@@ -1,8 +1,5 @@
 name: Publish artifacts
 
-# Runs when anything that affects the built output changes on main.
-# Also available as a manual trigger (e.g. to force a republish without a code change).
-
 on:
   push:
     branches: [main]
@@ -13,116 +10,85 @@ on:
       - 'scripts/publish-artifacts.sh'
   workflow_dispatch:
 
-# ── AWS authentication ─────────────────────────────────────────────────────────
-# This workflow uses OIDC — no long-lived AWS keys stored in GitHub secrets.
-#
-# One-time setup in your AWS account:
-#   1. Create an IAM OIDC identity provider:
-#        Provider URL : https://token.actions.githubusercontent.com
-#        Audience     : sts.amazonaws.com
-#
-#   2. Create an IAM role (e.g. "uptime-github-publish") with this trust policy:
-#        {
-#          "Version": "2012-10-17",
-#          "Statement": [{
-#            "Effect": "Allow",
-#            "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com" },
-#            "Action": "sts:AssumeRoleWithWebIdentity",
-#            "Condition": {
-#              "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-#              "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:maimon33/uptime:*" }
-#            }
-#          }]
-#        }
-#
-#   3. Attach a policy granting S3 write access to the release bucket:
-#        {
-#          "Version": "2012-10-17",
-#          "Statement": [{
-#            "Effect": "Allow",
-#            "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
-#            "Resource": [
-#              "arn:aws:s3:::www.maimons.dev",
-#              "arn:aws:s3:::www.maimons.dev/uptime/*"
-#            ]
-#          }]
-#        }
-#
-#   4. Add the role ARN as a GitHub secret:
-#        Settings → Secrets → Actions → New repository secret
-#        Name : AWS_PUBLISH_ROLE_ARN
-#        Value: arn:aws:iam::ACCOUNT_ID:role/uptime-github-publish
-#
-# Alternative — access keys (simpler but less secure):
-#   Skip steps 1–2 above. Create an IAM user with the same S3 policy.
-#   Add two secrets: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
-#   Then replace the configure-aws-credentials step below with:
-#
-#     - uses: aws-actions/configure-aws-credentials@v4
-#       with:
-#         aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-#         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-#         aws-region: us-east-1
-
 permissions:
-  id-token: write   # required for OIDC token request
+  id-token: write
   contents: read
 
 env:
   ARTIFACT_PREFIX: uptime
-  ARTIFACT_BUCKET_US_EAST_1: uptime-artifacts-us-east-1.maimons.dev
-  ARTIFACT_BUCKET_EU_WEST_1: uptime-artifacts-eu-west-1.maimons.dev
-  ARTIFACT_BUCKET_EU_CENTRAL_1: uptime-artifacts-eu-central-1.maimons.dev
-  ARTIFACT_BUCKET_AP_SOUTHEAST_1: uptime-artifacts-ap-southeast-1.maimons.dev
+  TEMPLATE_BUCKET: www.maimons.dev
+  TEMPLATE_REGION: us-east-1
 
 jobs:
-  publish:
+  publish-template:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
 
-      - name: Publish artifacts to all supported regions
+      - name: Publish public templates
+        run: |
+          aws s3 cp cloudformation/uptime-bootstrap.yaml "s3://${TEMPLATE_BUCKET}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml"
+          aws s3 cp cloudformation/uptime-artifacts.yaml "s3://${TEMPLATE_BUCKET}/${ARTIFACT_PREFIX}/cloudformation/uptime-artifacts.yaml"
+
+  publish-regional-artifacts:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - region: us-east-1
+            bucket: uptime-artifacts-us-east-1.maimons.dev
+          - region: eu-west-1
+            bucket: uptime-artifacts-eu-west-1.maimons.dev
+          - region: eu-central-1
+            bucket: uptime-artifacts-eu-central-1.maimons.dev
+          - region: ap-southeast-1
+            bucket: uptime-artifacts-ap-southeast-1.maimons.dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Publish regional artifacts
         run: |
           chmod +x scripts/publish-artifacts.sh scripts/package.sh
-          for spec in \
-            "us-east-1:${ARTIFACT_BUCKET_US_EAST_1}" \
-            "eu-west-1:${ARTIFACT_BUCKET_EU_WEST_1}" \
-            "eu-central-1:${ARTIFACT_BUCKET_EU_CENTRAL_1}" \
-            "ap-southeast-1:${ARTIFACT_BUCKET_AP_SOUTHEAST_1}"
-          do
-            REGION="${spec%%:*}"
-            BUCKET="${spec#*:}"
-            if [ -z "$BUCKET" ]; then
-              echo "Missing bucket variable for ${REGION}"
-              exit 1
-            fi
-            echo "Publishing to ${REGION} bucket: ${BUCKET}"
-            ./scripts/publish-artifacts.sh "$BUCKET" "$ARTIFACT_PREFIX"
-          done
+          ./scripts/publish-artifacts.sh "${{ matrix.bucket }}" "${ARTIFACT_PREFIX}"
 
-      - name: Summary
-        if: success()
+  summary:
+    runs-on: ubuntu-latest
+    needs:
+      - publish-template
+      - publish-regional-artifacts
+    if: success()
+
+    steps:
+      - name: Publish summary
         run: |
-          VERSION="$(git rev-parse --short HEAD)"
-          echo "### Published \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Published artifacts" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Region | Bucket | Live template |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| us-east-1 | \`${ARTIFACT_BUCKET_US_EAST_1}\` | \`s3://${ARTIFACT_BUCKET_US_EAST_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| eu-west-1 | \`${ARTIFACT_BUCKET_EU_WEST_1}\` | \`s3://${ARTIFACT_BUCKET_EU_WEST_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| eu-central-1 | \`${ARTIFACT_BUCKET_EU_CENTRAL_1}\` | \`s3://${ARTIFACT_BUCKET_EU_CENTRAL_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ap-southeast-1 | \`${ARTIFACT_BUCKET_AP_SOUTHEAST_1}\` | \`s3://${ARTIFACT_BUCKET_AP_SOUTHEAST_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "Template bucket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://${TEMPLATE_BUCKET}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://${TEMPLATE_BUCKET}/${ARTIFACT_PREFIX}/cloudformation/uptime-artifacts.yaml\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Official quick-create examples:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- us-east-1: https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_US_EAST_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
-          echo "- eu-west-1: https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_EU_WEST_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
-          echo "- eu-central-1: https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_EU_CENTRAL_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ap-southeast-1: https://console.aws.amazon.com/cloudformation/home?region=ap-southeast-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_AP_SOUTHEAST_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
+          echo "Regional Lambda ZIP buckets:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://uptime-artifacts-us-east-1.maimons.dev/${ARTIFACT_PREFIX}/releases/management.zip\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://uptime-artifacts-eu-west-1.maimons.dev/${ARTIFACT_PREFIX}/releases/management.zip\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://uptime-artifacts-eu-central-1.maimons.dev/${ARTIFACT_PREFIX}/releases/management.zip\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`s3://uptime-artifacts-ap-southeast-1.maimons.dev/${ARTIFACT_PREFIX}/releases/management.zip\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Quick-create example:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- https://console.aws.amazon.com/cloudformation/home?region=${TEMPLATE_REGION}#/stacks/quickcreate?templateURL=https://${TEMPLATE_BUCKET}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
