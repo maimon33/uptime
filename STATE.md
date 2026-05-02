@@ -12,7 +12,8 @@ Shared context for Claude Code + Codex collaboration.
   - `cloudformation/uptime-bootstrap.yaml` — full home-region stack (Lambda, DynamoDB, Secrets Manager, IAM, EventBridge).
   - `cloudformation/uptime-artifacts.yaml` — S3 bucket for release artifacts.
   - Lambda code is uploaded to S3 first, then referenced by the CFN stack via `LambdaCodeS3Bucket`/`LambdaCodeS3Key` parameters.
-  - Public bootstrap template has since been simplified to a single required parameter: `AdminApiKey`.
+  - Public bootstrap template has since been simplified to a single optional parameter: `AdminApiKey`.
+    If omitted, CloudFormation generates the admin key in Secrets Manager.
     The official artifact location is hardcoded to `www.maimons.dev / uptime/releases/management.zip`.
 - **Terraform** also exists (`terraform/`) as an alternative.
   - Currently incomplete vs CloudFormation (no EventBridge schedule rule for orchestration).

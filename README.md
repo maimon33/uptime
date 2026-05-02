@@ -178,7 +178,8 @@ You do not need to touch S3 — just deploy the stack and supply an admin key.
 
 #### One-click (AWS Console)
 
-Open this URL and fill in `AdminApiKey` — everything else has sensible defaults:
+Open this URL. You can either fill in `AdminApiKey`, or leave it blank and let
+CloudFormation generate one for you:
 
 ```
 https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https://www.maimons.dev.s3.amazonaws.com/uptime/cloudformation/uptime-bootstrap.yaml
@@ -193,14 +194,12 @@ aws cloudformation deploy \
   --region us-east-1 \
   --stack-name uptime \
   --template-url https://www.maimons.dev.s3.amazonaws.com/uptime/cloudformation/uptime-bootstrap.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    AdminApiKey=YOUR_SECURE_ADMIN_KEY
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
 `LambdaCodeS3Bucket` defaults to `www.maimons.dev` and `LambdaCodeS3Key` defaults to
 `uptime/releases/management.zip` inside the template, so the only parameter you
-need to provide is `AdminApiKey`.
+may want to provide is `AdminApiKey`.
 
 `AdminApiKey` is your admin password/token for this deployment. It is used to
 protect:
@@ -210,6 +209,19 @@ protect:
 
 It is **not** an encryption key. CloudFormation stores it as an encrypted
 Secrets Manager secret, and the management Lambda reads it from there.
+If you leave `AdminApiKey` blank, the stack generates one automatically.
+
+After deployment, you can retrieve the generated value from Secrets Manager:
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id uptime/admin-key \
+  --query SecretString \
+  --output text
+```
+
+If the secret was auto-generated, the returned value is JSON. The actual admin
+token is in the `password` field.
 
 #### How the official artifacts get there
 
@@ -352,7 +364,7 @@ log_retention_days = 14           # CloudWatch log retention
 
 | Parameter | Required | Description |
 |---|---|---|
-| `AdminApiKey` | yes | Secret admin password/token stored in Secrets Manager and used for `/admin` and `/api/*` |
+| `AdminApiKey` | no | Optional admin password/token. Leave blank to have the stack generate one in Secrets Manager. |
 
 For CloudFormation, the **home region is not a template parameter**. It is the region where you run the stack, for example with `aws cloudformation deploy --region us-east-1`.
 

@@ -176,9 +176,14 @@ def _get_admin_key() -> str:
     global _cached_admin_key
     if _cached_admin_key is None:
         if ADMIN_KEY_SECRET:
-            _cached_admin_key = _secretsmanager_client().get_secret_value(
+            secret_value = _secretsmanager_client().get_secret_value(
                 SecretId=ADMIN_KEY_SECRET
             )["SecretString"]
+            try:
+                secret_json = json.loads(secret_value)
+                _cached_admin_key = secret_json.get("password", secret_value)
+            except Exception:
+                _cached_admin_key = secret_value
         elif ADMIN_KEY_PARAM:
             _cached_admin_key = _ssm_client().get_parameter(
                 Name=ADMIN_KEY_PARAM, WithDecryption=True

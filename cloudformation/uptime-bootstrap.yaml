@@ -9,12 +9,11 @@ Parameters:
   AdminApiKey:
     Type: String
     NoEcho: true
-    MinLength: 16
-    Description: >-
-      Secret admin password/token for this Uptime deployment.
-      It protects the /admin page and all authenticated /api/* endpoints.
-      This is not an encryption key. Choose a long random secret and store it safely.
-      CloudFormation stores it as an encrypted Secrets Manager secret.
+    Default: ''
+    Description: Admin password/token. Leave blank to auto-generate in Secrets Manager.
+
+Conditions:
+  HasProvidedAdminApiKey: !Not [!Equals [!Ref AdminApiKey, '']]
 
 Resources:
   HostsTable:
@@ -67,7 +66,14 @@ Resources:
     Properties:
       Name: uptime/admin-key
       Description: Admin API key for uptime management Lambda
-      SecretString: !Ref AdminApiKey
+      SecretString: !If [HasProvidedAdminApiKey, !Ref AdminApiKey, !Ref AWS::NoValue]
+      GenerateSecretString: !If
+        - HasProvidedAdminApiKey
+        - !Ref AWS::NoValue
+        - ExcludePunctuation: true
+          GenerateStringKey: password
+          PasswordLength: 40
+          SecretStringTemplate: '{"type":"uptime-admin-key"}'
       Tags:
         - Key: Project
           Value: uptime
