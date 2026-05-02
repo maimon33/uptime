@@ -33,7 +33,7 @@ A fully self-hosted uptime monitoring system deployed entirely on your own AWS a
 │  │         │                                                │   │
 │  │         ▼                                                │   │
 │  │  DynamoDB (hosts + checks)    SNS topics                 │   │
-│  │  SSM Parameter (admin key)    CloudWatch Logs            │   │
+│  │  Secrets Manager (admin key)  CloudWatch Logs            │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                                                                  │
 │  │  EventBridge (single schedule) ─► Management orchestrator │   │
@@ -95,6 +95,23 @@ The zip currently includes:
 - `regions.py`
 - `_monitor_handler.py`
 
+For the official release path in this GitHub repo, uploads are handled by
+[`publish.yml`](/Users/assi/Work/repos/maimon33/uptime/.github/workflows/publish.yml).
+On `main`, it packages the Lambda and publishes the live artifacts to:
+
+- `s3://www.maimons.dev/uptime/releases/management.zip`
+- `s3://www.maimons.dev/uptime/cloudformation/uptime-bootstrap.yaml`
+- `s3://www.maimons.dev/uptime/cloudformation/uptime-artifacts.yaml`
+
+It also archives each publish under a versioned prefix:
+
+- `s3://www.maimons.dev/uptime/releases/<git-sha>/...`
+
+So the repo has two supported paths:
+
+- Official release path: GitHub Actions publishes to `www.maimons.dev`
+- Fork path: run [`publish-artifacts.sh`](/Users/assi/Work/repos/maimon33/uptime/scripts/publish-artifacts.sh) against your own bucket/prefix
+
 ### What The Initial Stack Creates
 
 The bootstrap deployment creates the home-region foundation:
@@ -104,7 +121,7 @@ The bootstrap deployment creates the home-region foundation:
 - EventBridge schedule for the central orchestrator
 - DynamoDB `hosts` table
 - DynamoDB `checks` table with TTL enabled
-- SSM SecureString parameter for the admin API key
+- Secrets Manager secret for the admin API key
 - IAM role and inline policy for the management Lambda
 - CloudWatch log group for the management Lambda
 - Optional default SNS topic for alerts
@@ -124,7 +141,7 @@ zip --version
 # IAM: create roles/policies
 # Lambda: create/update functions
 # DynamoDB: create tables
-# SSM: put/get parameters
+# Secrets Manager: create/get secret
 # SNS: create topics (optional)
 # EventBridge: create rules
 # CloudWatch Logs: create log groups
@@ -182,17 +199,40 @@ aws cloudformation deploy \
 ```
 
 `LambdaCodeS3Bucket` defaults to `www.maimons.dev` and `LambdaCodeS3Key` defaults to
-`uptime/releases/management.zip` — omit both unless you are using a custom build.
+`uptime/releases/management.zip` inside the template, so the only parameter you
+need to provide is `AdminApiKey`.
+
+`AdminApiKey` is your admin password/token for this deployment. It is used to
+protect:
+
+- `/admin`
+- all authenticated `/api/*` endpoints
+
+It is **not** an encryption key. CloudFormation stores it as an encrypted
+Secrets Manager secret, and the management Lambda reads it from there.
+
+#### How the official artifacts get there
+
+This repo includes a GitHub Actions workflow at
+[`publish.yml`](/Users/assi/Work/repos/maimon33/uptime/.github/workflows/publish.yml).
+When changes land on `main`, it:
+
+1. Packages the Lambda zip
+2. Assumes an AWS role via GitHub OIDC
+3. Publishes the official artifacts into `s3://www.maimons.dev/uptime/...`
+4. Keeps a versioned archive by Git commit SHA
+
+That means the CloudFormation template and the default Lambda artifact are both
+published from the repo automatically.
 
 #### What the stack creates
 
 - Management Lambda + Function URL (your status page and admin UI)
 - EventBridge schedule (orchestration, every minute)
 - DynamoDB `hosts` and `checks` tables (with TTL)
-- SSM SecureString parameter for the admin key
+- Secrets Manager secret for the admin key
 - IAM role for the management Lambda
 - CloudWatch log group
-- Optional default SNS topic for alerts
 
 Worker Lambdas in other regions are added later from the admin UI — no redeployment needed.
 
@@ -219,10 +259,11 @@ aws cloudformation deploy \
   --template-file cloudformation/uptime-bootstrap.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
-    AdminApiKey=YOUR_SECURE_ADMIN_KEY \
-    LambdaCodeS3Bucket=YOUR_BUCKET \
-    LambdaCodeS3Key=YOUR_PREFIX/releases/management.zip
+    AdminApiKey=YOUR_SECURE_ADMIN_KEY
 ```
+
+Then edit the template if you want to point it at your own bucket/key instead
+of the official release path.
 
 If you don't have a public bucket yet, `cloudformation/uptime-artifacts.yaml` creates one:
 
@@ -281,7 +322,7 @@ project    = "uptime"             # prefix for all resource names
 
 # ── Admin access ──────────────────────────────────────────────────────────
 # Leave blank to auto-generate a secure key (recommended)
-# The key is stored in SSM Parameter Store, encrypted with KMS
+# The key is stored in the bootstrap stack's secret store
 admin_api_key = ""
 
 # ── Retention ─────────────────────────────────────────────────────────────
@@ -311,19 +352,7 @@ log_retention_days = 14           # CloudWatch log retention
 
 | Parameter | Required | Description |
 |---|---|---|
-| `Project` | no | Resource name prefix |
-| `LambdaCodeS3Bucket` | yes | Bucket containing the uploaded `management.zip` |
-| `LambdaCodeS3Key` | yes | Object key for that zip, such as `releases/management.zip` |
-| `AdminApiKey` | yes | Secret admin key stored in SSM and used for `/admin` and `/api/*` |
-| `RetentionDays` | no | Check-history retention window |
-| `StatusPageTitle` | no | Default public page title |
-| `StatusPageDescription` | no | Default public page subtitle |
-| `LambdaMemoryMb` | no | Management Lambda memory |
-| `LambdaTimeoutSeconds` | no | Management Lambda timeout |
-| `OrchestrationSchedule` | no | EventBridge schedule expression |
-| `LogRetentionDays` | no | Management log retention |
-| `CreateDefaultAlertsTopic` | no | Whether to create a default SNS topic |
-| `DefaultAlertsEmail` | no | Optional email subscription for that topic |
+| `AdminApiKey` | yes | Secret admin password/token stored in Secrets Manager and used for `/admin` and `/api/*` |
 
 For CloudFormation, the **home region is not a template parameter**. It is the region where you run the stack, for example with `aws cloudformation deploy --region us-east-1`.
 
@@ -527,7 +556,7 @@ Without a custom domain, you get a free `*.lambda-url.*.on.aws` URL.
 
 ## Security Notes
 
-- **Admin key** is stored in SSM Parameter Store (SecureString, KMS-encrypted)
+- **Admin key** is stored in Secrets Manager (encrypted at rest)
 - The key is passed as `?key=` in the browser or `Authorization: Bearer` in API calls
 - Status page (`/`) is fully public — only shows hosts with `show_on_status_page: true`
 - All other endpoints require the admin key

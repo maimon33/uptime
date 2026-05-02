@@ -10,6 +10,7 @@ on:
       - 'src/**'
       - 'cloudformation/**'
       - 'scripts/package.sh'
+      - 'scripts/publish-artifacts.sh'
   workflow_dispatch:
 
 # ── AWS authentication ─────────────────────────────────────────────────────────

@@ -40,6 +40,7 @@ import regions as reg
 # ── AWS clients ───────────────────────────────────────────────────────────────
 _dynamodb = None
 _ssm = None
+_secretsmanager = None
 _lambda = None
 _sns = None
 
@@ -54,6 +55,13 @@ def _ssm_client():
     if _ssm is None:
         _ssm = boto3.client("ssm")
     return _ssm
+
+
+def _secretsmanager_client():
+    global _secretsmanager
+    if _secretsmanager is None:
+        _secretsmanager = boto3.client("secretsmanager")
+    return _secretsmanager
 
 
 def _lambda_client(region_name: str | None = None):
@@ -74,7 +82,8 @@ def _sns_client():
 # ── Config ────────────────────────────────────────────────────────────────────
 HOSTS_TABLE     = os.environ["HOSTS_TABLE"]
 CHECKS_TABLE    = os.environ["CHECKS_TABLE"]
-ADMIN_KEY_PARAM = os.environ["ADMIN_KEY_PARAM"]
+ADMIN_KEY_PARAM = os.environ.get("ADMIN_KEY_PARAM")
+ADMIN_KEY_SECRET = os.environ.get("ADMIN_KEY_SECRET")
 HOME_REGION     = os.environ.get("HOME_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "90"))
 
@@ -166,9 +175,16 @@ def _run_orchestration() -> dict:
 def _get_admin_key() -> str:
     global _cached_admin_key
     if _cached_admin_key is None:
-        _cached_admin_key = _ssm_client().get_parameter(
-            Name=ADMIN_KEY_PARAM, WithDecryption=True
-        )["Parameter"]["Value"]
+        if ADMIN_KEY_SECRET:
+            _cached_admin_key = _secretsmanager_client().get_secret_value(
+                SecretId=ADMIN_KEY_SECRET
+            )["SecretString"]
+        elif ADMIN_KEY_PARAM:
+            _cached_admin_key = _ssm_client().get_parameter(
+                Name=ADMIN_KEY_PARAM, WithDecryption=True
+            )["Parameter"]["Value"]
+        else:
+            raise RuntimeError("Missing ADMIN_KEY_SECRET or ADMIN_KEY_PARAM environment variable")
     return _cached_admin_key
 
 def _auth(event: dict) -> bool:

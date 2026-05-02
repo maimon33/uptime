@@ -2,124 +2,25 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Uptime bootstrap stack. Creates the initial home-region resources:
   management Lambda, Function URL, EventBridge schedule, DynamoDB tables,
-  SSM admin key, IAM role, logs, and an optional default SNS topic.
-  The region where this stack is launched becomes the home region.
+  Secrets Manager admin key, IAM role, and logs. The region where this stack is launched
+  becomes the home region.
 
 Parameters:
-  Project:
-    Type: String
-    Default: uptime
-    AllowedPattern: '^[a-z0-9-]{2,20}$'
-    Description: Prefix applied to resource names.
-
-  LambdaCodeS3Bucket:
-    Type: String
-    Default: www.maimons.dev
-    Description: >-
-      S3 bucket containing the management Lambda zip.
-      Default points to the official public release bucket at www.maimons.dev — no action needed for a standard deployment.
-      Override this (and LambdaCodeS3Key) only if you have forked the project and are hosting your own build.
-      Your bucket must be in the same region as this stack, or be configured for cross-region access.
-
-  LambdaCodeS3Key:
-    Type: String
-    Default: uptime/releases/management.zip
-    Description: >-
-      S3 object key for the Lambda zip within LambdaCodeS3Bucket.
-      Default is the latest official release. Override when using a custom build or a pinned release version,
-      for example uptime/releases/management-v1.2.0.zip.
-
   AdminApiKey:
     Type: String
     NoEcho: true
     MinLength: 16
-    Description: Secret admin key used for /admin and all /api/* access. It is stored in SSM Parameter Store.
-
-  RetentionDays:
-    Type: Number
-    Default: 90
-    MinValue: 7
-    MaxValue: 365
-    Description: Check-history retention in days.
-
-  StatusPageTitle:
-    Type: String
-    Default: System Status
-    Description: Default public status page title.
-
-  StatusPageDescription:
-    Type: String
-    Default: Real-time status of our services
-    Description: Default public status page subtitle.
-
-  LambdaMemoryMb:
-    Type: Number
-    Default: 256
-    AllowedValues: [128, 256, 512, 1024]
-    Description: Management Lambda memory size in MB.
-
-  LambdaTimeoutSeconds:
-    Type: Number
-    Default: 300
-    MinValue: 30
-    MaxValue: 900
-    Description: Management Lambda timeout in seconds.
-
-  OrchestrationSchedule:
-    Type: String
-    Default: rate(1 minute)
-    Description: EventBridge schedule expression for the central orchestrator.
-
-  LogRetentionDays:
-    Type: Number
-    Default: 14
-    AllowedValues:
-      - 1
-      - 3
-      - 5
-      - 7
-      - 14
-      - 30
-      - 60
-      - 90
-      - 120
-      - 150
-      - 180
-      - 365
-      - 400
-      - 545
-      - 731
-      - 1096
-      - 1827
-      - 2192
-      - 2557
-      - 2922
-      - 3288
-      - 3653
-    Description: CloudWatch log retention for the management Lambda.
-
-  CreateDefaultAlertsTopic:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: Whether to create a default SNS topic in the home region.
-
-  DefaultAlertsEmail:
-    Type: String
-    Default: ''
-    Description: Optional email subscription for the default SNS topic.
-
-Conditions:
-  CreateAlertsTopic: !Equals [!Ref CreateDefaultAlertsTopic, 'true']
-  CreateAlertsEmailSubscription: !And
-    - !Condition CreateAlertsTopic
-    - !Not [!Equals [!Ref DefaultAlertsEmail, '']]
+    Description: >-
+      Secret admin password/token for this Uptime deployment.
+      It protects the /admin page and all authenticated /api/* endpoints.
+      This is not an encryption key. Choose a long random secret and store it safely.
+      CloudFormation stores it as an encrypted Secrets Manager secret.
 
 Resources:
   HostsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub '${Project}-hosts'
+      TableName: uptime-hosts
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: host_id
@@ -131,14 +32,14 @@ Resources:
         PointInTimeRecoveryEnabled: true
       Tags:
         - Key: Project
-          Value: !Ref Project
+          Value: uptime
         - Key: ManagedBy
           Value: cloudformation
 
   ChecksTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub '${Project}-checks'
+      TableName: uptime-checks
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: host_id
@@ -157,31 +58,32 @@ Resources:
         PointInTimeRecoveryEnabled: true
       Tags:
         - Key: Project
-          Value: !Ref Project
+          Value: uptime
         - Key: ManagedBy
           Value: cloudformation
 
-  AdminKeyParameter:
-    Type: AWS::SSM::Parameter
+  AdminKeySecret:
+    Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub '/${Project}/admin-key'
-      Description: !Sub 'Admin API key for ${Project} management Lambda'
-      Type: SecureString
-      Value: !Ref AdminApiKey
+      Name: uptime/admin-key
+      Description: Admin API key for uptime management Lambda
+      SecretString: !Ref AdminApiKey
       Tags:
-        Project: !Ref Project
-        ManagedBy: cloudformation
+        - Key: Project
+          Value: uptime
+        - Key: ManagedBy
+          Value: cloudformation
 
   ManagementLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${Project}-management'
-      RetentionInDays: !Ref LogRetentionDays
+      LogGroupName: /aws/lambda/uptime-management
+      RetentionInDays: 14
 
   ManagementRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${Project}-management'
+      RoleName: uptime-management
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -190,7 +92,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub '${Project}-management'
+        - PolicyName: uptime-management
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -199,7 +101,7 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Project}-management:*'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/uptime-management:*'
               - Sid: Data
                 Effect: Allow
                 Action:
@@ -215,8 +117,8 @@ Resources:
               - Sid: AdminKey
                 Effect: Allow
                 Action:
-                  - ssm:GetParameter
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Project}/admin-key'
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AdminKeySecret
               - Sid: Alerts
                 Effect: Allow
                 Action:
@@ -235,7 +137,7 @@ Resources:
                   - lambda:AddPermission
                   - lambda:RemovePermission
                   - lambda:ListFunctions
-                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:${Project}-monitor-*'
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:uptime-monitor-*'
               - Sid: MonitorIAM
                 Effect: Allow
                 Action:
@@ -246,7 +148,7 @@ Resources:
                   - iam:DeleteRole
                   - iam:DeleteRolePolicy
                   - iam:PassRole
-                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${Project}-monitor'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/uptime-monitor'
               - Sid: MonitorLogs
                 Effect: Allow
                 Action:
@@ -254,7 +156,7 @@ Resources:
                   - logs:PutRetentionPolicy
                   - logs:DeleteLogGroup
                   - logs:DescribeLogGroups
-                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/${Project}-monitor-*'
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/uptime-monitor-*'
               - Sid: STS
                 Effect: Allow
                 Action:
@@ -262,35 +164,35 @@ Resources:
                 Resource: '*'
       Tags:
         - Key: Project
-          Value: !Ref Project
+          Value: uptime
         - Key: ManagedBy
           Value: cloudformation
 
   ManagementFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${Project}-management'
+      FunctionName: uptime-management
       Runtime: python3.12
       Handler: handler.handler
       Role: !GetAtt ManagementRole.Arn
-      Timeout: !Ref LambdaTimeoutSeconds
-      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 300
+      MemorySize: 256
       Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
+        S3Bucket: www.maimons.dev
+        S3Key: uptime/releases/management.zip
       Environment:
         Variables:
           HOSTS_TABLE: !Ref HostsTable
           CHECKS_TABLE: !Ref ChecksTable
-          ADMIN_KEY_PARAM: !Ref AdminKeyParameter
+          ADMIN_KEY_SECRET: !Ref AdminKeySecret
           HOME_REGION: !Ref AWS::Region
-          PROJECT: !Ref Project
-          RETENTION_DAYS: !Ref RetentionDays
-          STATUS_PAGE_TITLE: !Ref StatusPageTitle
-          STATUS_PAGE_DESC: !Ref StatusPageDescription
+          PROJECT: uptime
+          RETENTION_DAYS: '90'
+          STATUS_PAGE_TITLE: System Status
+          STATUS_PAGE_DESC: Real-time status of our services
       Tags:
         - Key: Project
-          Value: !Ref Project
+          Value: uptime
         - Key: ManagedBy
           Value: cloudformation
     DependsOn:
@@ -299,9 +201,9 @@ Resources:
   ManagementScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub '${Project}-management-schedule'
-      Description: !Sub '${Project} central monitor orchestration schedule'
-      ScheduleExpression: !Ref OrchestrationSchedule
+      Name: uptime-management-schedule
+      Description: uptime central monitor orchestration schedule
+      ScheduleExpression: rate(1 minute)
       State: ENABLED
       Targets:
         - Id: management-lambda
@@ -342,28 +244,9 @@ Resources:
       Principal: '*'
       FunctionUrlAuthType: NONE
 
-  DefaultAlertsTopic:
-    Type: AWS::SNS::Topic
-    Condition: CreateAlertsTopic
-    Properties:
-      TopicName: !Sub '${Project}-alerts'
-      Tags:
-        - Key: Project
-          Value: !Ref Project
-        - Key: ManagedBy
-          Value: cloudformation
-
-  DefaultAlertsEmailSubscription:
-    Type: AWS::SNS::Subscription
-    Condition: CreateAlertsEmailSubscription
-    Properties:
-      TopicArn: !Ref DefaultAlertsTopic
-      Protocol: email
-      Endpoint: !Ref DefaultAlertsEmail
-
 Outputs:
   HomeRegion:
-    Description: Stack home region. This is where management, DynamoDB, SSM, logs, and the central schedule live.
+    Description: Stack home region. This is where management, DynamoDB, Secrets Manager, logs, and the central schedule live.
     Value: !Ref AWS::Region
 
   ManagementFunctionUrl:
@@ -378,9 +261,9 @@ Outputs:
     Description: Admin UI URL. Append ?key=<your-admin-key>.
     Value: !Sub '${ManagementFunctionUrl.FunctionUrl}admin'
 
-  AdminKeySsmPath:
-    Description: SSM SecureString path containing the admin key.
-    Value: !Ref AdminKeyParameter
+  AdminKeySecretArn:
+    Description: Secrets Manager ARN containing the admin key.
+    Value: !Ref AdminKeySecret
 
   HostsTableName:
     Description: DynamoDB table for hosts, settings, and region records.
@@ -389,7 +272,3 @@ Outputs:
   ChecksTableName:
     Description: DynamoDB table for check history.
     Value: !Ref ChecksTable
-
-  DefaultAlertsTopicArn:
-    Description: ARN of the optional default SNS topic.
-    Value: !If [CreateAlertsTopic, !Ref DefaultAlertsTopic, '']
