@@ -6,11 +6,10 @@ and runs the scheduled cross-region monitoring orchestration.
 Routes (public):
   GET  /           → status page
   GET  /status     → alias
-
-Routes (admin key required — Bearer token or ?key=):
-  GET  /admin      → admin SPA
+  GET  /admin      → admin SPA login shell
 
 API (admin key required):
+  GET              /api/auth
   GET/POST         /api/hosts
   GET/PUT/DELETE   /api/hosts/:id
   GET              /api/hosts/:id/checks
@@ -90,6 +89,17 @@ RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "90"))
 _SETTINGS_DEFAULTS = {
     "status_page_title":       os.environ.get("STATUS_PAGE_TITLE", "System Status"),
     "status_page_description": os.environ.get("STATUS_PAGE_DESC",  "Real-time status of our services"),
+    "status_page_brand_name":  os.environ.get("STATUS_PAGE_BRAND_NAME", "Uptime"),
+    "status_page_logo_url":    os.environ.get("STATUS_PAGE_LOGO_URL", ""),
+    "status_page_theme":       os.environ.get("STATUS_PAGE_THEME", "clean"),
+    "status_page_subscribe_intro": os.environ.get("STATUS_PAGE_SUBSCRIBE_INTRO", "Subscribe for status updates."),
+    "status_page_subscribe_email_url": os.environ.get("STATUS_PAGE_SUBSCRIBE_EMAIL_URL", ""),
+    "status_page_subscribe_sms_url": os.environ.get("STATUS_PAGE_SUBSCRIBE_SMS_URL", ""),
+    "status_page_subscribe_webhook_url": os.environ.get("STATUS_PAGE_SUBSCRIBE_WEBHOOK_URL", ""),
+    "maintenance_enabled":     False,
+    "maintenance_message":     "",
+    "maintenance_window":      "",
+    "maintenance_scope":       "",
     "retention_days":          RETENTION_DAYS,
     "default_check_interval":  60,
     "default_timeout":         10,
@@ -114,13 +124,11 @@ def handler(event, context):
         return _serve_status_page()
 
     if path == "/admin":
-        if not _auth(event):
-            return _html(401, _auth_error_page())
         return _html(200, _admin_page())
 
     if path.startswith("/api/"):
         if not _auth(event):
-            return _json(401, {"error": "Unauthorized. Use Authorization: Bearer <key> or ?key=<key>"})
+            return _json(401, {"error": "Unauthorized. Sign in at /admin or send Authorization: Bearer <key>"})
         return _route_api(method, path, event)
 
     return _json(404, {"error": "Not found"})
@@ -230,6 +238,10 @@ def _route_api(method: str, path: str, event: dict) -> dict:
                 return _get_checks(rid, int(qs.get("limit", ["200"])[0]))
 
     # ── /api/settings ─────────────────────────────────────────────────────────
+    if resource == "auth":
+        if method == "GET":
+            return _json(200, {"ok": True})
+
     if resource == "settings":
         if method == "GET": return _get_settings()
         if method == "PUT": return _update_settings(body)
@@ -284,6 +296,7 @@ def _create_host(body: dict) -> dict:
         "alert_sns_arn":          body.get("alert_sns_arn", "") or None,
         "show_on_status_page":    bool(body.get("show_on_status_page", True)),
         "expected_status_code":   int(body.get("expected_status_code", 200)),
+        "target_regions":         _normalize_target_regions(body.get("target_regions")),
         "tags":                   body.get("tags", []),
         "created_at":             now,
         "updated_at":             now,
@@ -299,11 +312,13 @@ def _update_host(host_id: str, body: dict) -> dict:
     allowed = {
         "name", "url", "check_type", "check_interval_seconds", "timeout_seconds",
         "enabled", "alert_enabled", "alert_sns_arn", "show_on_status_page",
-        "expected_status_code", "tags",
+        "expected_status_code", "tags", "target_regions",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return _json(400, {"error": "No updatable fields"})
+    if "target_regions" in updates:
+        updates["target_regions"] = _normalize_target_regions(updates.get("target_regions"))
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     expr   = "SET " + ", ".join(f"#{k} = :{k}" for k in updates)
     table.update_item(
@@ -338,6 +353,11 @@ def _get_settings() -> dict:
 def _update_settings(body: dict) -> dict:
     allowed = {
         "status_page_title", "status_page_description",
+        "status_page_brand_name", "status_page_logo_url", "status_page_theme",
+        "status_page_subscribe_intro", "status_page_subscribe_email_url",
+        "status_page_subscribe_sms_url", "status_page_subscribe_webhook_url",
+        "maintenance_enabled", "maintenance_message", "maintenance_window",
+        "maintenance_scope",
         "retention_days", "default_check_interval", "default_timeout",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
@@ -359,6 +379,19 @@ def _invoke_region_worker(region: str, run_id: str) -> dict:
     if response.get("FunctionError"):
         raise RuntimeError(f"{function_name} failed: {body}")
     return body
+
+
+def _normalize_target_regions(value) -> list[str]:
+    if not value:
+        return []
+    if not isinstance(value, list):
+        return []
+    cleaned = []
+    for region in value:
+        region_name = str(region or "").strip()
+        if region_name and region_name not in cleaned:
+            cleaned.append(region_name)
+    return cleaned
 
 
 def _apply_aggregate_updates(db, hosts: list[dict], result_rows: list[dict], run_id: str) -> None:
@@ -511,10 +544,11 @@ def _remove_region(region: str) -> dict:
 # ── Cost estimate ─────────────────────────────────────────────────────────────
 
 def _cost_estimate(qs: dict) -> dict:
-    hosts    = int(qs.get("hosts",    ["10"])[0])
-    rcount   = int(qs.get("regions",  ["1"])[0])
-    interval = int(qs.get("interval", ["60"])[0])
-    days     = int(qs.get("days",     [str(RETENTION_DAYS)])[0])
+    defaults = _default_cost_inputs()
+    hosts    = int(qs.get("hosts",    [str(defaults["hosts"])])[0])
+    rcount   = int(qs.get("regions",  [str(defaults["regions"])])[0])
+    interval = int(qs.get("interval", [str(defaults["interval_sec"])])[0])
+    days     = int(qs.get("days",     [str(defaults["retention_days"])])[0])
 
     checks_mo    = int((30 * 24 * 3600 / interval) * hosts * rcount)
     invocations  = int((30 * 24 * 3600 / interval) * (rcount + 1))
@@ -534,6 +568,7 @@ def _cost_estimate(qs: dict) -> dict:
 
     return _json(200, {
         "inputs": {"hosts": hosts, "regions": rcount, "interval_sec": interval, "retention_days": days},
+        "defaults": defaults,
         "monthly_checks": checks_mo,
         "breakdown": {
             "lambda_usd":           round(lambda_cost,  4),
@@ -547,6 +582,17 @@ def _cost_estimate(qs: dict) -> dict:
     })
 
 
+def _default_cost_inputs() -> dict:
+    hosts = [host for host in _list_host_items() if host.get("enabled", True)]
+    settings = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": "__settings__"}).get("Item", {})
+    return {
+        "hosts": len(hosts),
+        "regions": len(reg.list_regions(_db())),
+        "interval_sec": int(settings.get("default_check_interval", _SETTINGS_DEFAULTS["default_check_interval"])),
+        "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
+    }
+
+
 # ── Public status page ────────────────────────────────────────────────────────
 
 def _serve_status_page() -> dict:
@@ -554,6 +600,17 @@ def _serve_status_page() -> dict:
     settings = db.Table(HOSTS_TABLE).get_item(Key={"host_id": "__settings__"}).get("Item", {})
     title = settings.get("status_page_title",       _SETTINGS_DEFAULTS["status_page_title"])
     desc  = settings.get("status_page_description", _SETTINGS_DEFAULTS["status_page_description"])
+    brand_name = settings.get("status_page_brand_name", _SETTINGS_DEFAULTS["status_page_brand_name"])
+    logo_url = settings.get("status_page_logo_url", _SETTINGS_DEFAULTS["status_page_logo_url"])
+    theme = settings.get("status_page_theme", _SETTINGS_DEFAULTS["status_page_theme"])
+    subscribe_intro = settings.get("status_page_subscribe_intro", _SETTINGS_DEFAULTS["status_page_subscribe_intro"])
+    subscribe_email_url = settings.get("status_page_subscribe_email_url", _SETTINGS_DEFAULTS["status_page_subscribe_email_url"])
+    subscribe_sms_url = settings.get("status_page_subscribe_sms_url", _SETTINGS_DEFAULTS["status_page_subscribe_sms_url"])
+    subscribe_webhook_url = settings.get("status_page_subscribe_webhook_url", _SETTINGS_DEFAULTS["status_page_subscribe_webhook_url"])
+    maintenance_enabled = bool(settings.get("maintenance_enabled", _SETTINGS_DEFAULTS["maintenance_enabled"]))
+    maintenance_message = settings.get("maintenance_message", _SETTINGS_DEFAULTS["maintenance_message"])
+    maintenance_window = settings.get("maintenance_window", _SETTINGS_DEFAULTS["maintenance_window"])
+    maintenance_scope = settings.get("maintenance_scope", _SETTINGS_DEFAULTS["maintenance_scope"])
 
     hosts_result = db.Table(HOSTS_TABLE).scan(
         FilterExpression="show_on_status_page = :t AND host_id <> :s AND NOT begins_with(host_id, :r)",
@@ -584,17 +641,47 @@ def _serve_status_page() -> dict:
             avg_latency = round(sum(float(c.get("latency_ms", 0)) for c in flat_checks) / len(flat_checks))
         else:
             uptime_pct, avg_latency = 100.0, 0
+        latest_latency = host.get("last_latency_ms")
+        region_summary = []
+        for region_name, region_info in sorted((host.get("region_statuses") or {}).items()):
+            region_summary.append({
+                "region": region_name,
+                "status": region_info.get("status", "unknown"),
+                "latency_ms": region_info.get("latency_ms"),
+            })
         host_data.append({
             "host":           host,
             "uptime_pct":     uptime_pct,
             "avg_latency":    avg_latency,
+            "latest_latency": latest_latency,
+            "region_summary": region_summary,
             "history":        list(reversed(run_statuses)),
             "current_status": host.get("current_status", "unknown"),
         })
-    return _html(200, _render_status_page(title, desc, host_data))
+    return _html(
+        200,
+        _render_status_page(
+            title,
+            desc,
+            brand_name,
+            logo_url,
+            theme,
+            host_data,
+            {
+                "subscribe_intro": subscribe_intro,
+                "subscribe_email_url": subscribe_email_url,
+                "subscribe_sms_url": subscribe_sms_url,
+                "subscribe_webhook_url": subscribe_webhook_url,
+                "maintenance_enabled": maintenance_enabled,
+                "maintenance_message": maintenance_message,
+                "maintenance_window": maintenance_window,
+                "maintenance_scope": maintenance_scope,
+            },
+        ),
+    )
 
 
-def _render_status_page(title: str, desc: str, host_data: list) -> str:
+def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, theme: str, host_data: list, page_options: dict) -> str:
     overall, ocls = "All systems operational", "operational"
     for h in host_data:
         if h["current_status"] == "down":
@@ -602,59 +689,134 @@ def _render_status_page(title: str, desc: str, host_data: list) -> str:
         if h["current_status"] == "degraded":
             overall, ocls = "Some systems are degraded", "degraded"
 
+    theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
+    maintenance_block = ""
+    if page_options.get("maintenance_enabled") and page_options.get("maintenance_message"):
+        window = page_options.get("maintenance_window", "").strip()
+        scope = page_options.get("maintenance_scope", "").strip()
+        maintenance_meta = []
+        if window:
+            maintenance_meta.append(f"<span>Window: {window}</span>")
+        if scope:
+            maintenance_meta.append(f"<span>Affected: {scope}</span>")
+        maintenance_block = f"""<div class="maintenance">
+  <div class="maintenance-title">Scheduled maintenance</div>
+  <div class="maintenance-copy">{page_options["maintenance_message"]}</div>
+  <div class="maintenance-meta">{' · '.join(maintenance_meta) if maintenance_meta else 'We will post updates here during the maintenance window.'}</div>
+</div>"""
+
+    subscribe_links = []
+    if page_options.get("subscribe_email_url"):
+        subscribe_links.append(f'<a class="subscribe-btn" href="{page_options["subscribe_email_url"]}">Email</a>')
+    if page_options.get("subscribe_sms_url"):
+        subscribe_links.append(f'<a class="subscribe-btn" href="{page_options["subscribe_sms_url"]}">SMS</a>')
+    if page_options.get("subscribe_webhook_url"):
+        subscribe_links.append(f'<a class="subscribe-btn" href="{page_options["subscribe_webhook_url"]}">Webhook / RSS</a>')
+    subscribe_block = ""
+    if subscribe_links:
+        subscribe_block = f"""<div class="subscribe">
+  <div>
+    <div class="subscribe-title">Stay informed</div>
+    <div class="subscribe-copy">{page_options.get("subscribe_intro") or _SETTINGS_DEFAULTS["status_page_subscribe_intro"]}</div>
+  </div>
+  <div class="subscribe-actions">{''.join(subscribe_links)}</div>
+</div>"""
+
     cards = ""
     for h in host_data:
         s     = h["current_status"]
         badge = {"up": "Operational", "down": "Down", "degraded": "Degraded"}.get(s, "Unknown")
         bars  = "".join(f'<span class="b {c}"></span>' for c in h["history"]) \
                 or '<span class="b unknown"></span>' * 10
+        latency_bits = []
+        if h["latest_latency"] is not None:
+            latency_bits.append(f"{h['latest_latency']} ms latest")
+        latency_bits.append(f"{h['avg_latency']} ms avg")
+        region_pills = "".join(
+            f'<span class="pill {r["status"]}">{r["region"]} · {r["latency_ms"] if r["latency_ms"] is not None else "—"} ms</span>'
+            for r in h["region_summary"]
+        )
         cards += f"""<div class="card">
   <div class="row"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
-  <div class="meta">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {h['avg_latency']} ms avg</div>
+  <div class="meta">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {' &nbsp;·&nbsp; '.join(latency_bits)}</div>
+  <div class="history-title">Recent history</div>
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
+  <div class="regions">{region_pills or '<span class="pill unknown">No regional data yet</span>'}</div>
 </div>"""
 
     if not host_data:
         cards = '<p class="empty">No services configured for the status page yet.</p>'
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    brand = ""
+    if brand_name or logo_url:
+        logo = f'<img src="{logo_url}" alt="{brand_name}" class="brand-logo">' if logo_url else ""
+        brand = f'<div class="brand">{logo}<span>{brand_name or title}</span></div>'
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f8fafc;color:#1e293b}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}}
+.theme-clean{{--bg:#f8fafc;--text:#1e293b;--card:#ffffff;--border:#e2e8f0;--muted:#64748b;--soft:#94a3b8;--hero:#ffffff;--hero-border:#e2e8f0}}
+.theme-midnight{{--bg:#020617;--text:#e2e8f0;--card:#0f172a;--border:#1e293b;--muted:#94a3b8;--soft:#64748b;--hero:#0b1120;--hero-border:#1e293b}}
+.theme-sunrise{{--bg:#fff7ed;--text:#431407;--card:#ffffff;--border:#fed7aa;--muted:#9a3412;--soft:#c2410c;--hero:#fffbeb;--hero-border:#fdba74}}
+.theme-forest{{--bg:#f0fdf4;--text:#14532d;--card:#ffffff;--border:#bbf7d0;--muted:#15803d;--soft:#16a34a;--hero:#ecfdf5;--hero-border:#86efac}}
 .wrap{{max-width:780px;margin:0 auto;padding:40px 20px}}
+.brand{{display:flex;align-items:center;gap:12px;font-size:.95rem;font-weight:700;color:var(--muted);margin-bottom:20px}}
+.brand-logo{{height:36px;width:36px;object-fit:contain;border-radius:10px;background:var(--card);border:1px solid var(--border);padding:4px}}
 h1{{font-size:1.9rem;font-weight:700;margin-bottom:6px}}
-.sub{{color:#64748b;margin-bottom:32px}}
-.overall{{display:flex;align-items:center;gap:12px;padding:18px 22px;border-radius:10px;margin-bottom:28px;font-weight:600}}
+.sub{{color:var(--muted);margin-bottom:32px}}
+.overall{{display:flex;align-items:center;gap:12px;padding:18px 22px;border-radius:10px;margin-bottom:28px;font-weight:600;background:var(--hero);border:1px solid var(--hero-border)}}
 .overall.operational{{background:#f0fdf4;border:1px solid #bbf7d0}}
 .overall.down{{background:#fef2f2;border:1px solid #fecaca}}
 .overall.degraded{{background:#fffbeb;border:1px solid #fde68a}}
+.maintenance,.subscribe{{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;padding:18px 22px;border-radius:10px;margin-bottom:20px;background:var(--hero);border:1px solid var(--hero-border)}}
+.maintenance{{background:#eff6ff;border-color:#bfdbfe}}
+.maintenance-title,.subscribe-title{{font-size:.82rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}}
+.maintenance-copy,.subscribe-copy{{font-size:.96rem;line-height:1.5}}
+.maintenance-meta{{margin-top:8px;color:var(--muted);font-size:.82rem}}
+.subscribe-actions{{display:flex;flex-wrap:wrap;gap:10px}}
+.subscribe-btn{{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;font-weight:700;white-space:nowrap}}
+.subscribe-btn:hover{{opacity:.92}}
 .dot{{width:14px;height:14px;border-radius:50%;flex-shrink:0}}
 .operational .dot{{background:#22c55e}}.down .dot{{background:#ef4444}}.degraded .dot{{background:#f59e0b}}
-.card{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:18px;margin-bottom:14px}}
+.card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:14px}}
 .row{{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}}
 .svc{{font-weight:600}}
 .badge{{font-size:.78rem;font-weight:700;padding:3px 11px;border-radius:20px}}
 .badge.up{{background:#f0fdf4;color:#16a34a}}.badge.down{{background:#fef2f2;color:#dc2626}}
 .badge.degraded{{background:#fffbeb;color:#d97706}}.badge.unknown{{background:#f1f5f9;color:#64748b}}
-.meta{{font-size:.83rem;color:#64748b;margin-bottom:10px}}
+.meta{{font-size:.83rem;color:var(--muted);margin-bottom:10px}}
+.history-title{{font-size:.76rem;color:var(--soft);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}}
 .bars{{display:flex;gap:2px;height:26px}}
 .b{{flex:1;border-radius:2px;min-width:3px}}
 .b.up{{background:#22c55e}}.b.down{{background:#ef4444}}.b.degraded{{background:#f59e0b}}.b.unknown{{background:#e2e8f0}}
-.bar-lbl{{display:flex;justify-content:space-between;font-size:.72rem;color:#94a3b8;margin-top:3px}}
-.empty{{text-align:center;color:#94a3b8;padding:40px 0}}
-footer{{text-align:center;margin-top:50px;font-size:.78rem;color:#94a3b8}}
-footer a{{color:#94a3b8}}
-</style></head><body>
+.bar-lbl{{display:flex;justify-content:space-between;font-size:.72rem;color:var(--soft);margin-top:3px}}
+.regions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
+.pill{{display:inline-flex;align-items:center;padding:4px 9px;border-radius:999px;font-size:.72rem;font-weight:600;background:#f8fafc;color:#475569;border:1px solid var(--border)}}
+.pill.up{{background:#f0fdf4;color:#166534;border-color:#bbf7d0}}
+.pill.down{{background:#fef2f2;color:#b91c1c;border-color:#fecaca}}
+.pill.degraded{{background:#fffbeb;color:#b45309;border-color:#fde68a}}
+.pill.unknown{{background:#f8fafc;color:#64748b}}
+.empty{{text-align:center;color:var(--soft);padding:40px 0}}
+footer{{text-align:center;margin-top:50px;font-size:.78rem;color:var(--soft)}}
+@media (max-width: 700px) {{
+  .maintenance,.subscribe{{flex-direction:column}}
+  .subscribe-actions{{width:100%}}
+  .subscribe-btn{{width:100%}}
+}}
+</style></head><body class="theme-{theme_class}">
 <div class="wrap">
+  {brand}
   <h1>{title}</h1><p class="sub">{desc}</p>
   <div class="overall {ocls}"><div class="dot"></div><span>{overall}</span></div>
+  {maintenance_block}
+  {subscribe_block}
   {cards}
-  <footer>Updated {now_str} &nbsp;·&nbsp; <a href="/admin">Admin</a></footer>
+  <footer>Updated {now_str}</footer>
 </div></body></html>"""
 
 
@@ -683,6 +845,7 @@ def _admin_page() -> str:
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
 nav{{background:#1e293b;border-bottom:1px solid #334155;padding:0 24px;display:flex;align-items:center;height:52px;gap:0}}
 .logo{{font-weight:700;color:#f8fafc;font-size:1.05rem;margin-right:32px;white-space:nowrap}}
+.nav-spacer{{margin-left:auto}}
 .tab{{padding:0 16px;height:52px;display:flex;align-items:center;cursor:pointer;font-size:.9rem;color:#94a3b8;border-bottom:2px solid transparent;white-space:nowrap}}
 .tab.active,.tab:hover{{color:#f8fafc;border-bottom-color:#6366f1}}
 .main{{max-width:960px;margin:0 auto;padding:32px 20px}}
@@ -731,6 +894,14 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
 .region-info .meta{{font-size:.8rem;color:#64748b}}
 .section-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}}
 .spinner{{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}}
+.auth-gate{{position:fixed;inset:0;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;z-index:250;padding:20px}}
+.auth-card{{width:100%;max-width:420px;background:#1e293b;border:1px solid #334155;border-radius:16px;padding:28px;box-shadow:0 20px 50px rgba(0,0,0,.35)}}
+.auth-card h1{{font-size:1.25rem;margin-bottom:10px}}
+.auth-card p{{color:#94a3b8;font-size:.9rem;line-height:1.6;margin-bottom:14px}}
+.auth-msg{{font-size:.82rem;color:#94a3b8;min-height:18px;margin-top:10px}}
+.checklist{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:10px}}
+.check-item{{display:flex;align-items:center;gap:8px;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:9px 10px;font-size:.83rem}}
+.check-item input{{width:auto}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style>
 </head><body>
@@ -742,10 +913,31 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   <span class="tab"         onclick="show('settings')">Settings</span>
   <span class="tab"         onclick="show('cost')">Cost</span>
   <span class="tab"         onclick="show('guides')">Guides</span>
+  <span class="nav-spacer"></span>
+  <button class="btn btn-ghost btn-sm" onclick="logoutAdmin()">Sign out</button>
 </nav>
+<div class="auth-gate" id="auth-gate">
+  <div class="auth-card">
+    <h1>Admin access</h1>
+    <p>Enter the admin password/token for this deployment. It stays in this browser session and is sent as a bearer token to the admin API.</p>
+    <div class="form-group" style="margin-bottom:10px">
+      <label>Admin Password / Token</label>
+      <input id="auth-key" type="password" placeholder="Paste the admin key">
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-primary" onclick="loginAdmin()">Unlock Admin</button>
+    </div>
+    <div class="auth-msg" id="auth-msg"></div>
+    <p style="margin-top:18px">If the stack generated the token for you, retrieve it with:</p>
+    <pre>aws secretsmanager get-secret-value \\
+  --secret-id uptime/admin-key \\
+  --query SecretString \\
+  --output text \\
+  --region {HOME_REGION}</pre>
+  </div>
+</div>
 <div class="main">
 
-<!-- ══ HOSTS ══════════════════════════════════════════════════════════════ -->
 <div id="pane-hosts">
   <div class="section-header">
     <h2>Hosts</h2>
@@ -762,7 +954,6 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </table>
 </div>
 
-<!-- ══ REGIONS ════════════════════════════════════════════════════════════ -->
 <div id="pane-regions" style="display:none">
   <div class="section-header">
     <h2>Worker Regions</h2>
@@ -771,25 +962,37 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   <p class="desc">
     The management Lambda owns the schedule and invokes one regional worker Lambda per configured region.
     Add multiple regions for global coverage and to detect regional outages without letting each region self-schedule.
-    Worker Lambdas are deployed directly from here — no Terraform or CLI needed for day-to-day region changes.
+    Worker Lambdas are deployed directly from here.
   </p>
   <div class="tip">
-    💡 Recommended starter set: <strong>us-east-1</strong>, <strong>eu-west-1</strong>, <strong>ap-southeast-1</strong>.<br>
-    Each additional worker region adds check coverage and a small Lambda cost.
+    Recommended starter set: <strong>us-east-1</strong>, <strong>eu-west-1</strong>, <strong>ap-southeast-1</strong>.
   </div>
   <div id="regions-list" style="margin-top:20px">
     <div style="color:#64748b;padding:20px 0">Loading…</div>
   </div>
 </div>
 
-<!-- ══ STATUS PAGE ════════════════════════════════════════════════════════ -->
 <div id="pane-status-page" style="display:none">
   <h2>Status Page</h2>
   <p class="desc">
-    Your public status page shows the hosts you select below. Visitors see real-time status and uptime history.
-    The page is served at the root URL of your Lambda Function URL (or custom domain if configured).
+    Your public status page shows the hosts you select below. Visitors see current state, recent history, and per-region latency badges.
   </p>
   <div class="panel">
+    <div class="grid2">
+      <div class="form-group">
+        <label>Brand Name</label>
+        <input id="sp-brand" placeholder="Uptime">
+      </div>
+      <div class="form-group">
+        <label>Theme</label>
+        <select id="sp-theme">
+          <option value="clean">Clean</option>
+          <option value="midnight">Midnight</option>
+          <option value="sunrise">Sunrise</option>
+          <option value="forest">Forest</option>
+        </select>
+      </div>
+    </div>
     <div class="form-group">
       <label>Page Title</label>
       <input id="sp-title" placeholder="System Status">
@@ -798,13 +1001,54 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
       <label>Page Description</label>
       <input id="sp-desc" placeholder="Real-time status of our services">
     </div>
+    <div class="form-group">
+      <label>Logo URL</label>
+      <input id="sp-logo" placeholder="https://example.com/logo.png">
+      <div class="hint">Optional. A square PNG or SVG works best.</div>
+    </div>
+    <div class="form-group">
+      <label class="toggle"><input type="checkbox" id="sp-maintenance-enabled"> Show maintenance notice</label>
+    </div>
+    <div class="form-group">
+      <label>Maintenance Message</label>
+      <input id="sp-maintenance-message" placeholder="Payments API maintenance is scheduled for Sunday at 02:00 UTC.">
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Maintenance Window</label>
+        <input id="sp-maintenance-window" placeholder="Sun 02:00-03:00 UTC">
+      </div>
+      <div class="form-group">
+        <label>Affected Scope</label>
+        <input id="sp-maintenance-scope" placeholder="eu-west-1, us-east-1, Payments API">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Subscribe Intro</label>
+      <input id="sp-subscribe-intro" placeholder="Subscribe for status updates.">
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Email Subscribe URL</label>
+        <input id="sp-subscribe-email" placeholder="mailto:status@example.com?subject=Subscribe">
+      </div>
+      <div class="form-group">
+        <label>SMS Subscribe URL</label>
+        <input id="sp-subscribe-sms" placeholder="https://example.com/status/subscribe/sms">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Webhook / RSS URL</label>
+      <input id="sp-subscribe-webhook" placeholder="https://example.com/status/feed.xml">
+      <div class="hint">Set any public subscribe or feed links you want shown on the page.</div>
+    </div>
+    <div class="tip">
+      Theme ideas: <strong>Clean</strong> for neutral SaaS, <strong>Midnight</strong> for infra teams,
+      <strong>Sunrise</strong> for warmer brands, <strong>Forest</strong> for calm/product-trust styling.
+    </div>
     <button class="btn btn-primary" onclick="saveStatusPageSettings()">Save</button>
   </div>
   <h3>Which hosts appear on the status page?</h3>
-  <p class="desc" style="margin-bottom:16px">
-    Toggle "Show on status page" on individual hosts (in the Hosts tab) to control visibility.
-    Hosts not shown here are still monitored — they just won't appear on the public page.
-  </p>
   <table>
     <thead><tr><th>Host</th><th>URL</th><th>Status</th><th>Visible on page</th></tr></thead>
     <tbody id="status-page-hosts">
@@ -812,27 +1056,21 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
     </tbody>
   </table>
   <div style="margin-top:20px">
-    <a class="btn btn-ghost" href="/" target="_blank">↗ Preview status page</a>
+    <a class="btn btn-ghost" href="/" target="_blank">Preview status page</a>
   </div>
 </div>
 
-<!-- ══ SETTINGS ═══════════════════════════════════════════════════════════ -->
 <div id="pane-settings" style="display:none">
   <h2>Settings</h2>
   <div class="panel">
     <div class="form-group">
       <label>Check History Retention (days)</label>
       <input id="s-retention" type="number" min="7" max="365">
-      <div class="hint">
-        DynamoDB automatically deletes records older than this via TTL.
-        Changing this only affects new checks — existing records keep their original expiry.
-        Range: 7–365 days.
-      </div>
+      <div class="hint">DynamoDB TTL deletes future check rows after this many days.</div>
     </div>
     <div class="form-group">
       <label>Default Check Interval (seconds)</label>
       <input id="s-interval" type="number" min="60" max="3600">
-      <div class="hint">Used as the default when adding a new host. 60 = every minute.</div>
     </div>
     <div class="form-group">
       <label>Default Timeout (seconds)</label>
@@ -842,15 +1080,14 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </div>
 </div>
 
-<!-- ══ COST ═══════════════════════════════════════════════════════════════ -->
 <div id="pane-cost" style="display:none">
   <h2>Cost Estimator</h2>
   <p class="desc">
-    All AWS Free Tier credits are applied. A typical setup with 10 hosts across 3 regions costs under $2/month.
+    Defaults are filled from your live deployment: enabled hosts, active worker regions, default interval, and retention.
   </p>
   <div class="panel grid2" style="margin-bottom:16px">
-    <div class="form-group"><label>Hosts</label><input id="c-hosts" type="number" value="10" min="1"></div>
-    <div class="form-group"><label>Monitor Regions</label><input id="c-regions" type="number" value="1" min="1"></div>
+    <div class="form-group"><label>Hosts</label><input id="c-hosts" type="number" value="0" min="0"></div>
+    <div class="form-group"><label>Monitor Regions</label><input id="c-regions" type="number" value="0" min="0"></div>
     <div class="form-group"><label>Check Interval (sec)</label><input id="c-interval" type="number" value="60" min="60"></div>
     <div class="form-group"><label>Retention (days)</label><input id="c-days" type="number" value="90"></div>
   </div>
@@ -860,30 +1097,23 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </div>
 </div>
 
-<!-- ══ GUIDES ═════════════════════════════════════════════════════════════ -->
 <div id="pane-guides" style="display:none">
   <h2>Guides &amp; Reference</h2>
 
   <h3>How worker regions work</h3>
   <p class="desc">
-    Clicking "Add Region" in the Regions tab triggers the management Lambda to:
-    (1) create a shared IAM role (once, global), (2) zip the worker code in memory,
-    (3) create a Lambda function in the target region. The management Lambda's single
-    EventBridge schedule then invokes all configured workers each cycle.
+    Each orchestration run fans out from the home-region management Lambda to every deployed worker region.
+    Hosts can optionally be limited to only specific workers.
   </p>
-  <div class="tip">The regional worker code is bundled inside the management Lambda package.
-  Click "Update Code" on a region to push the latest version without redeploying Terraform.</div>
 
   <h3>HTTP check vs TCP check</h3>
   <p class="desc">
-    <strong>HTTP</strong> — sends a GET request, checks status code and latency.
-    Also checks SSL certificate expiry for HTTPS endpoints (warns at &lt;30 days, degrades at &lt;7 days).<br>
-    <strong>TCP</strong> — opens a raw TCP connection to host:port. Useful for databases, SMTP, Redis, etc.
-    Format: <code>hostname:port</code> or <code>tcp://hostname:port</code>.
+    <strong>HTTP</strong> checks status code, latency, and SSL expiry for HTTPS.
+    <strong>TCP</strong> opens a raw socket to host:port for databases, SMTP, Redis, and similar services.
   </p>
 
   <h3>Setting up SNS alerts</h3>
-  <p class="desc">Alerts fire only on state transitions (UP→DOWN, DOWN→UP), not on every check.</p>
+  <p class="desc">Alerts fire on transitions, not on every check.</p>
   <pre># 1. Create an SNS topic
 aws sns create-topic --name uptime-alerts --region us-east-1
 
@@ -891,69 +1121,58 @@ aws sns create-topic --name uptime-alerts --region us-east-1
 aws sns subscribe \\
   --topic-arn arn:aws:sns:us-east-1:ACCOUNT_ID:uptime-alerts \\
   --protocol email \\
-  --notification-endpoint you@example.com
+  --notification-endpoint you@example.com</pre>
 
-# 3. Paste the topic ARN into the host's "SNS Topic ARN" field</pre>
-  <div class="tip">For Slack: use AWS Chatbot or an SNS → Lambda → webhook. For PagerDuty: use their native SNS integration.</div>
+  <h3>Custom domain / DNS</h3>
+  <p class="desc">
+    A direct DNS CNAME to a Lambda Function URL is usually not the cleanest production setup.
+    The recommended route is CloudFront + ACM + your own DNS record. If you want, we can add that setup next.
+  </p>
 
   <h3>Rotating the admin key</h3>
   <pre>NEW_KEY=$(openssl rand -hex 20)
-aws ssm put-parameter \\
-  --name /uptime/admin-key \\
-  --value "$NEW_KEY" --type SecureString --overwrite
-echo "New key: $NEW_KEY"
-# Lambda picks up the new key on next cold start.</pre>
+aws secretsmanager put-secret-value \\
+  --secret-id uptime/admin-key \\
+  --secret-string "$NEW_KEY" \\
+  --region {HOME_REGION}
+echo "New key: $NEW_KEY"</pre>
 
   <h3>Backing up check history</h3>
   <pre>aws dynamodb create-backup \\
   --table-name uptime-checks \\
   --backup-name uptime-backup-$(date +%Y%m%d)</pre>
-
-  <h3>Adding via API</h3>
-  <pre>curl -X POST "$URL/api/hosts" \\
-  -H "Authorization: Bearer YOUR_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"name":"My API","url":"https://api.example.com/health","alert_enabled":true,"alert_sns_arn":"arn:aws:sns:…"}}'</pre>
 </div>
 
-</div><!-- /main -->
+</div>
 
-<!-- ══ Add/Edit Host Modal ════════════════════════════════════════════════ -->
 <div class="modal-overlay" id="host-modal">
   <div class="modal">
     <h3 id="host-modal-title">Add Host</h3>
     <input type="hidden" id="m-id">
     <div class="form-group"><label>Name *</label><input id="m-name" placeholder="My Website"></div>
-    <div class="form-group">
-      <label>URL *</label>
-      <input id="m-url" placeholder="https://example.com  or  db.host.com:5432 for TCP">
-    </div>
+    <div class="form-group"><label>URL *</label><input id="m-url" placeholder="https://example.com or db.host.com:5432"></div>
     <div class="form-group">
       <label>Check Type</label>
       <select id="m-type">
-        <option value="http">HTTP / HTTPS — checks status code, latency, SSL expiry</option>
-        <option value="tcp">TCP — checks raw port connectivity (db, smtp, redis…)</option>
+        <option value="http">HTTP / HTTPS</option>
+        <option value="tcp">TCP</option>
       </select>
     </div>
     <div class="grid2">
-      <div class="form-group">
-        <label>Check Interval (sec)</label>
-        <input id="m-interval" type="number" value="60" min="60" max="3600">
-        <div class="hint">Runs under the central orchestration schedule.</div>
-      </div>
-      <div class="form-group">
-        <label>Timeout (sec)</label>
-        <input id="m-timeout" type="number" value="10" min="1" max="60">
-      </div>
+      <div class="form-group"><label>Check Interval (sec)</label><input id="m-interval" type="number" value="60" min="60" max="3600"></div>
+      <div class="form-group"><label>Timeout (sec)</label><input id="m-timeout" type="number" value="10" min="1" max="60"></div>
     </div>
     <div class="form-group">
       <label>Expected HTTP Status Code</label>
       <input id="m-code" type="number" value="200">
-      <div class="hint">Any other 2xx response is marked as degraded. Ignored for TCP.</div>
+    </div>
+    <div class="form-group">
+      <label>Worker Regions</label>
+      <div class="hint">Leave all unchecked to run this host from every deployed worker region.</div>
+      <div id="m-target-regions" class="checklist"></div>
     </div>
     <div class="form-group">
       <label class="toggle"><input type="checkbox" id="m-page" checked> Show on public status page</label>
-      <div class="hint">Uncheck to monitor silently without exposing to visitors.</div>
     </div>
     <div class="form-group">
       <label class="toggle"><input type="checkbox" id="m-alert" onchange="toggleSNS()"> Enable SNS alerts on state change</label>
@@ -962,27 +1181,22 @@ echo "New key: $NEW_KEY"
       <div class="form-group">
         <label>SNS Topic ARN</label>
         <input id="m-sns" placeholder="arn:aws:sns:us-east-1:123456789012:my-alerts">
-        <div class="hint">The monitor role has sns:Publish on topics in the home region.</div>
       </div>
     </div>
     <div class="form-group">
-      <label class="toggle"><input type="checkbox" id="m-enabled" checked> Enabled (uncheck to pause monitoring)</label>
+      <label class="toggle"><input type="checkbox" id="m-enabled" checked> Enabled</label>
     </div>
     <div style="display:flex;gap:10px;margin-top:8px">
       <button class="btn btn-primary" onclick="saveHost()">Save</button>
-      <button class="btn btn-ghost"   onclick="closeHostModal()">Cancel</button>
+      <button class="btn btn-ghost" onclick="closeHostModal()">Cancel</button>
     </div>
   </div>
 </div>
 
-<!-- ══ Add Region Modal ═══════════════════════════════════════════════════ -->
 <div class="modal-overlay" id="region-modal">
   <div class="modal">
     <h3>Add Worker Region</h3>
-    <p class="desc" style="margin-bottom:16px">
-      This deploys a new worker Lambda in the selected AWS region.
-      Takes ~20–30 seconds. It will join the next management orchestration run automatically.
-    </p>
+    <p class="desc" style="margin-bottom:16px">This deploys a new worker Lambda in the selected AWS region.</p>
     <div class="form-group">
       <label>AWS Region</label>
       <select id="r-region">{region_options}</select>
@@ -990,11 +1204,10 @@ echo "New key: $NEW_KEY"
     <div class="form-group">
       <label>Lambda Memory (MB)</label>
       <select id="r-memory">
-        <option value="128">128 MB — up to ~10 hosts</option>
-        <option value="256" selected>256 MB — up to ~50 hosts (recommended)</option>
-        <option value="512">512 MB — 100+ hosts (more parallelism)</option>
+        <option value="128">128 MB</option>
+        <option value="256" selected>256 MB</option>
+        <option value="512">512 MB</option>
       </select>
-      <div class="hint">More memory = more CPU = faster parallel checks. Minimal cost difference.</div>
     </div>
     <div style="display:flex;gap:10px;margin-top:8px">
       <button class="btn btn-primary" id="r-deploy-btn" onclick="deployRegion()">Deploy</button>
@@ -1007,13 +1220,25 @@ echo "New key: $NEW_KEY"
 <div class="toast hidden" id="toast"></div>
 
 <script>
-const KEY = new URLSearchParams(location.search).get('key') || '';
+let KEY = sessionStorage.getItem('uptime_admin_key') || '';
+const queryKey = new URLSearchParams(location.search).get('key') || '';
+let REGIONS_CACHE = [];
+if (queryKey) {{
+  KEY = queryKey;
+  sessionStorage.setItem('uptime_admin_key', KEY);
+  history.replaceState(null, '', location.pathname);
+}}
 
 function api(path, opts={{}}) {{
   return fetch(path, {{
     ...opts,
     headers: {{ Authorization: 'Bearer ' + KEY, 'Content-Type': 'application/json', ...(opts.headers||{{}}) }}
-  }}).then(r => r.json().catch(() => ({{}}))).catch(e => ({{error: e.message}}));
+  }}).then(async r => {{
+    const data = await r.json().catch(() => ({{}}));
+    if (r.status === 401) return {{...data, error: data.error || 'Unauthorized', unauthorized: true}};
+    if (!r.ok && !data.error) return {{...data, error: 'Request failed'}};
+    return data;
+  }}).catch(e => ({{error: e.message}}));
 }}
 
 function toast(msg, err=false) {{
@@ -1023,24 +1248,95 @@ function toast(msg, err=false) {{
   setTimeout(() => t.className = 'toast hidden', 3500);
 }}
 
+function showAuthGate(message='') {{
+  document.getElementById('auth-gate').style.display = 'flex';
+  document.getElementById('auth-msg').textContent = message;
+}}
+
+function hideAuthGate() {{
+  document.getElementById('auth-gate').style.display = 'none';
+  document.getElementById('auth-msg').textContent = '';
+}}
+
+async function ensureAuthed() {{
+  if (!KEY) {{
+    showAuthGate('Enter the admin token to continue.');
+    return false;
+  }}
+  const probe = await api('/api/auth');
+  if (probe.unauthorized || probe.error) {{
+    showAuthGate('That token was rejected. Check the value and try again.');
+    return false;
+  }}
+  hideAuthGate();
+  return true;
+}}
+
+async function loginAdmin() {{
+  KEY = document.getElementById('auth-key').value.trim();
+  if (!KEY) {{
+    showAuthGate('Enter the admin token first.');
+    return;
+  }}
+  sessionStorage.setItem('uptime_admin_key', KEY);
+  if (await ensureAuthed()) {{
+    document.getElementById('auth-key').value = '';
+    boot();
+  }}
+}}
+
+function logoutAdmin() {{
+  KEY = '';
+  sessionStorage.removeItem('uptime_admin_key');
+  showAuthGate('Signed out.');
+}}
+
 const PANES = ['hosts','regions','status-page','settings','cost','guides'];
 function show(tab) {{
   PANES.forEach((t,i) => {{
     document.getElementById('pane-'+t).style.display = t===tab ? '' : 'none';
     document.querySelectorAll('.tab')[i].classList.toggle('active', t===tab);
   }});
-  if (tab==='hosts')       loadHosts();
-  if (tab==='regions')     loadRegions();
-  if (tab==='status-page') loadStatusPage();
-  if (tab==='settings')    loadSettings();
+  if (tab === 'hosts') loadHosts();
+  if (tab === 'regions') loadRegions();
+  if (tab === 'status-page') loadStatusPage();
+  if (tab === 'settings') loadSettings();
+  if (tab === 'cost') loadCostDefaults();
 }}
 
-// ── Hosts ─────────────────────────────────────────────────────────────────
+async function ensureRegionsLoaded() {{
+  const list = await api('/api/regions');
+  REGIONS_CACHE = Array.isArray(list) ? list : [];
+  return REGIONS_CACHE;
+}}
+
+function renderTargetRegions(selected=[]) {{
+  const wrap = document.getElementById('m-target-regions');
+  if (!REGIONS_CACHE.length) {{
+    wrap.innerHTML = '<div class="hint">No worker regions deployed yet.</div>';
+    return;
+  }}
+  wrap.innerHTML = REGIONS_CACHE.map(r => `
+    <label class="check-item">
+      <input type="checkbox" value="${{r.region}}" ${{selected.includes(r.region) ? 'checked' : ''}}>
+      <span>${{r.region}}</span>
+    </label>
+  `).join('');
+}}
+
+function selectedTargetRegions() {{
+  return Array.from(document.querySelectorAll('#m-target-regions input[type=checkbox]:checked')).map(el => el.value);
+}}
+
 async function loadHosts() {{
   const hosts = await api('/api/hosts');
+  if (hosts.unauthorized) {{
+    showAuthGate('Enter the admin token to load hosts.');
+    return;
+  }}
   const tbody = document.getElementById('hosts-body');
   if (!Array.isArray(hosts) || !hosts.length) {{
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:32px">No hosts yet — click + Add Host to get started.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
     return;
   }}
   tbody.innerHTML = hosts.map(h => `
@@ -1060,7 +1356,8 @@ async function loadHosts() {{
     </tr>`).join('');
 }}
 
-function openAddHost() {{
+async function openAddHost() {{
+  await ensureRegionsLoaded();
   document.getElementById('host-modal-title').textContent = 'Add Host';
   ['m-id','m-name','m-url','m-sns'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('m-type').value = 'http';
@@ -1071,49 +1368,51 @@ function openAddHost() {{
   document.getElementById('m-alert').checked = false;
   document.getElementById('m-enabled').checked = true;
   document.getElementById('m-sns-group').style.display = 'none';
+  renderTargetRegions([]);
   document.getElementById('host-modal').classList.add('open');
 }}
 
-function openEditHost(h) {{
+async function openEditHost(h) {{
+  await ensureRegionsLoaded();
   document.getElementById('host-modal-title').textContent = 'Edit Host';
-  document.getElementById('m-id').value       = h.host_id;
-  document.getElementById('m-name').value     = h.name;
-  document.getElementById('m-url').value      = h.url;
-  document.getElementById('m-type').value     = h.check_type || 'http';
+  document.getElementById('m-id').value = h.host_id;
+  document.getElementById('m-name').value = h.name;
+  document.getElementById('m-url').value = h.url;
+  document.getElementById('m-type').value = h.check_type || 'http';
   document.getElementById('m-interval').value = h.check_interval_seconds || 60;
-  document.getElementById('m-timeout').value  = h.timeout_seconds || 10;
-  document.getElementById('m-code').value     = h.expected_status_code || 200;
-  document.getElementById('m-page').checked   = !!h.show_on_status_page;
-  document.getElementById('m-alert').checked  = !!h.alert_enabled;
-  document.getElementById('m-sns').value      = h.alert_sns_arn || '';
+  document.getElementById('m-timeout').value = h.timeout_seconds || 10;
+  document.getElementById('m-code').value = h.expected_status_code || 200;
+  document.getElementById('m-page').checked = !!h.show_on_status_page;
+  document.getElementById('m-alert').checked = !!h.alert_enabled;
+  document.getElementById('m-sns').value = h.alert_sns_arn || '';
   document.getElementById('m-enabled').checked = h.enabled !== false;
   document.getElementById('m-sns-group').style.display = h.alert_enabled ? '' : 'none';
+  renderTargetRegions(h.target_regions || []);
   document.getElementById('host-modal').classList.add('open');
 }}
 
 function toggleSNS() {{
-  document.getElementById('m-sns-group').style.display =
-    document.getElementById('m-alert').checked ? '' : 'none';
+  document.getElementById('m-sns-group').style.display = document.getElementById('m-alert').checked ? '' : 'none';
 }}
 
 function closeHostModal() {{ document.getElementById('host-modal').classList.remove('open'); }}
 
 async function saveHost() {{
-  const id   = document.getElementById('m-id').value;
+  const id = document.getElementById('m-id').value;
   const body = {{
-    name:                   document.getElementById('m-name').value,
-    url:                    document.getElementById('m-url').value,
-    check_type:             document.getElementById('m-type').value,
+    name: document.getElementById('m-name').value,
+    url: document.getElementById('m-url').value,
+    check_type: document.getElementById('m-type').value,
     check_interval_seconds: +document.getElementById('m-interval').value,
-    timeout_seconds:        +document.getElementById('m-timeout').value,
-    expected_status_code:   +document.getElementById('m-code').value,
-    show_on_status_page:    document.getElementById('m-page').checked,
-    alert_enabled:          document.getElementById('m-alert').checked,
-    alert_sns_arn:          document.getElementById('m-sns').value,
-    enabled:                document.getElementById('m-enabled').checked,
+    timeout_seconds: +document.getElementById('m-timeout').value,
+    expected_status_code: +document.getElementById('m-code').value,
+    show_on_status_page: document.getElementById('m-page').checked,
+    alert_enabled: document.getElementById('m-alert').checked,
+    alert_sns_arn: document.getElementById('m-sns').value,
+    enabled: document.getElementById('m-enabled').checked,
+    target_regions: selectedTargetRegions(),
   }};
-  const res = await api(id ? '/api/hosts/'+id : '/api/hosts',
-    {{ method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }});
+  const res = await api(id ? '/api/hosts/'+id : '/api/hosts', {{method: id ? 'PUT' : 'POST', body: JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
   closeHostModal();
   toast(id ? 'Host updated' : 'Host added');
@@ -1121,25 +1420,29 @@ async function saveHost() {{
 }}
 
 async function deleteHost(id, name) {{
-  if (!confirm(`Delete "${{name}}"?\nThis removes the configuration but not historical check data.`)) return;
+  if (!confirm(`Delete "${{name}}"?`)) return;
   await api('/api/hosts/'+id, {{method:'DELETE'}});
   toast('Host deleted');
   loadHosts();
 }}
 
-// ── Regions ───────────────────────────────────────────────────────────────
 async function loadRegions() {{
   const list = await api('/api/regions');
-  const el   = document.getElementById('regions-list');
-  if (!Array.isArray(list) || !list.length) {{
-    el.innerHTML = '<div style="color:#64748b;padding:20px 0">No worker regions deployed yet. Click + Add Region to get started.</div>';
+  if (list.unauthorized) {{
+    showAuthGate('Enter the admin token to load worker regions.');
     return;
   }}
-  el.innerHTML = list.map(r => `
+  REGIONS_CACHE = Array.isArray(list) ? list : [];
+  const el = document.getElementById('regions-list');
+  if (!REGIONS_CACHE.length) {{
+    el.innerHTML = '<div style="color:#64748b;padding:20px 0">No worker regions deployed yet.</div>';
+    return;
+  }}
+  el.innerHTML = REGIONS_CACHE.map(r => `
     <div class="region-card">
       <div class="region-info">
         <div class="name">${{r.region}} <span class="badge active" style="margin-left:6px">${{r.status||'active'}}</span></div>
-        <div class="meta">Memory: ${{r.memory_mb||256}}MB &nbsp;·&nbsp; Deployed: ${{r.deployed_at ? new Date(r.deployed_at).toLocaleDateString() : '—'}}</div>
+        <div class="meta">Memory: ${{r.memory_mb||256}}MB · Deployed: ${{r.deployed_at ? new Date(r.deployed_at).toLocaleDateString() : '—'}}</div>
       </div>
       <div class="actions">
         <button class="btn btn-warn btn-sm" onclick="updateRegion('${{r.region}}')">Update Code</button>
@@ -1154,19 +1457,17 @@ function openAddRegion() {{
   document.getElementById('r-deploy-btn').innerHTML = 'Deploy';
   document.getElementById('region-modal').classList.add('open');
 }}
+
 function closeRegionModal() {{ document.getElementById('region-modal').classList.remove('open'); }}
 
 async function deployRegion() {{
-  const btn  = document.getElementById('r-deploy-btn');
+  const btn = document.getElementById('r-deploy-btn');
   const stat = document.getElementById('r-status');
-  const body = {{
-    region:    document.getElementById('r-region').value,
-    memory_mb: +document.getElementById('r-memory').value,
-  }};
+  const body = {{region: document.getElementById('r-region').value, memory_mb: +document.getElementById('r-memory').value}};
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Deploying…';
   stat.style.display = '';
-  stat.innerHTML = '<span style="color:#94a3b8">Deploying worker Lambda in '+body.region+'… (~20-30s)</span>';
+  stat.innerHTML = '<span style="color:#94a3b8">Deploying worker Lambda in '+body.region+'…</span>';
   const res = await api('/api/regions', {{method:'POST', body:JSON.stringify(body)}});
   btn.disabled = false;
   btn.innerHTML = 'Deploy';
@@ -1174,14 +1475,13 @@ async function deployRegion() {{
     stat.innerHTML = '<span style="color:#ef4444">Error: '+res.error+'</span>';
     return;
   }}
-  stat.innerHTML = '<span style="color:#22c55e">✓ Deployed successfully</span>';
-  setTimeout(() => closeRegionModal(), 1500);
-  loadRegions();
+  stat.innerHTML = '<span style="color:#22c55e">Deployed successfully</span>';
+  await loadRegions();
   toast('Worker deployed in '+body.region);
 }}
 
 async function updateRegion(region) {{
-  if (!confirm('Push the latest monitor code to '+region+'?\\nThe Lambda will be briefly unavailable during the update.')) return;
+  if (!confirm('Push the latest monitor code to '+region+'?')) return;
   const res = await api('/api/regions/'+region+'/update', {{method:'POST'}});
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Monitor updated in '+region);
@@ -1189,18 +1489,32 @@ async function updateRegion(region) {{
 }}
 
 async function removeRegion(region) {{
-  if (!confirm('Remove monitor from '+region+'?\\nExisting check history is kept in DynamoDB.')) return;
+  if (!confirm('Remove monitor from '+region+'?')) return;
   const res = await api('/api/regions/'+region, {{method:'DELETE'}});
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Monitor removed from '+region);
   loadRegions();
 }}
 
-// ── Status Page ───────────────────────────────────────────────────────────
 async function loadStatusPage() {{
   const [settings, hosts] = await Promise.all([api('/api/settings'), api('/api/hosts')]);
+  if (settings.unauthorized || hosts.unauthorized) {{
+    showAuthGate('Enter the admin token to load status-page settings.');
+    return;
+  }}
+  document.getElementById('sp-brand').value = settings.status_page_brand_name || '';
   document.getElementById('sp-title').value = settings.status_page_title || '';
-  document.getElementById('sp-desc').value  = settings.status_page_description || '';
+  document.getElementById('sp-desc').value = settings.status_page_description || '';
+  document.getElementById('sp-logo').value = settings.status_page_logo_url || '';
+  document.getElementById('sp-theme').value = settings.status_page_theme || 'clean';
+  document.getElementById('sp-maintenance-enabled').checked = !!settings.maintenance_enabled;
+  document.getElementById('sp-maintenance-message').value = settings.maintenance_message || '';
+  document.getElementById('sp-maintenance-window').value = settings.maintenance_window || '';
+  document.getElementById('sp-maintenance-scope').value = settings.maintenance_scope || '';
+  document.getElementById('sp-subscribe-intro').value = settings.status_page_subscribe_intro || 'Subscribe for status updates.';
+  document.getElementById('sp-subscribe-email').value = settings.status_page_subscribe_email_url || '';
+  document.getElementById('sp-subscribe-sms').value = settings.status_page_subscribe_sms_url || '';
+  document.getElementById('sp-subscribe-webhook').value = settings.status_page_subscribe_webhook_url || '';
   const tbody = document.getElementById('status-page-hosts');
   if (!Array.isArray(hosts) || !hosts.length) {{
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b;padding:24px">No hosts yet.</td></tr>';
@@ -1211,13 +1525,7 @@ async function loadStatusPage() {{
       <td style="font-weight:600">${{h.name}}</td>
       <td style="color:#64748b;font-size:.8rem">${{h.url}}</td>
       <td><span class="badge ${{h.current_status||'unknown'}}">${{h.current_status||'unknown'}}</span></td>
-      <td>
-        <label class="toggle" style="cursor:pointer">
-          <input type="checkbox" ${{h.show_on_status_page?'checked':''}}
-            onchange="toggleHostPage('${{h.host_id}}', this.checked)">
-          <span style="font-size:.85rem">${{h.show_on_status_page ? 'Visible' : 'Hidden'}}</span>
-        </label>
-      </td>
+      <td><label class="toggle"><input type="checkbox" ${{h.show_on_status_page?'checked':''}} onchange="toggleHostPage('${{h.host_id}}', this.checked)"><span style="font-size:.85rem">${{h.show_on_status_page ? 'Visible' : 'Hidden'}}</span></label></td>
     </tr>`).join('');
 }}
 
@@ -1228,56 +1536,82 @@ async function toggleHostPage(id, visible) {{
 
 async function saveStatusPageSettings() {{
   const body = {{
-    status_page_title:       document.getElementById('sp-title').value,
+    status_page_brand_name: document.getElementById('sp-brand').value,
+    status_page_title: document.getElementById('sp-title').value,
     status_page_description: document.getElementById('sp-desc').value,
+    status_page_logo_url: document.getElementById('sp-logo').value,
+    status_page_theme: document.getElementById('sp-theme').value,
+    maintenance_enabled: document.getElementById('sp-maintenance-enabled').checked,
+    maintenance_message: document.getElementById('sp-maintenance-message').value,
+    maintenance_window: document.getElementById('sp-maintenance-window').value,
+    maintenance_scope: document.getElementById('sp-maintenance-scope').value,
+    status_page_subscribe_intro: document.getElementById('sp-subscribe-intro').value,
+    status_page_subscribe_email_url: document.getElementById('sp-subscribe-email').value,
+    status_page_subscribe_sms_url: document.getElementById('sp-subscribe-sms').value,
+    status_page_subscribe_webhook_url: document.getElementById('sp-subscribe-webhook').value,
   }};
   const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Status page settings saved');
 }}
 
-// ── Settings ──────────────────────────────────────────────────────────────
 async function loadSettings() {{
   const s = await api('/api/settings');
+  if (s.unauthorized) {{
+    showAuthGate('Enter the admin token to load settings.');
+    return;
+  }}
   document.getElementById('s-retention').value = s.retention_days || 90;
-  document.getElementById('s-interval').value  = s.default_check_interval || 60;
-  document.getElementById('s-timeout').value   = s.default_timeout || 10;
+  document.getElementById('s-interval').value = s.default_check_interval || 60;
+  document.getElementById('s-timeout').value = s.default_timeout || 10;
 }}
 
 async function saveSettings() {{
   const body = {{
-    retention_days:         +document.getElementById('s-retention').value,
+    retention_days: +document.getElementById('s-retention').value,
     default_check_interval: +document.getElementById('s-interval').value,
-    default_timeout:        +document.getElementById('s-timeout').value,
+    default_timeout: +document.getElementById('s-timeout').value,
   }};
   const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Settings saved');
 }}
 
-// ── Cost ──────────────────────────────────────────────────────────────────
+async function loadCostDefaults() {{
+  const data = await api('/api/cost');
+  if (data.unauthorized) {{
+    showAuthGate('Enter the admin token to load cost estimates.');
+    return;
+  }}
+  const defaults = data.defaults || data.inputs || {{}};
+  document.getElementById('c-hosts').value = defaults.hosts ?? 0;
+  document.getElementById('c-regions').value = defaults.regions ?? 0;
+  document.getElementById('c-interval').value = defaults.interval_sec ?? 60;
+  document.getElementById('c-days').value = defaults.retention_days ?? 90;
+  await calcCost();
+}}
+
 async function calcCost() {{
-  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+
-    '&regions='+document.getElementById('c-regions').value+
-    '&interval='+document.getElementById('c-interval').value+
-    '&days='+document.getElementById('c-days').value);
-  const b  = data.breakdown || {{}};
+  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value);
+  if (data.unauthorized) {{
+    showAuthGate('Enter the admin token to calculate costs.');
+    return;
+  }}
+  const b = data.breakdown || {{}};
   const el = document.getElementById('cost-result');
   el.style.display = '';
   document.getElementById('cost-rows').innerHTML =
-    [['Lambda (workers + orchestrator)', b.lambda_usd],
-     ['DynamoDB writes',   b.dynamodb_writes_usd],
-     ['DynamoDB reads',    b.dynamodb_reads_usd],
-     ['DynamoDB storage',  b.dynamodb_storage_usd],
-     ['CloudWatch Logs',   b.cloudwatch_logs_usd],
-     ['Total / month',     data.total_usd_per_month]]
+    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
     .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{(v||0).toFixed(4)}}</span></div>`)
-    .join('') +
-    `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{data.note||''}}</div>`;
+    .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{data.note||''}}</div>`;
 }}
 
-// init
-loadHosts();
+async function boot() {{
+  if (!await ensureAuthed()) return;
+  await Promise.all([ensureRegionsLoaded(), loadHosts()]);
+}}
+
+boot();
 </script>
 </body></html>"""
 
@@ -1314,16 +1648,3 @@ def _parse_body(event: dict) -> dict:
         return json.loads(raw) if raw else {}
     except Exception:
         return {}
-
-def _auth_error_page() -> str:
-    return """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Unauthorized</title>
-<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.box{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:36px;max-width:400px;text-align:center}
-h1{font-size:1.3rem;margin-bottom:12px}p{color:#94a3b8;font-size:.9rem;line-height:1.6;margin-bottom:8px}
-code{background:#0f172a;padding:3px 7px;border-radius:4px;font-size:.8rem}</style></head>
-<body><div class="box"><h1>🔒 Admin Access Required</h1>
-<p>Append your admin key to the URL:</p>
-<p><code>/admin?key=YOUR_KEY</code></p>
-<p style="margin-top:16px">Retrieve your key:<br>
-<code>terraform output -raw admin_key</code></p>
-</div></body></html>"""

@@ -47,7 +47,10 @@ def handler(event, context):
         FilterExpression="enabled = :t AND host_id <> :s AND NOT begins_with(host_id, :r)",
         ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__"},
     )
-    hosts = resp.get("Items", [])
+    hosts = [
+        host for host in resp.get("Items", [])
+        if _host_runs_in_region(host, MONITOR_REGION)
+    ]
 
     if not hosts:
         print(f"[{MONITOR_REGION}] no enabled hosts")
@@ -88,6 +91,13 @@ def handler(event, context):
         "run_id": run_id,
         "results": results,
     }
+
+
+def _host_runs_in_region(host: dict, region: str) -> bool:
+    targets = host.get("target_regions") or []
+    if not targets:
+        return True
+    return region in targets
 
 
 def _check_and_record(host: dict, run_id: str) -> dict:

@@ -8,6 +8,7 @@ on:
       - 'cloudformation/**'
       - 'scripts/package.sh'
       - 'scripts/publish-artifacts.sh'
+      - 'scripts/deploy-new-version.sh'
   workflow_dispatch:
 
 permissions:

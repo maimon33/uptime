@@ -5,7 +5,8 @@ Description: >-
   Secrets Manager admin key, IAM role, and logs. The region where this stack is launched
   becomes the home region. This template may be hosted in a central bucket,
   but the management Lambda zip must be read from a bucket in the same region
-  as the stack's home region.
+  as the stack's home region. Public artifact mapping currently supports only
+  us-east-1, eu-west-1, eu-central-1, and ap-southeast-1.
 
 Parameters:
   AdminApiKey:
@@ -21,6 +22,7 @@ Mappings:
   # The CloudFormation template itself can be served from any public bucket.
   # This mapping is only for the Lambda ZIP artifact, which Lambda requires
   # to come from an S3 bucket in the same region as the function being created.
+  # Only the four regions below are supported by the public artifact publishing flow today.
   ArtifactBuckets:
     us-east-1:
       Name: uptime-artifacts-us-east-1.maimons.dev

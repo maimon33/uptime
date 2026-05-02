@@ -24,9 +24,14 @@ bootstrap path.
 
 - HTTP and TCP checks
 - Multi-region probes
+- Per-host worker-region targeting
 - Public status page
 - Admin UI
+- Status-page themes, brand name, logo, and title
+- Status-page maintenance notice and public subscribe links
 - Per-host SNS alerts
+- Notification controls roadmap: recipient/channel routing, recurring reminders, snooze/delay, quiet hours, sleep windows, TTL where supported
+- Metrics roadmap: per-region uptime, host counts, runtime, RAM, execution counts, failures, and latency summaries
 - DynamoDB TTL-based retention
 - Configurable retention, with `90` days as the default
 
@@ -83,6 +88,9 @@ aws secretsmanager get-secret-value \
 
 If the secret was auto-generated, the admin token is in the `password` field.
 
+Open `/admin` and enter the token there. The browser stores it for the current
+session and sends it as a bearer token to the admin API.
+
 ## Cost
 
 Typical cost is low. For example, `10` hosts, `3` worker regions, `1` minute
@@ -93,6 +101,9 @@ The app also includes a built-in cost estimator at `/api/cost`.
 
 ## More
 
+- Deploy latest version:
+  `./scripts/deploy-new-version.sh eu-central-1`
+  Optional second argument: an SNS topic ARN for deployment notifications.
 - Terraform usage: [terraform/README.md](/Users/assi/Work/repos/maimon33/uptime/terraform/README.md)
 - CloudFormation templates: [cloudformation](/Users/assi/Work/repos/maimon33/uptime/cloudformation)
 - Packaging scripts: [scripts](/Users/assi/Work/repos/maimon33/uptime/scripts)

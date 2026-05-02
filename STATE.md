@@ -28,6 +28,10 @@ Shared context for Claude Code + Codex collaboration.
   - Invokes each region's worker Lambda in parallel (ThreadPoolExecutor, max 8).
   - Collects results, writes aggregate status back to hosts table.
   - Sends SNS alerts on state transitions (centralized, not per-worker).
+- `/admin` now serves a public login shell. The admin token is entered once in-browser and reused from session storage for Bearer-authenticated API calls.
+- The public status page now supports theme/brand/logo settings and shows recent history plus latency badges per region.
+- The public status page also supports a configurable maintenance notice plus public subscribe links for email/SMS/webhook or RSS destinations.
+- Hosts can now optionally limit checks to a selected subset of deployed worker regions via `target_regions`.
 - Worker Lambdas (`uptime-monitor-<region>`) no longer have their own EventBridge schedules.
   They are only invoked by the orchestrator. They run checks and return results; they do NOT write to DynamoDB themselves (check recording moved to orchestrator via `_apply_aggregate_updates`).
 
@@ -46,6 +50,7 @@ Shared context for Claude Code + Codex collaboration.
 | `terraform/main.tf` | Claude | Alternative Terraform deployment (may lag CFN) |
 | `scripts/package.sh` | Both | Builds `dist/management.zip` (copies monitor into management) |
 | `scripts/publish-artifacts.sh` | Codex | Packages + uploads to S3 + prints CFN quick-create URL |
+| `scripts/deploy-new-version.sh` | Codex | Publishes artifacts, updates the live management Lambda, writes `dist/deploy-last.json`, optionally notifies SNS |
 
 ### DynamoDB schema
 
@@ -53,8 +58,8 @@ Shared context for Claude Code + Codex collaboration.
 
 | host_id value | Type | Description |
 |---|---|---|
-| `<uuid>` | Host config | name, url, check_type, enabled, alert_enabled, alert_sns_arn, show_on_status_page, expected_status_code, current_status, last_checked_at, last_down_at, last_latency_ms, region_statuses |
-| `__settings__` | Settings | status_page_title, status_page_description, retention_days, default_check_interval, default_timeout |
+| `<uuid>` | Host config | name, url, check_type, enabled, alert_enabled, alert_sns_arn, show_on_status_page, expected_status_code, target_regions, current_status, last_checked_at, last_down_at, last_latency_ms, region_statuses |
+| `__settings__` | Settings | status_page_title, status_page_description, status_page_brand_name, status_page_logo_url, status_page_theme, status_page_subscribe_intro, status_page_subscribe_email_url, status_page_subscribe_sms_url, status_page_subscribe_webhook_url, maintenance_enabled, maintenance_message, maintenance_window, maintenance_scope, retention_days, default_check_interval, default_timeout |
 | `__region__<name>` | Region record | region, function_arn, function_name, memory_mb, status, deployed_at |
 
 **`uptime-checks` table** — PK: `host_id`, SK: `checked_at` (ISO timestamp)
@@ -74,7 +79,8 @@ Shared context for Claude Code + Codex collaboration.
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` or `/status` | Public status page |
-| GET | `/admin` | Admin SPA (requires `?key=` or `Authorization: Bearer`) |
+| GET | `/admin` | Admin SPA login shell |
+| GET | `/api/auth` | Validate current bearer token |
 | GET | `/api/hosts` | List all hosts |
 | POST | `/api/hosts` | Create host |
 | GET | `/api/hosts/:id` | Get host |
@@ -110,7 +116,11 @@ The management role has permissions to: manage Lambda functions (`uptime-monitor
 
 4. **Worker return format**: `_invoke_region_worker` in handler.py expects worker to return `{"results": [...]}`. The current monitor handler returns `{"checked": N, "up": N, "down": N, "region": ...}` — it does NOT return a `results` list. The orchestrator's `result_rows` will always be empty. Either the worker needs to return per-check results, or the orchestrator needs to read from DynamoDB after workers complete.
 
-5. **Admin UI `schedule` field**: The UI still shows a schedule dropdown when adding a region. But `regions.py:deploy_region` no longer takes a schedule param — workers have no EventBridge schedule. The UI field is dead. Either remove it or restore per-region scheduling.
+5. **CloudFormation section below is stale**: it still shows the older parameterized stack flow. Update it if this file is kept as an operator guide.
+
+6. **Notifications roadmap vs current implementation**: the UI/docs now call out future notification controls like quiet hours, snooze, sleep, recurring reminders, and richer recipient routing. Current code still only sends transition alerts to a configured SNS topic ARN per host.
+
+7. **Metrics roadmap vs current implementation**: the product notes now mention runtime/RAM/execution and per-region rollups, but the current system mainly persists check history, aggregate status, and latency. Additional metric collection and dashboards are still to be implemented.
 
 ---
 
