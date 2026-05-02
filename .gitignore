@@ -1,0 +1,13 @@
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!example.tfvars
+*.zip
+__pycache__/
+*.pyc
+.env
+.DS_Store
+dist/
+.terraform-states/
+src/management/_monitor_handler.py

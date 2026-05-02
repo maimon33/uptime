@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Creates an S3 bucket for Uptime release artifacts and public install assets,
+  such as management.zip and CloudFormation templates.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique bucket name for Uptime artifacts.
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enable bucket versioning.
+
+  AllowPublicRead:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether uploaded objects should be publicly readable.
+
+Conditions:
+  VersioningEnabled: !Equals [!Ref EnableVersioning, 'true']
+  PublicReadEnabled: !Equals [!Ref AllowPublicRead, 'true']
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: !If [VersioningEnabled, Enabled, Suspended]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: !If [PublicReadEnabled, false, true]
+        IgnorePublicAcls: !If [PublicReadEnabled, false, true]
+        BlockPublicPolicy: !If [PublicReadEnabled, false, true]
+        RestrictPublicBuckets: !If [PublicReadEnabled, false, true]
+      Tags:
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: Project
+          Value: uptime
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: PublicReadEnabled
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${ArtifactsBucket.Arn}/*'
+
+Outputs:
+  BucketName:
+    Description: Name of the artifacts bucket.
+    Value: !Ref ArtifactsBucket
+
+  BucketRegionalDomainName:
+    Description: Regional S3 domain for the artifacts bucket.
+    Value: !GetAtt ArtifactsBucket.RegionalDomainName
+
+  SuggestedLambdaZipKey:
+    Description: Suggested object key for the packaged management Lambda zip under a dedicated prefix.
+    Value: uptime/releases/management.zip
+
+  SuggestedBootstrapTemplateKey:
+    Description: Suggested object key for the bootstrap CloudFormation template under a dedicated prefix.
+    Value: uptime/cloudformation/uptime-bootstrap.yaml

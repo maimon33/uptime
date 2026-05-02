@@ -1,0 +1,101 @@
+name: Publish artifacts
+
+# Runs when anything that affects the built output changes on main.
+# Also available as a manual trigger (e.g. to force a republish without a code change).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'cloudformation/**'
+      - 'scripts/package.sh'
+  workflow_dispatch:
+
+# ── AWS authentication ─────────────────────────────────────────────────────────
+# This workflow uses OIDC — no long-lived AWS keys stored in GitHub secrets.
+#
+# One-time setup in your AWS account:
+#   1. Create an IAM OIDC identity provider:
+#        Provider URL : https://token.actions.githubusercontent.com
+#        Audience     : sts.amazonaws.com
+#
+#   2. Create an IAM role (e.g. "uptime-github-publish") with this trust policy:
+#        {
+#          "Version": "2012-10-17",
+#          "Statement": [{
+#            "Effect": "Allow",
+#            "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com" },
+#            "Action": "sts:AssumeRoleWithWebIdentity",
+#            "Condition": {
+#              "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+#              "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:maimon33/uptime:*" }
+#            }
+#          }]
+#        }
+#
+#   3. Attach a policy granting S3 write access to the release bucket:
+#        {
+#          "Version": "2012-10-17",
+#          "Statement": [{
+#            "Effect": "Allow",
+#            "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+#            "Resource": [
+#              "arn:aws:s3:::www.maimons.dev",
+#              "arn:aws:s3:::www.maimons.dev/uptime/*"
+#            ]
+#          }]
+#        }
+#
+#   4. Add the role ARN as a GitHub secret:
+#        Settings → Secrets → Actions → New repository secret
+#        Name : AWS_PUBLISH_ROLE_ARN
+#        Value: arn:aws:iam::ACCOUNT_ID:role/uptime-github-publish
+#
+# Alternative — access keys (simpler but less secure):
+#   Skip steps 1–2 above. Create an IAM user with the same S3 policy.
+#   Add two secrets: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+#   Then replace the configure-aws-credentials step below with:
+#
+#     - uses: aws-actions/configure-aws-credentials@v4
+#       with:
+#         aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+#         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#         aws-region: us-east-1
+
+permissions:
+  id-token: write   # required for OIDC token request
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Publish artifacts
+        run: |
+          chmod +x scripts/publish-artifacts.sh scripts/package.sh
+          ./scripts/publish-artifacts.sh
+
+      - name: Summary
+        if: success()
+        run: |
+          VERSION="$(git rev-parse --short HEAD)"
+          echo "### Published \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | Path |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Lambda zip | \`s3://www.maimons.dev/uptime/releases/management.zip\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CFN template | \`s3://www.maimons.dev/uptime/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Versioned | \`s3://www.maimons.dev/uptime/releases/${VERSION}/\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "[One-click deploy](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https://www.maimons.dev.s3.amazonaws.com/uptime/cloudformation/uptime-bootstrap.yaml)" >> "$GITHUB_STEP_SUMMARY"
