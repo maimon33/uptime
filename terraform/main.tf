@@ -265,10 +265,26 @@ resource "aws_lambda_function_url" "management" {
 
   cors {
     allow_origins = ["*"]
-    allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE"]
     allow_headers = ["Content-Type", "Authorization"]
     max_age       = 300
   }
+}
+
+resource "aws_lambda_permission" "allow_public_function_url" {
+  statement_id        = "AllowPublicFunctionUrl"
+  action              = "lambda:InvokeFunctionUrl"
+  function_name       = aws_lambda_function.management.function_name
+  principal           = "*"
+  function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "allow_public_function_url_invoke_function" {
+  statement_id  = "AllowPublicFunctionUrlInvokeFunction"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.management.function_name
+  principal     = "*"
+  invoked_via_function_url = true
 }
 
 # ── Optional: custom domain via CloudFront + ACM + Route53 ───────────────────

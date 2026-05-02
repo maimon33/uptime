@@ -266,6 +266,14 @@ Resources:
       Principal: '*'
       FunctionUrlAuthType: NONE
 
+  AllowPublicFunctionUrlInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ManagementFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
 Outputs:
   HomeRegion:
     Description: Stack home region. This is where management, DynamoDB, Secrets Manager, logs, and the central schedule live.
