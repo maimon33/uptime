@@ -68,6 +68,13 @@ permissions:
   id-token: write   # required for OIDC token request
   contents: read
 
+env:
+  ARTIFACT_PREFIX: uptime
+  ARTIFACT_BUCKET_US_EAST_1: uptime-artifacts-us-east-1.maimons.dev
+  ARTIFACT_BUCKET_EU_WEST_1: uptime-artifacts-eu-west-1.maimons.dev
+  ARTIFACT_BUCKET_EU_CENTRAL_1: uptime-artifacts-eu-central-1.maimons.dev
+  ARTIFACT_BUCKET_AP_SOUTHEAST_1: uptime-artifacts-ap-southeast-1.maimons.dev
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -82,10 +89,24 @@ jobs:
           role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
 
-      - name: Publish artifacts
+      - name: Publish artifacts to all supported regions
         run: |
           chmod +x scripts/publish-artifacts.sh scripts/package.sh
-          ./scripts/publish-artifacts.sh
+          for spec in \
+            "us-east-1:${ARTIFACT_BUCKET_US_EAST_1}" \
+            "eu-west-1:${ARTIFACT_BUCKET_EU_WEST_1}" \
+            "eu-central-1:${ARTIFACT_BUCKET_EU_CENTRAL_1}" \
+            "ap-southeast-1:${ARTIFACT_BUCKET_AP_SOUTHEAST_1}"
+          do
+            REGION="${spec%%:*}"
+            BUCKET="${spec#*:}"
+            if [ -z "$BUCKET" ]; then
+              echo "Missing bucket variable for ${REGION}"
+              exit 1
+            fi
+            echo "Publishing to ${REGION} bucket: ${BUCKET}"
+            ./scripts/publish-artifacts.sh "$BUCKET" "$ARTIFACT_PREFIX"
+          done
 
       - name: Summary
         if: success()
@@ -93,10 +114,15 @@ jobs:
           VERSION="$(git rev-parse --short HEAD)"
           echo "### Published \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| | Path |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Lambda zip | \`s3://www.maimons.dev/uptime/releases/management.zip\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| CFN template | \`s3://www.maimons.dev/uptime/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Versioned | \`s3://www.maimons.dev/uptime/releases/${VERSION}/\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | Bucket | Live template |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| us-east-1 | \`${ARTIFACT_BUCKET_US_EAST_1}\` | \`s3://${ARTIFACT_BUCKET_US_EAST_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| eu-west-1 | \`${ARTIFACT_BUCKET_EU_WEST_1}\` | \`s3://${ARTIFACT_BUCKET_EU_WEST_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| eu-central-1 | \`${ARTIFACT_BUCKET_EU_CENTRAL_1}\` | \`s3://${ARTIFACT_BUCKET_EU_CENTRAL_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ap-southeast-1 | \`${ARTIFACT_BUCKET_AP_SOUTHEAST_1}\` | \`s3://${ARTIFACT_BUCKET_AP_SOUTHEAST_1}/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "[One-click deploy](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https://www.maimons.dev.s3.amazonaws.com/uptime/cloudformation/uptime-bootstrap.yaml)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Official quick-create examples:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- us-east-1: https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_US_EAST_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- eu-west-1: https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_EU_WEST_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- eu-central-1: https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_EU_CENTRAL_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ap-southeast-1: https://console.aws.amazon.com/cloudformation/home?region=ap-southeast-1#/stacks/quickcreate?templateURL=https://${ARTIFACT_BUCKET_AP_SOUTHEAST_1}.s3.amazonaws.com/${ARTIFACT_PREFIX}/cloudformation/uptime-bootstrap.yaml" >> "$GITHUB_STEP_SUMMARY"
