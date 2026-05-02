@@ -29,7 +29,9 @@ bootstrap path.
 - Admin UI
 - Status-page themes, brand name, logo, and title
 - Status-page maintenance notice and public subscribe links
+- Custom-domain deploy/destroy flow from the admin UI using CloudFront + ACM, with manual DNS record instructions
 - Per-host SNS alerts
+- Admin notification settings for defaults, quiet hours, reminder cadence, sleep windows, and maintenance muting
 - Notification controls roadmap: recipient/channel routing, recurring reminders, snooze/delay, quiet hours, sleep windows, TTL where supported
 - Metrics roadmap: per-region uptime, host counts, runtime, RAM, execution counts, failures, and latency summaries
 - DynamoDB TTL-based retention

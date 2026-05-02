@@ -151,6 +151,21 @@ resource "aws_iam_role_policy" "management" {
         Action   = ["sns:Publish"]
         Resource = "arn:aws:sns:${var.aws_region}:${local.account_id}:*"
       },
+      {
+        Sid    = "CustomDomain"
+        Effect = "Allow"
+        Action = [
+          "acm:RequestCertificate",
+          "acm:DescribeCertificate",
+          "acm:DeleteCertificate",
+          "cloudfront:CreateDistribution",
+          "cloudfront:GetDistribution",
+          "cloudfront:GetDistributionConfig",
+          "cloudfront:UpdateDistribution",
+          "cloudfront:DeleteDistribution",
+        ]
+        Resource = "*"
+      },
       # ── Permissions to manage monitor Lambdas in any region ──────────────
       # Scoped to functions named <project>-monitor-* in this account.
       {

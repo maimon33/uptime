@@ -31,6 +31,8 @@ Shared context for Claude Code + Codex collaboration.
 - `/admin` now serves a public login shell. The admin token is entered once in-browser and reused from session storage for Bearer-authenticated API calls.
 - The public status page now supports theme/brand/logo settings and shows recent history plus latency badges per region.
 - The public status page also supports a configurable maintenance notice plus public subscribe links for email/SMS/webhook or RSS destinations.
+- The status-page admin pane can now start and tear down a custom-domain rollout via ACM + CloudFront. DNS stays manual by design: the app returns the exact validation and traffic records the operator should create or remove.
+- The admin UI now includes a Notifications tab for deployment-wide defaults like topic ARN, quiet hours, reminder cadence, sleep windows, TTL, and maintenance muting. These values are stored in settings even where backend enforcement is still pending.
 - Hosts can now optionally limit checks to a selected subset of deployed worker regions via `target_regions`.
 - Worker Lambdas (`uptime-monitor-<region>`) no longer have their own EventBridge schedules.
   They are only invoked by the orchestrator. They run checks and return results; they do NOT write to DynamoDB themselves (check recording moved to orchestrator via `_apply_aggregate_updates`).
@@ -59,7 +61,7 @@ Shared context for Claude Code + Codex collaboration.
 | host_id value | Type | Description |
 |---|---|---|
 | `<uuid>` | Host config | name, url, check_type, enabled, alert_enabled, alert_sns_arn, show_on_status_page, expected_status_code, target_regions, current_status, last_checked_at, last_down_at, last_latency_ms, region_statuses |
-| `__settings__` | Settings | status_page_title, status_page_description, status_page_brand_name, status_page_logo_url, status_page_theme, status_page_subscribe_intro, status_page_subscribe_email_url, status_page_subscribe_sms_url, status_page_subscribe_webhook_url, maintenance_enabled, maintenance_message, maintenance_window, maintenance_scope, retention_days, default_check_interval, default_timeout |
+| `__settings__` | Settings | status_page_title, status_page_description, status_page_brand_name, status_page_logo_url, status_page_theme, status_page_subscribe_intro, status_page_subscribe_email_url, status_page_subscribe_sms_url, status_page_subscribe_webhook_url, maintenance_enabled, maintenance_message, maintenance_window, maintenance_scope, notifications_default_topic_arn, notifications_sender_label, notifications_initial_delay_seconds, notifications_reminder_interval_minutes, notifications_ttl_seconds, notifications_quiet_hours_enabled, notifications_quiet_hours_timezone, notifications_quiet_hours_start, notifications_quiet_hours_end, notifications_sleep_until, notifications_mute_during_maintenance, custom_domain_name, custom_domain_origin_url, custom_domain_certificate_arn, custom_domain_distribution_id, custom_domain_distribution_domain_name, custom_domain_distribution_status, custom_domain_status, custom_domain_last_error, custom_domain_validation_records, retention_days, default_check_interval, default_timeout |
 | `__region__<name>` | Region record | region, function_arn, function_name, memory_mb, status, deployed_at |
 
 **`uptime-checks` table** — PK: `host_id`, SK: `checked_at` (ISO timestamp)
@@ -121,6 +123,8 @@ The management role has permissions to: manage Lambda functions (`uptime-monitor
 6. **Notifications roadmap vs current implementation**: the UI/docs now call out future notification controls like quiet hours, snooze, sleep, recurring reminders, and richer recipient routing. Current code still only sends transition alerts to a configured SNS topic ARN per host.
 
 7. **Metrics roadmap vs current implementation**: the product notes now mention runtime/RAM/execution and per-region rollups, but the current system mainly persists check history, aggregate status, and latency. Additional metric collection and dashboards are still to be implemented.
+
+8. **Custom-domain rollout is intentionally progressive**: the admin API can request the certificate, inspect validation state, create/disable/delete the CloudFront distribution, and tell the operator which DNS records to manage manually. It does not edit DNS itself.
 
 ---
 

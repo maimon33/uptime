@@ -30,7 +30,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from decimal import Decimal
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import boto3
 
@@ -42,6 +42,9 @@ _ssm = None
 _secretsmanager = None
 _lambda = None
 _sns = None
+_acm = None
+_cloudfront = None
+_route53 = None
 
 def _db():
     global _dynamodb
@@ -78,6 +81,27 @@ def _sns_client():
         _sns = boto3.client("sns", region_name=HOME_REGION)
     return _sns
 
+
+def _acm_client():
+    global _acm
+    if _acm is None:
+        _acm = boto3.client("acm", region_name="us-east-1")
+    return _acm
+
+
+def _cloudfront_client():
+    global _cloudfront
+    if _cloudfront is None:
+        _cloudfront = boto3.client("cloudfront")
+    return _cloudfront
+
+
+def _route53_client():
+    global _route53
+    if _route53 is None:
+        _route53 = boto3.client("route53")
+    return _route53
+
 # ── Config ────────────────────────────────────────────────────────────────────
 HOSTS_TABLE     = os.environ["HOSTS_TABLE"]
 CHECKS_TABLE    = os.environ["CHECKS_TABLE"]
@@ -100,6 +124,28 @@ _SETTINGS_DEFAULTS = {
     "maintenance_message":     "",
     "maintenance_window":      "",
     "maintenance_scope":       "",
+    "notifications_default_topic_arn": "",
+    "notifications_sender_label": "",
+    "notifications_initial_delay_seconds": 0,
+    "notifications_reminder_interval_minutes": 0,
+    "notifications_ttl_seconds": 0,
+    "notifications_quiet_hours_enabled": False,
+    "notifications_quiet_hours_timezone": "UTC",
+    "notifications_quiet_hours_start": "",
+    "notifications_quiet_hours_end": "",
+    "notifications_sleep_until": "",
+    "notifications_mute_during_maintenance": True,
+    "custom_domain_name": "",
+    "custom_domain_origin_url": "",
+    "custom_domain_hosted_zone_name": "",
+    "custom_domain_zone_id": "",
+    "custom_domain_certificate_arn": "",
+    "custom_domain_distribution_id": "",
+    "custom_domain_distribution_domain_name": "",
+    "custom_domain_distribution_status": "",
+    "custom_domain_status": "",
+    "custom_domain_last_error": "",
+    "custom_domain_validation_records": [],
     "retention_days":          RETENTION_DAYS,
     "default_check_interval":  60,
     "default_timeout":         10,
@@ -246,6 +292,14 @@ def _route_api(method: str, path: str, event: dict) -> dict:
         if method == "GET": return _get_settings()
         if method == "PUT": return _update_settings(body)
 
+    if resource == "custom-domain":
+        if method == "GET":
+            return _get_custom_domain_status(event)
+        if method == "POST":
+            return _deploy_custom_domain(body, event)
+        if method == "DELETE":
+            return _destroy_custom_domain()
+
     # ── /api/cost ─────────────────────────────────────────────────────────────
     if resource == "cost":
         return _cost_estimate(qs)
@@ -346,7 +400,7 @@ def _get_checks(host_id: str, limit: int = 200) -> dict:
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 def _get_settings() -> dict:
-    item = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": "__settings__"}).get("Item", {})
+    item = _load_settings_item()
     item.pop("host_id", None)
     return _json(200, {**_SETTINGS_DEFAULTS, **item})
 
@@ -358,13 +412,35 @@ def _update_settings(body: dict) -> dict:
         "status_page_subscribe_sms_url", "status_page_subscribe_webhook_url",
         "maintenance_enabled", "maintenance_message", "maintenance_window",
         "maintenance_scope",
+        "notifications_default_topic_arn", "notifications_sender_label",
+        "notifications_initial_delay_seconds", "notifications_reminder_interval_minutes",
+        "notifications_ttl_seconds", "notifications_quiet_hours_enabled",
+        "notifications_quiet_hours_timezone", "notifications_quiet_hours_start",
+        "notifications_quiet_hours_end", "notifications_sleep_until",
+        "notifications_mute_during_maintenance",
+        "custom_domain_name", "custom_domain_origin_url", "custom_domain_hosted_zone_name", "custom_domain_zone_id",
+        "custom_domain_certificate_arn", "custom_domain_distribution_id",
+        "custom_domain_distribution_domain_name", "custom_domain_distribution_status",
+        "custom_domain_status", "custom_domain_last_error", "custom_domain_validation_records",
         "retention_days", "default_check_interval", "default_timeout",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return _json(400, {"error": "No updatable settings"})
-    _db().Table(HOSTS_TABLE).put_item(Item={"host_id": "__settings__", **updates})
-    return _json(200, updates)
+    item = _load_settings_item()
+    item.update(updates)
+    _save_settings_item(item)
+    item.pop("host_id", None)
+    return _json(200, item)
+
+
+def _load_settings_item() -> dict:
+    return _db().Table(HOSTS_TABLE).get_item(Key={"host_id": "__settings__"}).get("Item", {"host_id": "__settings__"})
+
+
+def _save_settings_item(item: dict) -> None:
+    payload = {"host_id": "__settings__", **{k: v for k, v in item.items() if k != "host_id"}}
+    _db().Table(HOSTS_TABLE).put_item(Item=payload)
 
 
 def _invoke_region_worker(region: str, run_id: str) -> dict:
@@ -539,6 +615,294 @@ def _remove_region(region: str) -> dict:
         return _json(200, {"removed": region})
     except Exception as e:
         return _json(500, {"error": str(e)})
+
+
+# ── Custom domain ─────────────────────────────────────────────────────────────
+
+def _get_custom_domain_status(event: dict | None = None) -> dict:
+    settings = _load_settings_item()
+    cert_arn = settings.get("custom_domain_certificate_arn")
+    if cert_arn:
+        try:
+            cert = _acm_client().describe_certificate(CertificateArn=cert_arn)["Certificate"]
+            settings["custom_domain_validation_records"] = _certificate_validation_records(cert)
+            if cert["Status"] != "ISSUED":
+                settings["custom_domain_status"] = "pending_validation"
+        except Exception as exc:
+            settings["custom_domain_last_error"] = str(exc)
+    distribution_id = settings.get("custom_domain_distribution_id")
+    if distribution_id:
+        try:
+            distribution = _cloudfront_client().get_distribution(Id=distribution_id)["Distribution"]
+            settings["custom_domain_distribution_domain_name"] = distribution["DomainName"]
+            settings["custom_domain_distribution_status"] = distribution["Status"]
+            settings["custom_domain_status"] = "ready" if distribution["Status"] == "Deployed" else "creating_distribution"
+        except Exception as exc:
+            settings["custom_domain_last_error"] = str(exc)
+    _save_settings_item(settings)
+    summary = _custom_domain_summary(settings, event)
+    return _json(200, summary)
+
+
+def _deploy_custom_domain(body: dict, event: dict | None = None) -> dict:
+    domain_name = str(body.get("domain_name") or "").strip().lower().rstrip(".")
+    if not domain_name:
+        return _json(400, {"error": "'domain_name' is required"})
+
+    settings = _load_settings_item()
+    existing_domain = str(settings.get("custom_domain_name") or "").strip().lower().rstrip(".")
+    if existing_domain and existing_domain != domain_name and (
+        settings.get("custom_domain_certificate_arn") or settings.get("custom_domain_distribution_id")
+    ):
+        return _json(400, {"error": f"Custom domain resources already exist for {existing_domain}. Destroy them first before switching domains."})
+
+    origin_url = _management_origin_url(settings, event)
+    if not origin_url:
+        return _json(400, {"error": "Unable to determine the raw Lambda Function URL. Open the admin using the Function URL once, then try again."})
+
+    settings["custom_domain_name"] = domain_name
+    settings["custom_domain_origin_url"] = origin_url
+    settings["custom_domain_last_error"] = ""
+
+    cert_arn = settings.get("custom_domain_certificate_arn")
+    if not cert_arn:
+        cert_resp = _acm_client().request_certificate(
+            DomainName=domain_name,
+            ValidationMethod="DNS",
+            Tags=[
+                {"Key": "Project", "Value": os.environ.get("PROJECT", "uptime")},
+                {"Key": "ManagedBy", "Value": "uptime-management"},
+            ],
+        )
+        cert_arn = cert_resp["CertificateArn"]
+        settings["custom_domain_certificate_arn"] = cert_arn
+
+    cert = _acm_client().describe_certificate(CertificateArn=cert_arn)["Certificate"]
+    validation_records = _certificate_validation_records(cert)
+    settings["custom_domain_validation_records"] = validation_records
+
+    if cert["Status"] != "ISSUED":
+        settings["custom_domain_status"] = "pending_validation"
+        settings["custom_domain_distribution_status"] = ""
+        _save_settings_item(settings)
+        return _json(200, _custom_domain_summary(settings, event))
+
+    distribution_id = settings.get("custom_domain_distribution_id")
+    if not distribution_id:
+        distribution = _cloudfront_client().create_distribution(
+            DistributionConfig=_cloudfront_distribution_config(
+                domain_name=domain_name,
+                origin_url=origin_url,
+                certificate_arn=cert_arn,
+            )
+        )["Distribution"]
+        settings["custom_domain_distribution_id"] = distribution["Id"]
+        settings["custom_domain_distribution_domain_name"] = distribution["DomainName"]
+        settings["custom_domain_distribution_status"] = distribution["Status"]
+        settings["custom_domain_status"] = "creating_distribution"
+        _save_settings_item(settings)
+        return _json(200, _custom_domain_summary(settings, event))
+
+    try:
+        distribution = _cloudfront_client().get_distribution(Id=distribution_id)["Distribution"]
+        settings["custom_domain_distribution_domain_name"] = distribution["DomainName"]
+        settings["custom_domain_distribution_status"] = distribution["Status"]
+        settings["custom_domain_status"] = "ready" if distribution["Status"] == "Deployed" else "creating_distribution"
+    except Exception as exc:
+        settings["custom_domain_last_error"] = str(exc)
+        settings["custom_domain_status"] = "error"
+
+    _save_settings_item(settings)
+    return _json(200, _custom_domain_summary(settings, event))
+
+
+def _destroy_custom_domain() -> dict:
+    settings = _load_settings_item()
+    if not settings.get("custom_domain_name") and not settings.get("custom_domain_certificate_arn") and not settings.get("custom_domain_distribution_id"):
+        return _json(200, {"ok": True, "status": "not_configured", "dns_records_to_remove": []})
+    cleanup_records = _custom_domain_summary(settings).get("dns_records_to_remove", [])
+
+    distribution_id = settings.get("custom_domain_distribution_id")
+    if distribution_id:
+        try:
+            dist_resp = _cloudfront_client().get_distribution_config(Id=distribution_id)
+            dist_cfg = dist_resp["DistributionConfig"]
+            etag = dist_resp["ETag"]
+            if dist_cfg.get("Enabled", False):
+                dist_cfg["Enabled"] = False
+                _cloudfront_client().update_distribution(Id=distribution_id, IfMatch=etag, DistributionConfig=dist_cfg)
+                settings["custom_domain_distribution_status"] = "Disabling"
+                settings["custom_domain_status"] = "disabling_distribution"
+                _save_settings_item(settings)
+                return _json(200, _custom_domain_summary(settings))
+            distribution = _cloudfront_client().get_distribution(Id=distribution_id)["Distribution"]
+            settings["custom_domain_distribution_status"] = distribution["Status"]
+            if distribution["Status"] != "Deployed":
+                settings["custom_domain_status"] = "disabling_distribution"
+                _save_settings_item(settings)
+                return _json(200, _custom_domain_summary(settings))
+            _cloudfront_client().delete_distribution(Id=distribution_id, IfMatch=etag)
+            settings["custom_domain_distribution_id"] = ""
+            settings["custom_domain_distribution_domain_name"] = ""
+            settings["custom_domain_distribution_status"] = ""
+        except _cloudfront_client().exceptions.NoSuchDistribution:
+            settings["custom_domain_distribution_id"] = ""
+            settings["custom_domain_distribution_domain_name"] = ""
+            settings["custom_domain_distribution_status"] = ""
+
+    cert_arn = settings.get("custom_domain_certificate_arn")
+    if cert_arn:
+        try:
+            _acm_client().delete_certificate(CertificateArn=cert_arn)
+            settings["custom_domain_certificate_arn"] = ""
+            settings["custom_domain_validation_records"] = []
+        except Exception as exc:
+            settings["custom_domain_status"] = "waiting_certificate_release"
+            settings["custom_domain_last_error"] = str(exc)
+            _save_settings_item(settings)
+            return _json(200, _custom_domain_summary(settings))
+
+    settings["custom_domain_status"] = "not_configured"
+    settings["custom_domain_last_error"] = ""
+    _save_settings_item(settings)
+    summary = _custom_domain_summary(settings)
+    if cleanup_records:
+        summary["dns_records_to_remove"] = cleanup_records
+    return _json(200, summary)
+
+
+def _management_origin_url(settings: dict, event: dict | None = None) -> str:
+    saved = str(settings.get("custom_domain_origin_url") or "").strip()
+    if saved:
+        return saved
+    request_domain = (((event or {}).get("requestContext") or {}).get("domainName") or "").strip()
+    if request_domain and ".lambda-url." in request_domain and request_domain.endswith(".on.aws"):
+        proto = ((event or {}).get("headers") or {}).get("x-forwarded-proto", "https")
+        return f"{proto}://{request_domain}"
+    return ""
+
+
+def _certificate_validation_records(certificate: dict) -> list[dict]:
+    records = []
+    for option in certificate.get("DomainValidationOptions", []):
+        resource_record = option.get("ResourceRecord") or {}
+        if not resource_record:
+            continue
+        records.append({
+            "name": resource_record.get("Name", ""),
+            "type": resource_record.get("Type", ""),
+            "value": resource_record.get("Value", ""),
+        })
+    return records
+
+
+def _cloudfront_distribution_config(domain_name: str, origin_url: str, certificate_arn: str) -> dict:
+    origin_domain = urlparse(origin_url).netloc
+    return {
+        "CallerReference": f"{domain_name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+        "Comment": f"{os.environ.get('PROJECT', 'uptime')} status page for {domain_name}",
+        "Enabled": True,
+        "Aliases": {"Quantity": 1, "Items": [domain_name]},
+        "Origins": {
+            "Quantity": 1,
+            "Items": [{
+                "Id": "lambda",
+                "DomainName": origin_domain,
+                "CustomOriginConfig": {
+                    "HTTPPort": 80,
+                    "HTTPSPort": 443,
+                    "OriginProtocolPolicy": "https-only",
+                    "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+                },
+            }],
+        },
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "lambda",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": {
+                "Quantity": 7,
+                "Items": ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+                "CachedMethods": {
+                    "Quantity": 2,
+                    "Items": ["GET", "HEAD"],
+                },
+            },
+            "Compress": True,
+            "TrustedSigners": {"Enabled": False, "Quantity": 0},
+            "ForwardedValues": {
+                "QueryString": True,
+                "Cookies": {"Forward": "none"},
+                "Headers": {"Quantity": 1, "Items": ["Authorization"]},
+            },
+            "MinTTL": 0,
+            "DefaultTTL": 30,
+            "MaxTTL": 60,
+        },
+        "ViewerCertificate": {
+            "ACMCertificateArn": certificate_arn,
+            "SSLSupportMethod": "sni-only",
+            "MinimumProtocolVersion": "TLSv1.2_2021",
+        },
+        "Restrictions": {
+            "GeoRestriction": {"RestrictionType": "none", "Quantity": 0}
+        },
+        "PriceClass": "PriceClass_All",
+        "HttpVersion": "http2",
+        "IsIPV6Enabled": True,
+    }
+
+
+def _custom_domain_summary(settings: dict, event: dict | None = None) -> dict:
+    domain_name = str(settings.get("custom_domain_name") or "").strip()
+    validation_records = settings.get("custom_domain_validation_records") or []
+    distribution_domain = str(settings.get("custom_domain_distribution_domain_name") or "").strip()
+    distribution_status = str(settings.get("custom_domain_distribution_status") or "").strip()
+    status = str(settings.get("custom_domain_status") or ("not_configured" if not domain_name else "pending_validation"))
+    origin_url = _management_origin_url(settings, event)
+
+    dns_records_to_create = []
+    if status == "pending_validation":
+        for record in validation_records:
+            dns_records_to_create.append({
+                "purpose": "ACM validation",
+                **record,
+            })
+    if distribution_domain:
+        dns_records_to_create.append({
+            "purpose": "Status page traffic",
+            "type": "CNAME",
+            "name": domain_name,
+            "value": distribution_domain,
+            "note": "For Route53 you can use an Alias A/AAAA to this CloudFront distribution instead of a CNAME.",
+        })
+
+    dns_records_to_remove = []
+    if distribution_domain:
+        dns_records_to_remove.append({
+            "purpose": "Status page traffic",
+            "type": "CNAME or Alias",
+            "name": domain_name,
+            "value": distribution_domain,
+        })
+    for record in validation_records:
+        dns_records_to_remove.append({
+            "purpose": "ACM validation",
+            **record,
+        })
+
+    return {
+        "configured": bool(domain_name),
+        "domain_name": domain_name,
+        "origin_url": origin_url,
+        "certificate_arn": settings.get("custom_domain_certificate_arn", ""),
+        "distribution_id": settings.get("custom_domain_distribution_id", ""),
+        "distribution_domain_name": distribution_domain,
+        "distribution_status": distribution_status,
+        "status": status,
+        "last_error": settings.get("custom_domain_last_error", ""),
+        "dns_records_to_create": dns_records_to_create,
+        "dns_records_to_remove": dns_records_to_remove,
+    }
 
 
 # ── Cost estimate ─────────────────────────────────────────────────────────────
@@ -910,6 +1274,7 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   <span class="tab active"  onclick="show('hosts')">Hosts</span>
   <span class="tab"         onclick="show('regions')">Regions</span>
   <span class="tab"         onclick="show('status-page')">Status Page</span>
+  <span class="tab"         onclick="show('notifications')">Notifications</span>
   <span class="tab"         onclick="show('settings')">Settings</span>
   <span class="tab"         onclick="show('cost')">Cost</span>
   <span class="tab"         onclick="show('guides')">Guides</span>
@@ -1057,6 +1422,91 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </table>
   <div style="margin-top:20px">
     <a class="btn btn-ghost" href="/" target="_blank">Preview status page</a>
+  </div>
+
+  <h3 style="margin-top:28px">Custom Domain</h3>
+  <div class="panel">
+    <p class="desc">
+      Deploy a CloudFront distribution in front of the raw Lambda Function URL. DNS is left manual on purpose: after each deploy step, the app will tell you exactly which records to create.
+    </p>
+    <div class="form-group">
+      <label>Custom Domain</label>
+      <input id="cd-domain" placeholder="uptime.example.com">
+      <div class="hint">Use a subdomain like `uptime.example.com` for the simplest DNS setup.</div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="deployCustomDomain()">Deploy / Continue</button>
+      <button class="btn btn-ghost" onclick="refreshCustomDomain()">Refresh Status</button>
+      <button class="btn btn-danger" onclick="destroyCustomDomain()">Destroy</button>
+    </div>
+    <pre id="cd-status" style="margin-top:14px">No custom domain configured.</pre>
+  </div>
+</div>
+
+<div id="pane-notifications" style="display:none">
+  <h2>Notifications</h2>
+  <p class="desc">
+    Configure the shared notification defaults for this deployment. Host-level SNS alert toggles still decide which hosts actually send transition alerts today.
+  </p>
+  <div class="panel">
+    <div class="grid2">
+      <div class="form-group">
+        <label>Default SNS Topic ARN</label>
+        <input id="n-topic-arn" placeholder="arn:aws:sns:us-east-1:123456789012:uptime-alerts">
+        <div class="hint">Stored as the deployment-wide default target for alert routing.</div>
+      </div>
+      <div class="form-group">
+        <label>Sender Label</label>
+        <input id="n-sender-label" placeholder="UPTIME">
+        <div class="hint">Useful as a display label for SMS or message templates where supported.</div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Initial Delay (seconds)</label>
+        <input id="n-delay" type="number" min="0" max="86400">
+      </div>
+      <div class="form-group">
+        <label>Reminder Interval (minutes)</label>
+        <input id="n-reminder" type="number" min="0" max="10080">
+        <div class="hint">Use `0` to disable recurring reminders.</div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>TTL (seconds)</label>
+        <input id="n-ttl" type="number" min="0" max="2419200">
+        <div class="hint">Only relevant for channels that support message expiration.</div>
+      </div>
+      <div class="form-group">
+        <label>Sleep Until</label>
+        <input id="n-sleep-until" placeholder="2026-05-04T06:00:00Z">
+        <div class="hint">Temporary deployment-wide mute window end.</div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="toggle"><input type="checkbox" id="n-quiet-enabled"> Enable quiet hours</label>
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Quiet Hours Timezone</label>
+        <input id="n-quiet-timezone" placeholder="UTC">
+      </div>
+      <div class="form-group">
+        <label>Quiet Hours Range</label>
+        <div class="grid2">
+          <input id="n-quiet-start" placeholder="22:00">
+          <input id="n-quiet-end" placeholder="07:00">
+        </div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="toggle"><input type="checkbox" id="n-maintenance-mute"> Mute notifications during maintenance</label>
+    </div>
+    <div class="tip">
+      Current behavior: transition alerts are already sent via each host's configured SNS topic. Delay, reminder cadence, quiet hours, sleep, and maintenance muting are stored here for the next alerting pass, but are not fully enforced by the backend yet.
+    </div>
+    <button class="btn btn-primary" onclick="saveNotificationSettings()">Save Notification Settings</button>
   </div>
 </div>
 
@@ -1291,7 +1741,7 @@ function logoutAdmin() {{
   showAuthGate('Signed out.');
 }}
 
-const PANES = ['hosts','regions','status-page','settings','cost','guides'];
+const PANES = ['hosts','regions','status-page','notifications','settings','cost','guides'];
 function show(tab) {{
   PANES.forEach((t,i) => {{
     document.getElementById('pane-'+t).style.display = t===tab ? '' : 'none';
@@ -1300,6 +1750,7 @@ function show(tab) {{
   if (tab === 'hosts') loadHosts();
   if (tab === 'regions') loadRegions();
   if (tab === 'status-page') loadStatusPage();
+  if (tab === 'notifications') loadNotificationSettings();
   if (tab === 'settings') loadSettings();
   if (tab === 'cost') loadCostDefaults();
 }}
@@ -1515,6 +1966,8 @@ async function loadStatusPage() {{
   document.getElementById('sp-subscribe-email').value = settings.status_page_subscribe_email_url || '';
   document.getElementById('sp-subscribe-sms').value = settings.status_page_subscribe_sms_url || '';
   document.getElementById('sp-subscribe-webhook').value = settings.status_page_subscribe_webhook_url || '';
+  document.getElementById('cd-domain').value = settings.custom_domain_name || '';
+  refreshCustomDomain();
   const tbody = document.getElementById('status-page-hosts');
   if (!Array.isArray(hosts) || !hosts.length) {{
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b;padding:24px">No hosts yet.</td></tr>';
@@ -1553,6 +2006,102 @@ async function saveStatusPageSettings() {{
   const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Status page settings saved');
+}}
+
+function renderCustomDomainStatus(data) {{
+  const statusEl = document.getElementById('cd-status');
+  if (!data || data.error) {{
+    statusEl.textContent = data?.error || 'Unable to load custom domain status.';
+    return;
+  }}
+  const lines = [];
+  lines.push(`Status: ${{data.status || 'unknown'}}`);
+  if (data.domain_name) lines.push(`Domain: ${{data.domain_name}}`);
+  if (data.origin_url) lines.push(`Origin: ${{data.origin_url}}`);
+  if (data.distribution_domain_name) lines.push(`CloudFront: ${{data.distribution_domain_name}} (${{data.distribution_status || 'unknown'}})`);
+  if (data.last_error) lines.push(`Last error: ${{data.last_error}}`);
+  if (Array.isArray(data.dns_records_to_create) && data.dns_records_to_create.length) {{
+    lines.push('');
+    lines.push('Create these DNS records:');
+    data.dns_records_to_create.forEach((r, idx) => {{
+      lines.push(`${{idx + 1}}. [${{r.purpose}}] ${{r.type}} ${{r.name}} -> ${{r.value}}${{r.note ? ' (' + r.note + ')' : ''}}`);
+    }});
+  }}
+  if (Array.isArray(data.dns_records_to_remove) && data.dns_records_to_remove.length && data.status === 'not_configured') {{
+    lines.push('');
+    lines.push('Clean up these DNS records if they still exist:');
+    data.dns_records_to_remove.forEach((r, idx) => {{
+      lines.push(`${{idx + 1}}. [${{r.purpose}}] ${{r.type}} ${{r.name}} -> ${{r.value}}`);
+    }});
+  }}
+  statusEl.textContent = lines.join('\n') || 'No custom domain configured.';
+}}
+
+async function refreshCustomDomain() {{
+  const res = await api('/api/custom-domain');
+  if (res.unauthorized) {{
+    showAuthGate('Enter the admin token to load custom-domain status.');
+    return;
+  }}
+  renderCustomDomainStatus(res);
+}}
+
+async function deployCustomDomain() {{
+  const domain = document.getElementById('cd-domain').value.trim();
+  if (!domain) {{
+    toast('Enter a custom domain first', true);
+    return;
+  }}
+  const res = await api('/api/custom-domain', {{method:'POST', body:JSON.stringify({{domain_name: domain}})}});
+  if (res.error) {{ toast(res.error, true); renderCustomDomainStatus(res); return; }}
+  renderCustomDomainStatus(res);
+  toast('Custom domain step completed');
+}}
+
+async function destroyCustomDomain() {{
+  if (!confirm('Destroy the custom domain deployment? DNS cleanup will still be manual.')) return;
+  const res = await api('/api/custom-domain', {{method:'DELETE'}});
+  if (res.error) {{ toast(res.error, true); renderCustomDomainStatus(res); return; }}
+  renderCustomDomainStatus(res);
+  toast('Custom domain destroy step completed');
+}}
+
+async function loadNotificationSettings() {{
+  const s = await api('/api/settings');
+  if (s.unauthorized) {{
+    showAuthGate('Enter the admin token to load notification settings.');
+    return;
+  }}
+  document.getElementById('n-topic-arn').value = s.notifications_default_topic_arn || '';
+  document.getElementById('n-sender-label').value = s.notifications_sender_label || '';
+  document.getElementById('n-delay').value = s.notifications_initial_delay_seconds || 0;
+  document.getElementById('n-reminder').value = s.notifications_reminder_interval_minutes || 0;
+  document.getElementById('n-ttl').value = s.notifications_ttl_seconds || 0;
+  document.getElementById('n-quiet-enabled').checked = !!s.notifications_quiet_hours_enabled;
+  document.getElementById('n-quiet-timezone').value = s.notifications_quiet_hours_timezone || 'UTC';
+  document.getElementById('n-quiet-start').value = s.notifications_quiet_hours_start || '';
+  document.getElementById('n-quiet-end').value = s.notifications_quiet_hours_end || '';
+  document.getElementById('n-sleep-until').value = s.notifications_sleep_until || '';
+  document.getElementById('n-maintenance-mute').checked = s.notifications_mute_during_maintenance !== false;
+}}
+
+async function saveNotificationSettings() {{
+  const body = {{
+    notifications_default_topic_arn: document.getElementById('n-topic-arn').value,
+    notifications_sender_label: document.getElementById('n-sender-label').value,
+    notifications_initial_delay_seconds: +document.getElementById('n-delay').value,
+    notifications_reminder_interval_minutes: +document.getElementById('n-reminder').value,
+    notifications_ttl_seconds: +document.getElementById('n-ttl').value,
+    notifications_quiet_hours_enabled: document.getElementById('n-quiet-enabled').checked,
+    notifications_quiet_hours_timezone: document.getElementById('n-quiet-timezone').value,
+    notifications_quiet_hours_start: document.getElementById('n-quiet-start').value,
+    notifications_quiet_hours_end: document.getElementById('n-quiet-end').value,
+    notifications_sleep_until: document.getElementById('n-sleep-until').value,
+    notifications_mute_during_maintenance: document.getElementById('n-maintenance-mute').checked,
+  }};
+  const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
+  if (res.error) {{ toast(res.error, true); return; }}
+  toast('Notification settings saved');
 }}
 
 async function loadSettings() {{
