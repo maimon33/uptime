@@ -26,9 +26,11 @@ import base64
 import hmac
 import json
 import os
+from pathlib import Path
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
 
@@ -45,12 +47,19 @@ _sns = None
 _acm = None
 _cloudfront = None
 _route53 = None
+_dynamodb_client = None
 
 def _db():
     global _dynamodb
     if _dynamodb is None:
         _dynamodb = boto3.resource("dynamodb")
     return _dynamodb
+
+def _ddb_client():
+    global _dynamodb_client
+    if _dynamodb_client is None:
+        _dynamodb_client = boto3.client("dynamodb")
+    return _dynamodb_client
 
 def _ssm_client():
     global _ssm
@@ -152,42 +161,108 @@ _SETTINGS_DEFAULTS = {
 }
 
 _cached_admin_key = None
+_build_info_cache = None
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def handler(event, context):
-    if _is_scheduled_event(event):
-        return _run_orchestration()
+    try:
+        if _is_scheduled_event(event):
+            _log("info", "scheduled_event_received", source=event.get("source"), resources=event.get("resources", []))
+            return _run_orchestration()
 
-    method = event.get("requestContext", {}).get("http", {}).get("method", "GET").upper()
-    path   = (event.get("rawPath", "/") or "/").rstrip("/") or "/"
+        method = event.get("requestContext", {}).get("http", {}).get("method", "GET").upper()
+        path   = (event.get("rawPath", "/") or "/").rstrip("/") or "/"
+        _log_request(event, method, path)
 
-    if method == "OPTIONS":
-        return _cors_ok()
+        if method == "OPTIONS":
+            return _cors_ok()
 
-    if path in ("/", "/status"):
-        return _serve_status_page()
+        if path in ("/", "/status"):
+            return _serve_status_page()
 
-    if path == "/admin":
-        return _html(200, _admin_page())
+        if path == "/admin":
+            _log("info", "admin_page_served")
+            return _html(200, _admin_page())
 
-    if path.startswith("/api/"):
-        if not _auth(event):
-            return _json(401, {"error": "Unauthorized. Sign in at /admin or send Authorization: Bearer <key>"})
-        return _route_api(method, path, event)
+        if path.startswith("/api/"):
+            authed = _auth(event)
+            if not authed:
+                _log("warn", "api_request_unauthorized", method=method, path=path)
+                return _json(401, {"error": "Unauthorized. Sign in at /admin or send Authorization: Bearer <key>"})
+            response = _route_api(method, path, event)
+            _log("info", "api_request_completed", method=method, path=path, status_code=response.get("statusCode"))
+            return response
 
-    return _json(404, {"error": "Not found"})
+        _log("warn", "route_not_found", method=method, path=path)
+        return _json(404, {"error": "Not found"})
+    except Exception as exc:
+        method = event.get("requestContext", {}).get("http", {}).get("method", "GET").upper() if isinstance(event, dict) else "UNKNOWN"
+        path = (event.get("rawPath", "/") or "/") if isinstance(event, dict) else "/"
+        tb = traceback.format_exc()
+        request_id = getattr(context, "aws_request_id", None)
+        _log("error", "handler_exception", method=method, path=path, request_id=request_id, error=str(exc), traceback=tb)
+        if isinstance(event, dict) and path.startswith("/api/"):
+            return _json(500, {
+                "error": "Internal server error",
+                "detail": str(exc),
+                "request_id": request_id,
+                "path": path,
+                "traceback": tb,
+            })
+        return _json(500, {"error": "Internal server error", "request_id": request_id})
 
 
 def _is_scheduled_event(event: dict) -> bool:
     return isinstance(event, dict) and event.get("source") == "aws.events"
 
 
+def _build_info() -> dict:
+    global _build_info_cache
+    if _build_info_cache is None:
+        info = {
+            "version": os.environ.get("APP_VERSION", "unknown"),
+            "built_at": os.environ.get("APP_BUILT_AT", ""),
+            "region": HOME_REGION,
+            "function_name": os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "uptime-management"),
+        }
+        try:
+            path = Path(__file__).with_name("_build_info.json")
+            if path.exists():
+                info.update(json.loads(path.read_text()))
+        except Exception as exc:
+            _log("warn", "build_info_load_failed", error=str(exc))
+        _build_info_cache = info
+    return _build_info_cache
+
+
+def _log(level: str, message: str, **fields) -> None:
+    payload = {"level": level, "message": message, "time": datetime.now(timezone.utc).isoformat()}
+    payload.update(fields)
+    print(json.dumps(payload, default=_serial))
+
+
+def _log_request(event: dict, method: str, path: str) -> None:
+    headers = event.get("headers") or {}
+    _log(
+        "info",
+        "http_request_received",
+        method=method,
+        path=path,
+        source_ip=((event.get("requestContext") or {}).get("http") or {}).get("sourceIp"),
+        user_agent=headers.get("user-agent") or headers.get("User-Agent"),
+        host=headers.get("host") or headers.get("Host"),
+        has_authorization=bool(headers.get("authorization") or headers.get("Authorization")),
+        raw_query=event.get("rawQueryString", ""),
+    )
+
+
 def _run_orchestration() -> dict:
     db = _db()
     run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     regions = reg.list_regions(db)
+    _log("info", "orchestration_started", run_id=run_id, configured_regions=len(regions))
 
     if not regions:
         print("No worker regions configured; skipping orchestration run.")
@@ -216,6 +291,7 @@ def _run_orchestration() -> dict:
         result_rows.extend(worker.get("results", []))
 
     _apply_aggregate_updates(db, hosts, result_rows, run_id)
+    _log("info", "orchestration_completed", run_id=run_id, regions=len(regions), hosts=len(hosts), results=len(result_rows))
     return {
         "run_id": run_id,
         "regions": len(regions),
@@ -255,8 +331,11 @@ def _auth(event: dict) -> bool:
         qs    = event.get("rawQueryString") or ""
         token = parse_qs(qs).get("key", [""])[0]
     if not token:
+        _log("warn", "auth_missing_token")
         return False
-    return hmac.compare_digest(token.strip(), _get_admin_key().strip())
+    ok = hmac.compare_digest(token.strip(), _get_admin_key().strip())
+    _log("info" if ok else "warn", "auth_checked", ok=ok, token_length=len(token.strip()))
+    return ok
 
 
 # ── API router ────────────────────────────────────────────────────────────────
@@ -269,6 +348,7 @@ def _route_api(method: str, path: str, event: dict) -> dict:
     resource = segs[2] if len(segs) > 2 else ""
     rid      = segs[3] if len(segs) > 3 else ""
     sub      = segs[4] if len(segs) > 4 else ""
+    _log("info", "api_route_dispatch", method=method, path=path, resource=resource, rid=rid, sub=sub)
 
     # ── /api/hosts ────────────────────────────────────────────────────────────
     if resource == "hosts":
@@ -288,6 +368,10 @@ def _route_api(method: str, path: str, event: dict) -> dict:
         if method == "GET":
             return _json(200, {"ok": True})
 
+    if resource == "debug" and rid == "version":
+        if method == "GET":
+            return _json(200, _build_info())
+
     if resource == "settings":
         if method == "GET": return _get_settings()
         if method == "PUT": return _update_settings(body)
@@ -299,6 +383,12 @@ def _route_api(method: str, path: str, event: dict) -> dict:
             return _deploy_custom_domain(body, event)
         if method == "DELETE":
             return _destroy_custom_domain()
+
+    if resource == "management":
+        if method == "GET":
+            return _get_management_summary()
+        if method == "POST":
+            return _run_management_action(body)
 
     # ── /api/cost ─────────────────────────────────────────────────────────────
     if resource == "cost":
@@ -402,6 +492,7 @@ def _get_checks(host_id: str, limit: int = 200) -> dict:
 def _get_settings() -> dict:
     item = _load_settings_item()
     item.pop("host_id", None)
+    _log("info", "settings_loaded", keys=sorted(item.keys()))
     return _json(200, {**_SETTINGS_DEFAULTS, **item})
 
 def _update_settings(body: dict) -> dict:
@@ -431,6 +522,7 @@ def _update_settings(body: dict) -> dict:
     item.update(updates)
     _save_settings_item(item)
     item.pop("host_id", None)
+    _log("info", "settings_updated", updated_keys=sorted(updates.keys()))
     return _json(200, item)
 
 
@@ -769,6 +861,114 @@ def _destroy_custom_domain() -> dict:
     if cleanup_records:
         summary["dns_records_to_remove"] = cleanup_records
     return _json(200, summary)
+
+
+def _get_management_summary() -> dict:
+    settings = _load_settings_item()
+    hosts_desc = _ddb_client().describe_table(TableName=HOSTS_TABLE)["Table"]
+    checks_desc = _ddb_client().describe_table(TableName=CHECKS_TABLE)["Table"]
+    hosts = _list_host_items()
+    enabled_hosts = [host for host in hosts if host.get("enabled", True)]
+    summary = {
+        "home_region": HOME_REGION,
+        "tables": {
+            "hosts": _table_summary(hosts_desc),
+            "checks": _table_summary(checks_desc),
+        },
+        "hosts": {
+            "total": len(hosts),
+            "enabled": len(enabled_hosts),
+            "on_status_page": sum(1 for host in hosts if host.get("show_on_status_page", True)),
+            "alerts_enabled": sum(1 for host in hosts if host.get("alert_enabled")),
+        },
+        "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
+        "worker_regions": len(reg.list_regions(_db())),
+    }
+    _log("info", "management_summary_loaded", hosts=summary["hosts"], tables=summary["tables"])
+    return _json(200, summary)
+
+
+def _run_management_action(body: dict) -> dict:
+    action = str(body.get("action") or "").strip()
+    _log("info", "management_action_requested", action=action, body=body)
+    if action == "purge_checks":
+        older_than_days = int(body.get("older_than_days", 30))
+        max_delete = int(body.get("max_delete", 500))
+        return _purge_checks_older_than(older_than_days, max_delete)
+    if action == "set_retention_days":
+        retention_days = int(body.get("retention_days", _SETTINGS_DEFAULTS["retention_days"]))
+        settings = _load_settings_item()
+        settings["retention_days"] = retention_days
+        _save_settings_item(settings)
+        _log("info", "management_retention_updated", retention_days=retention_days)
+        return _json(200, {"ok": True, "retention_days": retention_days})
+    return _json(400, {"error": "Unknown management action"})
+
+
+def _table_summary(table_desc: dict) -> dict:
+    return {
+        "name": table_desc["TableName"],
+        "status": table_desc.get("TableStatus"),
+        "item_count": int(table_desc.get("ItemCount", 0)),
+        "size_bytes": int(table_desc.get("TableSizeBytes", 0)),
+        "size_human": _human_bytes(int(table_desc.get("TableSizeBytes", 0))),
+        "billing_mode": (((table_desc.get("BillingModeSummary") or {}).get("BillingMode")) or "PAY_PER_REQUEST"),
+        "created_at": table_desc.get("CreationDateTime"),
+    }
+
+
+def _human_bytes(num: int) -> str:
+    value = float(num)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{num} B"
+
+
+def _purge_checks_older_than(older_than_days: int, max_delete: int) -> dict:
+    from boto3.dynamodb.conditions import Key
+
+    if older_than_days < 1:
+        return _json(400, {"error": "older_than_days must be at least 1"})
+    if max_delete < 1 or max_delete > 5000:
+        return _json(400, {"error": "max_delete must be between 1 and 5000"})
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    deleted = 0
+    scanned_hosts = 0
+    table = _db().Table(CHECKS_TABLE)
+    hosts = sorted(_list_host_items(), key=lambda h: h.get("host_id", ""))
+    _log("info", "purge_checks_started", older_than_days=older_than_days, max_delete=max_delete, cutoff=cutoff, host_count=len(hosts))
+
+    with table.batch_writer() as batch:
+        for host in hosts:
+            if deleted >= max_delete:
+                break
+            scanned_hosts += 1
+            remaining = max_delete - deleted
+            result = table.query(
+                KeyConditionExpression=Key("host_id").eq(host["host_id"]) & Key("checked_at").lt(cutoff),
+                ProjectionExpression="host_id, checked_at",
+                Limit=remaining,
+            )
+            items = result.get("Items", [])
+            if items:
+                _log("info", "purge_checks_host_matches", host_id=host["host_id"], host_name=host.get("name"), match_count=len(items))
+            for item in items:
+                batch.delete_item(Key={"host_id": item["host_id"], "checked_at": item["checked_at"]})
+                deleted += 1
+                if deleted >= max_delete:
+                    break
+
+    _log("info", "purge_checks_completed", older_than_days=older_than_days, cutoff=cutoff, deleted=deleted, scanned_hosts=scanned_hosts)
+    return _json(200, {
+        "ok": True,
+        "deleted": deleted,
+        "cutoff": cutoff,
+        "older_than_days": older_than_days,
+        "scanned_hosts": scanned_hosts,
+    })
 
 
 def _management_origin_url(settings: dict, event: dict | None = None) -> str:
@@ -1188,6 +1388,7 @@ footer{{text-align:center;margin-top:50px;font-size:.78rem;color:var(--soft)}}
 
 def _admin_page() -> str:
     # All AWS regions available for monitor deployment
+    build = _build_info()
     all_regions = [
         "us-east-1","us-east-2","us-west-1","us-west-2",
         "ca-central-1","ca-west-1",
@@ -1270,11 +1471,12 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
 </style>
 </head><body>
 <nav>
-  <span class="logo">⬆ Uptime Admin</span>
+  <span class="logo">⬆ Uptime Admin <span style="font-size:.72rem;color:#94a3b8;font-weight:600">v{build.get("version", "unknown")}</span></span>
   <span class="tab active"  onclick="show('hosts')">Hosts</span>
   <span class="tab"         onclick="show('regions')">Regions</span>
   <span class="tab"         onclick="show('status-page')">Status Page</span>
   <span class="tab"         onclick="show('notifications')">Notifications</span>
+  <span class="tab"         onclick="show('management')">Management</span>
   <span class="tab"         onclick="show('settings')">Settings</span>
   <span class="tab"         onclick="show('cost')">Cost</span>
   <span class="tab"         onclick="show('guides')">Guides</span>
@@ -1302,6 +1504,7 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </div>
 </div>
 <div class="main">
+<div class="hint" style="margin-bottom:16px">Build: <strong>{build.get("version", "unknown")}</strong>{' · Built at: ' + build.get('built_at') if build.get('built_at') else ''} · Region: <strong>{build.get("region", HOME_REGION)}</strong></div>
 
 <div id="pane-hosts">
   <div class="section-header">
@@ -1510,6 +1713,47 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </div>
 </div>
 
+<div id="pane-management" style="display:none">
+  <h2>Management</h2>
+  <p class="desc">
+    Monitor DynamoDB table size and manually reduce stored check history when you need to reclaim space faster than TTL cleanup.
+  </p>
+  <div class="panel">
+    <div id="mgmt-summary" style="color:#94a3b8">Loading…</div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Retention</h3>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Retention Days</label>
+        <input id="mgmt-retention-days" type="number" min="1" max="3650">
+        <div class="hint">New checks get a DynamoDB TTL based on this value.</div>
+      </div>
+      <div class="form-group" style="display:flex;align-items:flex-end">
+        <button class="btn btn-primary" onclick="saveManagementRetention()">Save Retention</button>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Manual Cleanup</h3>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Delete checks older than (days)</label>
+        <input id="mgmt-purge-days" type="number" min="1" max="3650" value="30">
+      </div>
+      <div class="form-group">
+        <label>Max items to delete now</label>
+        <input id="mgmt-purge-limit" type="number" min="1" max="5000" value="500">
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-danger" onclick="purgeOldChecks()">Purge Old Checks</button>
+      <button class="btn btn-ghost" onclick="loadManagement()">Refresh</button>
+    </div>
+    <pre id="mgmt-result" style="margin-top:14px">No management action has run yet.</pre>
+  </div>
+</div>
+
 <div id="pane-settings" style="display:none">
   <h2>Settings</h2>
   <div class="panel">
@@ -1591,6 +1835,11 @@ echo "New key: $NEW_KEY"</pre>
   <pre>aws dynamodb create-backup \\
   --table-name uptime-checks \\
   --backup-name uptime-backup-$(date +%Y%m%d)</pre>
+
+  <h3>Debugging deployed version</h3>
+  <p class="desc">This deployment exposes a tiny version endpoint so you can confirm exactly which management build is live.</p>
+  <pre>GET /api/debug/version
+Authorization: Bearer &lt;admin-token&gt;</pre>
 </div>
 
 </div>
@@ -1741,7 +1990,7 @@ function logoutAdmin() {{
   showAuthGate('Signed out.');
 }}
 
-const PANES = ['hosts','regions','status-page','notifications','settings','cost','guides'];
+const PANES = ['hosts','regions','status-page','notifications','management','settings','cost','guides'];
 function show(tab) {{
   PANES.forEach((t,i) => {{
     document.getElementById('pane-'+t).style.display = t===tab ? '' : 'none';
@@ -1751,6 +2000,7 @@ function show(tab) {{
   if (tab === 'regions') loadRegions();
   if (tab === 'status-page') loadStatusPage();
   if (tab === 'notifications') loadNotificationSettings();
+  if (tab === 'management') loadManagement();
   if (tab === 'settings') loadSettings();
   if (tab === 'cost') loadCostDefaults();
 }}
@@ -2011,7 +2261,7 @@ async function saveStatusPageSettings() {{
 function renderCustomDomainStatus(data) {{
   const statusEl = document.getElementById('cd-status');
   if (!data || data.error) {{
-    statusEl.textContent = data?.error || 'Unable to load custom domain status.';
+    statusEl.textContent = (data && data.error) || 'Unable to load custom domain status.';
     return;
   }}
   const lines = [];
@@ -2034,7 +2284,7 @@ function renderCustomDomainStatus(data) {{
       lines.push(`${{idx + 1}}. [${{r.purpose}}] ${{r.type}} ${{r.name}} -> ${{r.value}}`);
     }});
   }}
-  statusEl.textContent = lines.join('\n') || 'No custom domain configured.';
+  statusEl.textContent = lines.join('\\n') || 'No custom domain configured.';
 }}
 
 async function refreshCustomDomain() {{
@@ -2102,6 +2352,82 @@ async function saveNotificationSettings() {{
   const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Notification settings saved');
+}}
+
+function formatBytes(num) {{
+  if (num == null) return '0 B';
+  let value = Number(num);
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {{
+    value /= 1024;
+    idx += 1;
+  }}
+  return value.toFixed(1) + ' ' + units[idx];
+}}
+
+function renderManagementSummary(data) {{
+  const el = document.getElementById('mgmt-summary');
+  if (!data || data.error) {{
+    el.innerHTML = `<div style="color:#ef4444">${{(data && data.error) || 'Unable to load management summary.'}}</div>`;
+    return;
+  }}
+  document.getElementById('mgmt-retention-days').value = data.retention_days || 90;
+  el.innerHTML = `
+    <div class="grid2">
+      <div>
+        <h3 style="margin-top:0">Hosts Table</h3>
+        <div class="hint">Name: ${{data.tables.hosts.name}}</div>
+        <div class="hint">Items: ${{data.tables.hosts.item_count}}</div>
+        <div class="hint">Size: ${{data.tables.hosts.size_human}} (${{data.tables.hosts.size_bytes}} bytes)</div>
+        <div class="hint">Status: ${{data.tables.hosts.status}}</div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Checks Table</h3>
+        <div class="hint">Name: ${{data.tables.checks.name}}</div>
+        <div class="hint">Items: ${{data.tables.checks.item_count}}</div>
+        <div class="hint">Size: ${{data.tables.checks.size_human}} (${{data.tables.checks.size_bytes}} bytes)</div>
+        <div class="hint">Status: ${{data.tables.checks.status}}</div>
+      </div>
+    </div>
+    <div style="margin-top:16px" class="hint">
+      Hosts: ${{data.hosts.total}} total, ${{data.hosts.enabled}} enabled, ${{data.hosts.on_status_page}} on status page, ${{data.hosts.alerts_enabled}} with alerts.
+      Worker regions: ${{data.worker_regions}}. Home region: ${{data.home_region}}.
+    </div>
+  `;
+}}
+
+async function loadManagement() {{
+  const data = await api('/api/management');
+  if (data.unauthorized) {{
+    showAuthGate('Enter the admin token to load management data.');
+    return;
+  }}
+  renderManagementSummary(data);
+}}
+
+async function saveManagementRetention() {{
+  const retention = +document.getElementById('mgmt-retention-days').value;
+  const res = await api('/api/management', {{method:'POST', body:JSON.stringify({{action:'set_retention_days', retention_days: retention}})}});
+  if (res.error) {{ toast(res.error, true); return; }}
+  toast('Retention updated');
+  loadManagement();
+}}
+
+async function purgeOldChecks() {{
+  const olderThanDays = +document.getElementById('mgmt-purge-days').value;
+  const maxDelete = +document.getElementById('mgmt-purge-limit').value;
+  if (!confirm(`Delete up to ${{maxDelete}} checks older than ${{olderThanDays}} days?`)) return;
+  const res = await api('/api/management', {{method:'POST', body:JSON.stringify({{action:'purge_checks', older_than_days: olderThanDays, max_delete: maxDelete}})}});
+  if (res.error) {{
+    document.getElementById('mgmt-result').textContent = res.error;
+    toast(res.error, true);
+    return;
+  }}
+  document.getElementById('mgmt-result').textContent =
+    `Deleted: ${{res.deleted}}\\nOlder than days: ${{res.older_than_days}}\\nCutoff: ${{res.cutoff}}\\nHosts scanned: ${{res.scanned_hosts}}`;
+  toast('Manual cleanup completed');
+  loadManagement();
 }}
 
 async function loadSettings() {{
