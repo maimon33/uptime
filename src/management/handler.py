@@ -27,6 +27,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -769,7 +770,7 @@ def _deploy_custom_domain(body: dict, event: dict | None = None) -> dict:
         cert_arn = cert_resp["CertificateArn"]
         settings["custom_domain_certificate_arn"] = cert_arn
 
-    cert = _acm_client().describe_certificate(CertificateArn=cert_arn)["Certificate"]
+    cert = _wait_for_acm_dns_records(cert_arn)
     validation_records = _certificate_validation_records(cert)
     settings["custom_domain_validation_records"] = validation_records
 
@@ -996,6 +997,18 @@ def _certificate_validation_records(certificate: dict) -> list[dict]:
     return records
 
 
+def _wait_for_acm_dns_records(certificate_arn: str, attempts: int = 5, sleep_seconds: int = 3) -> dict:
+    last = _acm_client().describe_certificate(CertificateArn=certificate_arn)["Certificate"]
+    if _certificate_validation_records(last):
+        return last
+    for _ in range(attempts - 1):
+        time.sleep(sleep_seconds)
+        last = _acm_client().describe_certificate(CertificateArn=certificate_arn)["Certificate"]
+        if _certificate_validation_records(last):
+            break
+    return last
+
+
 def _cloudfront_distribution_config(domain_name: str, origin_url: str, certificate_arn: str) -> dict:
     origin_domain = urlparse(origin_url).netloc
     return {
@@ -1090,6 +1103,20 @@ def _custom_domain_summary(settings: dict, event: dict | None = None) -> dict:
             **record,
         })
 
+    next_action = "Enter a custom domain and click Deploy / Continue."
+    cloudfront_created_when = "CloudFront is created only after ACM reports the certificate as ISSUED."
+    if status == "pending_validation":
+        if dns_records_to_create:
+            next_action = "Create the ACM validation DNS record(s), wait for ACM to validate, then click Deploy / Continue again."
+        else:
+            next_action = "ACM is still preparing the validation DNS record. Click Refresh Status in a few seconds."
+    elif status == "creating_distribution":
+        next_action = "CloudFront is being created now. Wait for it to finish deploying, then click Refresh Status."
+    elif status == "ready":
+        next_action = "Create the final traffic DNS record that points your custom domain at CloudFront."
+    elif status == "disabling_distribution":
+        next_action = "CloudFront is being disabled so it can be deleted. Wait, then click Destroy again if needed."
+
     return {
         "configured": bool(domain_name),
         "domain_name": domain_name,
@@ -1100,6 +1127,8 @@ def _custom_domain_summary(settings: dict, event: dict | None = None) -> dict:
         "distribution_status": distribution_status,
         "status": status,
         "last_error": settings.get("custom_domain_last_error", ""),
+        "next_action": next_action,
+        "cloudfront_created_when": cloudfront_created_when,
         "dns_records_to_create": dns_records_to_create,
         "dns_records_to_remove": dns_records_to_remove,
     }
@@ -1113,6 +1142,7 @@ def _cost_estimate(qs: dict) -> dict:
     rcount   = int(qs.get("regions",  [str(defaults["regions"])])[0])
     interval = int(qs.get("interval", [str(defaults["interval_sec"])])[0])
     days     = int(qs.get("days",     [str(defaults["retention_days"])])[0])
+    custom_domain_enabled = str(qs.get("custom_domain", [str(int(defaults.get("custom_domain_enabled", 0)))])[0]).strip().lower() in {"1", "true", "yes", "on"}
 
     checks_mo    = int((30 * 24 * 3600 / interval) * hosts * rcount)
     invocations  = int((30 * 24 * 3600 / interval) * (rcount + 1))
@@ -1128,10 +1158,11 @@ def _cost_estimate(qs: dict) -> dict:
     storage_cost = max(0, (storage_gb - 25) * 0.25)
     log_gb       = (checks_mo * 100) / (1024 ** 3)
     log_cost     = max(0, (log_gb - 5) * 0.50)
-    total        = lambda_cost + ddb_w_cost + ddb_r_cost + storage_cost + log_cost
+    cloudfront_custom_domain_cost = 0.0
+    total        = lambda_cost + ddb_w_cost + ddb_r_cost + storage_cost + log_cost + cloudfront_custom_domain_cost
 
     return _json(200, {
-        "inputs": {"hosts": hosts, "regions": rcount, "interval_sec": interval, "retention_days": days},
+        "inputs": {"hosts": hosts, "regions": rcount, "interval_sec": interval, "retention_days": days, "custom_domain": custom_domain_enabled},
         "defaults": defaults,
         "monthly_checks": checks_mo,
         "breakdown": {
@@ -1139,10 +1170,11 @@ def _cost_estimate(qs: dict) -> dict:
             "dynamodb_writes_usd":  round(ddb_w_cost,   4),
             "dynamodb_reads_usd":   round(ddb_r_cost,   4),
             "dynamodb_storage_usd": round(storage_cost, 4),
+            "cloudfront_custom_domain_usd": round(cloudfront_custom_domain_cost, 4),
             "cloudwatch_logs_usd":  round(log_cost,     4),
         },
         "total_usd_per_month": round(total, 4),
-        "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). Actual cost may vary.",
+        "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). CloudFront/ACM custom-domain line is shown as 0.0000 because viewer requests and data transfer are usage-based and not estimated here.",
     })
 
 
@@ -1154,6 +1186,7 @@ def _default_cost_inputs() -> dict:
         "regions": len(reg.list_regions(_db())),
         "interval_sec": int(settings.get("default_check_interval", _SETTINGS_DEFAULTS["default_check_interval"])),
         "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
+        "custom_domain_enabled": 1 if settings.get("custom_domain_name") else 0,
     }
 
 
@@ -1642,6 +1675,7 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
       <button class="btn btn-ghost" onclick="refreshCustomDomain()">Refresh Status</button>
       <button class="btn btn-danger" onclick="destroyCustomDomain()">Destroy</button>
     </div>
+    <div id="cd-records" style="margin-top:14px"></div>
     <pre id="cd-status" style="margin-top:14px">No custom domain configured.</pre>
   </div>
 </div>
@@ -2260,8 +2294,10 @@ async function saveStatusPageSettings() {{
 
 function renderCustomDomainStatus(data) {{
   const statusEl = document.getElementById('cd-status');
+  const recordsEl = document.getElementById('cd-records');
   if (!data || data.error) {{
     statusEl.textContent = (data && data.error) || 'Unable to load custom domain status.';
+    recordsEl.innerHTML = '';
     return;
   }}
   const lines = [];
@@ -2269,22 +2305,60 @@ function renderCustomDomainStatus(data) {{
   if (data.domain_name) lines.push(`Domain: ${{data.domain_name}}`);
   if (data.origin_url) lines.push(`Origin: ${{data.origin_url}}`);
   if (data.distribution_domain_name) lines.push(`CloudFront: ${{data.distribution_domain_name}} (${{data.distribution_status || 'unknown'}})`);
+  if (data.cloudfront_created_when) lines.push(`CloudFront creation: ${{data.cloudfront_created_when}}`);
+  if (data.next_action) lines.push(`Next action: ${{data.next_action}}`);
   if (data.last_error) lines.push(`Last error: ${{data.last_error}}`);
-  if (Array.isArray(data.dns_records_to_create) && data.dns_records_to_create.length) {{
+  const createRecords = Array.isArray(data.dns_records_to_create) ? data.dns_records_to_create : [];
+  const removeRecords = Array.isArray(data.dns_records_to_remove) ? data.dns_records_to_remove : [];
+  if (createRecords.length) {{
     lines.push('');
-    lines.push('Create these DNS records:');
-    data.dns_records_to_create.forEach((r, idx) => {{
-      lines.push(`${{idx + 1}}. [${{r.purpose}}] ${{r.type}} ${{r.name}} -> ${{r.value}}${{r.note ? ' (' + r.note + ')' : ''}}`);
-    }});
+    lines.push('DNS records to create are listed below in copy boxes.');
   }}
   if (Array.isArray(data.dns_records_to_remove) && data.dns_records_to_remove.length && data.status === 'not_configured') {{
     lines.push('');
-    lines.push('Clean up these DNS records if they still exist:');
-    data.dns_records_to_remove.forEach((r, idx) => {{
+    lines.push('Cleanup DNS records are listed below if they still exist.');
+    removeRecords.forEach((r, idx) => {{
       lines.push(`${{idx + 1}}. [${{r.purpose}}] ${{r.type}} ${{r.name}} -> ${{r.value}}`);
     }});
   }}
   statusEl.textContent = lines.join('\\n') || 'No custom domain configured.';
+  const recordCards = [];
+  createRecords.forEach((r, idx) => {{
+    const value = `${{r.type}}\\n${{r.name}}\\n${{r.value}}`;
+    recordCards.push(`
+      <div class="panel" style="margin-top:12px;margin-bottom:0;padding:14px">
+        <div style="font-weight:700;margin-bottom:6px">${{idx + 1}}. ${{r.purpose}}</div>
+        <div class="hint" style="margin-bottom:8px">${{r.note || ''}}</div>
+        <textarea readonly style="min-height:82px">${{value}}</textarea>
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="copyRecord(this, ${{JSON.stringify(value)}})">Copy All</button>
+          <button class="btn btn-ghost btn-sm" onclick="copyRecord(this, ${{JSON.stringify(r.name)}})">Copy Name</button>
+          <button class="btn btn-ghost btn-sm" onclick="copyRecord(this, ${{JSON.stringify(r.value)}})">Copy Value</button>
+        </div>
+      </div>
+    `);
+  }});
+  if (data.status === 'not_configured') {{
+    removeRecords.forEach((r, idx) => {{
+      const value = `${{r.type}}\\n${{r.name}}\\n${{r.value}}`;
+      recordCards.push(`
+        <div class="panel" style="margin-top:12px;margin-bottom:0;padding:14px">
+          <div style="font-weight:700;margin-bottom:6px">Cleanup ${{idx + 1}}. ${{r.purpose}}</div>
+          <textarea readonly style="min-height:82px">${{value}}</textarea>
+        </div>
+      `);
+    }});
+  }}
+  recordsEl.innerHTML = recordCards.join('');
+}}
+
+async function copyRecord(btn, text) {{
+  try {{
+    await navigator.clipboard.writeText(text);
+    toast('Copied');
+  }} catch (err) {{
+    toast('Copy failed', true);
+  }}
 }}
 
 async function refreshCustomDomain() {{
@@ -2467,7 +2541,9 @@ async function loadCostDefaults() {{
 }}
 
 async function calcCost() {{
-  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value);
+  const customDomainInput = document.getElementById('cd-domain');
+  const customDomainEnabled = !!(customDomainInput && customDomainInput.value);
+  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value+'&custom_domain='+(customDomainEnabled ? '1' : '0'));
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to calculate costs.');
     return;
@@ -2476,7 +2552,7 @@ async function calcCost() {{
   const el = document.getElementById('cost-result');
   el.style.display = '';
   document.getElementById('cost-rows').innerHTML =
-    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
+    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
     .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{(v||0).toFixed(4)}}</span></div>`)
     .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{data.note||''}}</div>`;
 }}
