@@ -49,6 +49,7 @@ _acm = None
 _cloudfront = None
 _route53 = None
 _dynamodb_client = None
+_cloudwatch = {}
 
 def _db():
     global _dynamodb
@@ -112,6 +113,14 @@ def _route53_client():
         _route53 = boto3.client("route53")
     return _route53
 
+
+def _cloudwatch_client(region_name: str):
+    client = _cloudwatch.get(region_name)
+    if client is None:
+        client = boto3.client("cloudwatch", region_name=region_name)
+        _cloudwatch[region_name] = client
+    return client
+
 # ── Config ────────────────────────────────────────────────────────────────────
 HOSTS_TABLE     = os.environ["HOSTS_TABLE"]
 CHECKS_TABLE    = os.environ["CHECKS_TABLE"]
@@ -119,6 +128,7 @@ ADMIN_KEY_PARAM = os.environ.get("ADMIN_KEY_PARAM")
 ADMIN_KEY_SECRET = os.environ.get("ADMIN_KEY_SECRET")
 HOME_REGION     = os.environ.get("HOME_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "90"))
+READ_ONLY_MODE  = str(os.environ.get("READ_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 _SETTINGS_DEFAULTS = {
     "status_page_title":       os.environ.get("STATUS_PAGE_TITLE", "System Status"),
@@ -219,6 +229,10 @@ def _is_scheduled_event(event: dict) -> bool:
     return isinstance(event, dict) and event.get("source") == "aws.events"
 
 
+def _is_read_only() -> bool:
+    return READ_ONLY_MODE
+
+
 def _build_info() -> dict:
     global _build_info_cache
     if _build_info_cache is None:
@@ -227,6 +241,7 @@ def _build_info() -> dict:
             "built_at": os.environ.get("APP_BUILT_AT", ""),
             "region": HOME_REGION,
             "function_name": os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "uptime-management"),
+            "read_only_mode": _is_read_only(),
         }
         try:
             path = Path(__file__).with_name("_build_info.json")
@@ -260,6 +275,9 @@ def _log_request(event: dict, method: str, path: str) -> None:
 
 
 def _run_orchestration() -> dict:
+    if _is_read_only():
+        _log("info", "orchestration_skipped_read_only")
+        return {"skipped": True, "reason": "read_only_mode"}
     db = _db()
     run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     regions = reg.list_regions(db)
@@ -350,6 +368,9 @@ def _route_api(method: str, path: str, event: dict) -> dict:
     rid      = segs[3] if len(segs) > 3 else ""
     sub      = segs[4] if len(segs) > 4 else ""
     _log("info", "api_route_dispatch", method=method, path=path, resource=resource, rid=rid, sub=sub)
+    if _is_read_only() and _is_mutating_api_request(method, resource, rid, sub):
+        _log("warn", "api_mutation_blocked_read_only", method=method, path=path, resource=resource, rid=rid, sub=sub)
+        return _json(403, {"error": "Read-only mode is enabled. Mutating actions are disabled."})
 
     # ── /api/hosts ────────────────────────────────────────────────────────────
     if resource == "hosts":
@@ -405,6 +426,12 @@ def _route_api(method: str, path: str, event: dict) -> dict:
             if method == "POST" and sub == "update": return _update_region(rid)
 
     return _json(404, {"error": "API endpoint not found"})
+
+
+def _is_mutating_api_request(method: str, resource: str, rid: str, sub: str) -> bool:
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    return True
 
 
 # ── Hosts CRUD ────────────────────────────────────────────────────────────────
@@ -870,6 +897,20 @@ def _get_management_summary() -> dict:
     checks_desc = _ddb_client().describe_table(TableName=CHECKS_TABLE)["Table"]
     hosts = _list_host_items()
     enabled_hosts = [host for host in hosts if host.get("enabled", True)]
+    region_records = reg.list_regions(_db())
+    worker_summaries = []
+    for region_info in region_records:
+        try:
+            worker_summaries.append(_worker_lambda_summary(region_info))
+        except Exception as exc:
+            worker_summaries.append({
+                "function_name": region_info.get("function_name"),
+                "region": region_info.get("region"),
+                "memory_mb": int(region_info.get("memory_mb", 0) or 0),
+                "deployed_at": region_info.get("deployed_at"),
+                "age_human": _age_human(region_info.get("deployed_at")),
+                "error": str(exc),
+            })
     summary = {
         "home_region": HOME_REGION,
         "tables": {
@@ -883,7 +924,11 @@ def _get_management_summary() -> dict:
             "alerts_enabled": sum(1 for host in hosts if host.get("alert_enabled")),
         },
         "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
-        "worker_regions": len(reg.list_regions(_db())),
+        "worker_regions": len(region_records),
+        "lambdas": {
+            "management": _management_lambda_summary(),
+            "workers": worker_summaries,
+        },
     }
     _log("info", "management_summary_loaded", hosts=summary["hosts"], tables=summary["tables"])
     return _json(200, summary)
@@ -925,6 +970,131 @@ def _human_bytes(num: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{num} B"
+
+
+def _parse_aws_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _age_human(value: str | None) -> str | None:
+    dt = _parse_aws_timestamp(value)
+    if dt is None:
+        return None
+    total_seconds = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _cloudwatch_sum(region_name: str, function_name: str, metric_name: str, start_time: datetime, end_time: datetime) -> float:
+    response = _cloudwatch_client(region_name).get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName=metric_name,
+        Dimensions=[{"Name": "FunctionName", "Value": function_name}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=3600,
+        Statistics=["Sum"],
+    )
+    return float(sum(point.get("Sum", 0.0) for point in response.get("Datapoints", [])))
+
+
+def _cloudwatch_duration(region_name: str, function_name: str, start_time: datetime, end_time: datetime) -> dict:
+    response = _cloudwatch_client(region_name).get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Duration",
+        Dimensions=[{"Name": "FunctionName", "Value": function_name}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=3600,
+        Statistics=["Average", "Maximum", "SampleCount"],
+    )
+    datapoints = response.get("Datapoints", [])
+    if not datapoints:
+        return {"average_ms": None, "max_ms": None}
+    weighted_sum = 0.0
+    total_samples = 0.0
+    max_ms = 0.0
+    for point in datapoints:
+        sample_count = float(point.get("SampleCount", 0.0) or 0.0)
+        average = float(point.get("Average", 0.0) or 0.0)
+        weighted_sum += average * sample_count
+        total_samples += sample_count
+        max_ms = max(max_ms, float(point.get("Maximum", 0.0) or 0.0))
+    average_ms = (weighted_sum / total_samples) if total_samples else None
+    return {
+        "average_ms": round(average_ms, 2) if average_ms is not None else None,
+        "max_ms": round(max_ms, 2) if max_ms else None,
+    }
+
+
+def _lambda_metrics_snapshot(function_name: str, region_name: str, deployed_at: str | None = None, memory_mb: int | None = None, runtime: str | None = None) -> dict:
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=24)
+    invocations = _cloudwatch_sum(region_name, function_name, "Invocations", start_time, end_time)
+    errors = _cloudwatch_sum(region_name, function_name, "Errors", start_time, end_time)
+    durations = _cloudwatch_duration(region_name, function_name, start_time, end_time)
+    return {
+        "function_name": function_name,
+        "region": region_name,
+        "runtime": runtime,
+        "memory_mb": memory_mb,
+        "deployed_at": deployed_at,
+        "age_human": _age_human(deployed_at),
+        "last_24h": {
+            "invocations": int(round(invocations)),
+            "errors": int(round(errors)),
+            "avg_duration_ms": durations["average_ms"],
+            "max_duration_ms": durations["max_ms"],
+        },
+    }
+
+
+def _management_lambda_summary() -> dict:
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "uptime-management")
+    try:
+        config = _lambda_client().get_function_configuration(FunctionName=function_name)
+    except Exception as exc:
+        return {
+            "function_name": function_name,
+            "region": HOME_REGION,
+            "error": str(exc),
+        }
+    return _lambda_metrics_snapshot(
+        function_name=function_name,
+        region_name=HOME_REGION,
+        deployed_at=config.get("LastModified"),
+        memory_mb=int(config.get("MemorySize", 0) or 0),
+        runtime=config.get("Runtime"),
+    )
+
+
+def _worker_lambda_summary(region_info: dict) -> dict:
+    return _lambda_metrics_snapshot(
+        function_name=region_info.get("function_name", f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region_info.get('region')}"),
+        region_name=region_info.get("region", HOME_REGION),
+        deployed_at=region_info.get("deployed_at"),
+        memory_mb=int(region_info.get("memory_mb", 0) or 0),
+        runtime="python3.12",
+    )
 
 
 def _purge_checks_older_than(older_than_days: int, max_delete: int) -> dict:
@@ -1136,6 +1306,24 @@ def _custom_domain_summary(settings: dict, event: dict | None = None) -> dict:
 
 # ── Cost estimate ─────────────────────────────────────────────────────────────
 
+_CLOUDFRONT_PLAN_COSTS = {
+    "payg": 0.0,
+    "free": 0.0,
+    "pro": 15.0,
+    "business": 200.0,
+    "premium": 1000.0,
+}
+
+
+def _current_scheduler_interval_seconds() -> int:
+    # The management EventBridge rule currently runs once per minute.
+    return 60
+
+
+def _checks_per_day(interval_seconds: int) -> int:
+    return int(86400 / max(1, interval_seconds))
+
+
 def _cost_estimate(qs: dict) -> dict:
     defaults = _default_cost_inputs()
     hosts    = int(qs.get("hosts",    [str(defaults["hosts"])])[0])
@@ -1143,10 +1331,18 @@ def _cost_estimate(qs: dict) -> dict:
     interval = int(qs.get("interval", [str(defaults["interval_sec"])])[0])
     days     = int(qs.get("days",     [str(defaults["retention_days"])])[0])
     custom_domain_enabled = str(qs.get("custom_domain", [str(int(defaults.get("custom_domain_enabled", 0)))])[0]).strip().lower() in {"1", "true", "yes", "on"}
+    cloudfront_plan = str(qs.get("cloudfront_plan", [defaults.get("cloudfront_plan", "payg")])[0] or "payg").strip().lower()
+    if cloudfront_plan not in _CLOUDFRONT_PLAN_COSTS:
+        cloudfront_plan = "payg"
 
-    checks_mo    = int((30 * 24 * 3600 / interval) * hosts * rcount)
-    invocations  = int((30 * 24 * 3600 / interval) * (rcount + 1))
-    gb_sec       = int((30 * 24 * 3600 / interval) * rcount) * 2.0 * (256 / 1024)
+    requested_interval = max(1, interval)
+    effective_interval = _current_scheduler_interval_seconds()
+    runs_per_month = int((30 * 24 * 3600) / effective_interval)
+    checks_mo = runs_per_month * hosts * rcount
+    management_invocations = runs_per_month
+    worker_invocations = runs_per_month * rcount
+    invocations = management_invocations + worker_invocations
+    gb_sec = worker_invocations * 2.0 * (256 / 1024)
     lambda_cost  = max(0, (invocations - 1_000_000) / 1_000_000 * 0.20) + \
                    max(0, (gb_sec - 400_000) * 0.00001667)
     ddb_w        = checks_mo * 2
@@ -1158,13 +1354,31 @@ def _cost_estimate(qs: dict) -> dict:
     storage_cost = max(0, (storage_gb - 25) * 0.25)
     log_gb       = (checks_mo * 100) / (1024 ** 3)
     log_cost     = max(0, (log_gb - 5) * 0.50)
-    cloudfront_custom_domain_cost = 0.0
+    cloudfront_custom_domain_cost = _CLOUDFRONT_PLAN_COSTS[cloudfront_plan] if custom_domain_enabled else 0.0
     total        = lambda_cost + ddb_w_cost + ddb_r_cost + storage_cost + log_cost + cloudfront_custom_domain_cost
 
     return _json(200, {
-        "inputs": {"hosts": hosts, "regions": rcount, "interval_sec": interval, "retention_days": days, "custom_domain": custom_domain_enabled},
+        "inputs": {
+            "hosts": hosts,
+            "regions": rcount,
+            "interval_sec": interval,
+            "retention_days": days,
+            "custom_domain": custom_domain_enabled,
+            "cloudfront_plan": cloudfront_plan,
+        },
         "defaults": defaults,
         "monthly_checks": checks_mo,
+        "checks_per_day_per_region": _checks_per_day(effective_interval),
+        "requested_checks_per_day_per_region": _checks_per_day(requested_interval),
+        "monthly_invocations": {
+            "management": management_invocations,
+            "workers": worker_invocations,
+            "total": invocations,
+        },
+        "scheduler": {
+            "requested_interval_sec": requested_interval,
+            "effective_interval_sec": effective_interval,
+        },
         "breakdown": {
             "lambda_usd":           round(lambda_cost,  4),
             "dynamodb_writes_usd":  round(ddb_w_cost,   4),
@@ -1174,7 +1388,7 @@ def _cost_estimate(qs: dict) -> dict:
             "cloudwatch_logs_usd":  round(log_cost,     4),
         },
         "total_usd_per_month": round(total, 4),
-        "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). CloudFront/ACM custom-domain line is shown as 0.0000 because viewer requests and data transfer are usage-based and not estimated here.",
+        "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). The current scheduler runs once per minute, so Lambda invocations are driven by worker-region count, not by each host's requested interval. CloudFront uses the selected plan cost; pay-as-you-go request and bandwidth overages are not estimated here.",
     })
 
 
@@ -1187,6 +1401,7 @@ def _default_cost_inputs() -> dict:
         "interval_sec": int(settings.get("default_check_interval", _SETTINGS_DEFAULTS["default_check_interval"])),
         "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
         "custom_domain_enabled": 1 if settings.get("custom_domain_name") else 0,
+        "cloudfront_plan": "free" if settings.get("custom_domain_name") else "payg",
     }
 
 
@@ -1253,6 +1468,7 @@ def _serve_status_page() -> dict:
             "latest_latency": latest_latency,
             "region_summary": region_summary,
             "history":        list(reversed(run_statuses)),
+            "history_available": bool(run_statuses),
             "current_status": host.get("current_status", "unknown"),
         })
     return _html(
@@ -1301,6 +1517,20 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   <div class="maintenance-copy">{page_options["maintenance_message"]}</div>
   <div class="maintenance-meta">{' · '.join(maintenance_meta) if maintenance_meta else 'We will post updates here during the maintenance window.'}</div>
 </div>"""
+    upcoming_maintenance_block = ""
+    if page_options.get("maintenance_enabled") and page_options.get("maintenance_message"):
+        upcoming_maintenance_block = f"""<div class="maintenance-list">
+  <div class="maintenance-list-title">Upcoming maintenance</div>
+  <div class="maintenance-list-item">
+    <div class="maintenance-list-copy">{page_options["maintenance_message"]}</div>
+    <div class="maintenance-list-meta">{page_options.get("maintenance_window") or 'Window not set'}{' · Affected: ' + page_options.get("maintenance_scope") if page_options.get("maintenance_scope") else ''}</div>
+  </div>
+</div>"""
+    else:
+        upcoming_maintenance_block = """<div class="maintenance-list">
+  <div class="maintenance-list-title">Upcoming maintenance</div>
+  <div class="maintenance-list-empty">None</div>
+</div>"""
 
     subscribe_links = []
     if page_options.get("subscribe_email_url"):
@@ -1333,10 +1563,12 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
             f'<span class="pill {r["status"]}">{r["region"]} · {r["latency_ms"] if r["latency_ms"] is not None else "—"} ms</span>'
             for r in h["region_summary"]
         )
+        history_note = "" if h["history_available"] else '<div class="history-note">History appears after checks have been recorded for this host.</div>'
         cards += f"""<div class="card">
   <div class="row"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
   <div class="meta">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {' &nbsp;·&nbsp; '.join(latency_bits)}</div>
   <div class="history-title">Recent history</div>
+  {history_note}
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
   <div class="regions">{region_pills or '<span class="pill unknown">No regional data yet</span>'}</div>
@@ -1375,6 +1607,11 @@ h1{{font-size:1.9rem;font-weight:700;margin-bottom:6px}}
 .maintenance-title,.subscribe-title{{font-size:.82rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}}
 .maintenance-copy,.subscribe-copy{{font-size:.96rem;line-height:1.5}}
 .maintenance-meta{{margin-top:8px;color:var(--muted);font-size:.82rem}}
+.maintenance-list{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px 22px;margin-bottom:20px}}
+.maintenance-list-title{{font-size:.82rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;color:var(--soft)}}
+.maintenance-list-item{{display:flex;flex-direction:column;gap:6px}}
+.maintenance-list-copy{{font-size:.95rem;line-height:1.5}}
+.maintenance-list-meta,.maintenance-list-empty{{font-size:.83rem;color:var(--muted)}}
 .subscribe-actions{{display:flex;flex-wrap:wrap;gap:10px}}
 .subscribe-btn{{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;font-weight:700;white-space:nowrap}}
 .subscribe-btn:hover{{opacity:.92}}
@@ -1388,6 +1625,7 @@ h1{{font-size:1.9rem;font-weight:700;margin-bottom:6px}}
 .badge.degraded{{background:#fffbeb;color:#d97706}}.badge.unknown{{background:#f1f5f9;color:#64748b}}
 .meta{{font-size:.83rem;color:var(--muted);margin-bottom:10px}}
 .history-title{{font-size:.76rem;color:var(--soft);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}}
+.history-note{{font-size:.78rem;color:var(--muted);margin-bottom:8px}}
 .bars{{display:flex;gap:2px;height:26px}}
 .b{{flex:1;border-radius:2px;min-width:3px}}
 .b.up{{background:#22c55e}}.b.down{{background:#ef4444}}.b.degraded{{background:#f59e0b}}.b.unknown{{background:#e2e8f0}}
@@ -1411,6 +1649,7 @@ footer{{text-align:center;margin-top:50px;font-size:.78rem;color:var(--soft)}}
   <h1>{title}</h1><p class="sub">{desc}</p>
   <div class="overall {ocls}"><div class="dot"></div><span>{overall}</span></div>
   {maintenance_block}
+  {upcoming_maintenance_block}
   {subscribe_block}
   {cards}
   <footer>Updated {now_str}</footer>
@@ -1422,6 +1661,11 @@ footer{{text-align:center;margin-top:50px;font-size:.78rem;color:var(--soft)}}
 def _admin_page() -> str:
     # All AWS regions available for monitor deployment
     build = _build_info()
+    read_only_banner = ""
+    if _is_read_only():
+        read_only_banner = """<div class="tip" style="margin-bottom:16px;background:#3f1d1d;border-left-color:#ef4444;color:#fecaca">
+Read-only mode is enabled. Browsing still works, but all mutating admin actions are disabled.
+</div>"""
     all_regions = [
         "us-east-1","us-east-2","us-west-1","us-west-2",
         "ca-central-1","ca-west-1",
@@ -1537,6 +1781,7 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </div>
 </div>
 <div class="main">
+{read_only_banner}
 <div class="hint" style="margin-bottom:16px">Build: <strong>{build.get("version", "unknown")}</strong>{' · Built at: ' + build.get('built_at') if build.get('built_at') else ''} · Region: <strong>{build.get("region", HOME_REGION)}</strong></div>
 
 <div id="pane-hosts">
@@ -1818,9 +2063,20 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
     <div class="form-group"><label>Monitor Regions</label><input id="c-regions" type="number" value="0" min="0"></div>
     <div class="form-group"><label>Check Interval (sec)</label><input id="c-interval" type="number" value="60" min="60"></div>
     <div class="form-group"><label>Retention (days)</label><input id="c-days" type="number" value="90"></div>
+    <div class="form-group">
+      <label>CloudFront Plan</label>
+      <select id="c-cloudfront-plan">
+        <option value="payg">Pay as you go (not estimated)</option>
+        <option value="free">Free plan ($0/mo)</option>
+        <option value="pro">Pro plan ($15/mo)</option>
+        <option value="business">Business plan ($200/mo)</option>
+        <option value="premium">Premium plan ($1000/mo)</option>
+      </select>
+    </div>
   </div>
   <button class="btn btn-primary" onclick="calcCost()" style="margin-bottom:20px">Calculate</button>
   <div class="panel" id="cost-result" style="display:none">
+    <div id="cost-summary" class="hint" style="margin-bottom:14px"></div>
     <div id="cost-rows"></div>
   </div>
 </div>
@@ -1894,6 +2150,9 @@ Authorization: Bearer &lt;admin-token&gt;</pre>
     <div class="grid2">
       <div class="form-group"><label>Check Interval (sec)</label><input id="m-interval" type="number" value="60" min="60" max="3600"></div>
       <div class="form-group"><label>Timeout (sec)</label><input id="m-timeout" type="number" value="10" min="1" max="60"></div>
+    </div>
+    <div class="tip" id="m-impact">
+      Current scheduler: every 60 seconds. This host will be checked about 1,440 times/day per worker region and does not create one Lambda invocation per check by itself.
     </div>
     <div class="form-group">
       <label>Expected HTTP Status Code</label>
@@ -2053,7 +2312,7 @@ function renderTargetRegions(selected=[]) {{
   }}
   wrap.innerHTML = REGIONS_CACHE.map(r => `
     <label class="check-item">
-      <input type="checkbox" value="${{r.region}}" ${{selected.includes(r.region) ? 'checked' : ''}}>
+      <input type="checkbox" value="${{r.region}}" ${{selected.includes(r.region) ? 'checked' : ''}} onchange="updateHostImpact()">
       <span>${{r.region}}</span>
     </label>
   `).join('');
@@ -2104,6 +2363,7 @@ async function openAddHost() {{
   document.getElementById('m-enabled').checked = true;
   document.getElementById('m-sns-group').style.display = 'none';
   renderTargetRegions([]);
+  updateHostImpact();
   document.getElementById('host-modal').classList.add('open');
 }}
 
@@ -2123,11 +2383,28 @@ async function openEditHost(h) {{
   document.getElementById('m-enabled').checked = h.enabled !== false;
   document.getElementById('m-sns-group').style.display = h.alert_enabled ? '' : 'none';
   renderTargetRegions(h.target_regions || []);
+  updateHostImpact();
   document.getElementById('host-modal').classList.add('open');
 }}
 
 function toggleSNS() {{
   document.getElementById('m-sns-group').style.display = document.getElementById('m-alert').checked ? '' : 'none';
+}}
+
+function updateHostImpact() {{
+  const requestedInterval = Math.max(1, +(document.getElementById('m-interval').value || 60));
+  const effectiveInterval = 60;
+  const selectedRegions = selectedTargetRegions();
+  const deployedRegions = ALL_REGIONS.length;
+  const regionCount = selectedRegions.length || deployedRegions || 0;
+  const requestedChecksPerDayPerRegion = Math.round(86400 / requestedInterval);
+  const effectiveChecksPerDayPerRegion = Math.round(86400 / effectiveInterval);
+  const effectiveChecksPerDayTotal = effectiveChecksPerDayPerRegion * regionCount;
+  const targetLabel = selectedRegions.length ? (selectedRegions.length + ' selected worker region(s)') : (deployedRegions + ' deployed worker region(s)');
+  document.getElementById('m-impact').innerHTML =
+    `Requested interval: every <strong>${{requestedInterval}}s</strong>, which would be about <strong>${{requestedChecksPerDayPerRegion.toLocaleString()}}</strong> checks/day per region if per-host intervals were enforced.<br>` +
+    `Current scheduler: every <strong>${{effectiveInterval}}s</strong>, so this host is currently checked about <strong>${{effectiveChecksPerDayTotal.toLocaleString()}}</strong> times/day across ${{targetLabel}}.<br>` +
+    `Lambda invocations are driven by the once-per-minute management + worker schedule, so adding this host increases checks and DynamoDB writes, not one Lambda invoke per check.`;
 }}
 
 function closeHostModal() {{ document.getElementById('host-modal').classList.remove('open'); }}
@@ -2212,6 +2489,7 @@ async function deployRegion() {{
   }}
   stat.innerHTML = '<span style="color:#22c55e">Deployed successfully</span>';
   await loadRegions();
+  closeRegionModal();
   toast('Worker deployed in '+body.region);
 }}
 
@@ -2446,6 +2724,20 @@ function renderManagementSummary(data) {{
     el.innerHTML = `<div style="color:#ef4444">${{(data && data.error) || 'Unable to load management summary.'}}</div>`;
     return;
   }}
+  const managementLambda = data.lambdas?.management || {{}};
+  const workers = Array.isArray(data.lambdas?.workers) ? data.lambdas.workers : [];
+  const workerRows = workers.map(worker => `
+    <tr>
+      <td>${{worker.region || '—'}}</td>
+      <td>${{worker.function_name || '—'}}</td>
+      <td>${{worker.memory_mb || '—'}} MB</td>
+      <td>${{worker.age_human || '—'}}</td>
+      <td>${{worker.last_24h?.invocations ?? '—'}}</td>
+      <td>${{worker.last_24h?.avg_duration_ms != null ? worker.last_24h.avg_duration_ms + ' ms' : '—'}}</td>
+      <td>${{worker.last_24h?.errors ?? '—'}}</td>
+    </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:#64748b;padding:16px">No worker regions deployed yet.</td></tr>`;
+  const workerInvocations24h = workers.reduce((sum, worker) => sum + (worker.last_24h?.invocations || 0), 0);
+  const workerErrors24h = workers.reduce((sum, worker) => sum + (worker.last_24h?.errors || 0), 0);
   document.getElementById('mgmt-retention-days').value = data.retention_days || 90;
   el.innerHTML = `
     <div class="grid2">
@@ -2463,6 +2755,29 @@ function renderManagementSummary(data) {{
         <div class="hint">Size: ${{data.tables.checks.size_human}} (${{data.tables.checks.size_bytes}} bytes)</div>
         <div class="hint">Status: ${{data.tables.checks.status}}</div>
       </div>
+    </div>
+    <div class="grid2" style="margin-top:16px">
+      <div>
+        <h3 style="margin-top:0">Management Lambda</h3>
+        <div class="hint">Function: ${{managementLambda.function_name || 'uptime-management'}}</div>
+        <div class="hint">Memory: ${{managementLambda.memory_mb || '—'}} MB</div>
+        <div class="hint">Age: ${{managementLambda.age_human || '—'}}</div>
+        <div class="hint">Invocations (24h): ${{managementLambda.last_24h?.invocations ?? '—'}}</div>
+        <div class="hint">Avg runtime (24h): ${{managementLambda.last_24h?.avg_duration_ms != null ? managementLambda.last_24h.avg_duration_ms + ' ms' : '—'}}</div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Worker Fleet</h3>
+        <div class="hint">Deployed regions: ${{data.worker_regions}}</div>
+        <div class="hint">Home region: ${{data.home_region}}</div>
+        <div class="hint">Worker invocations (24h): ${{workerInvocations24h}}</div>
+        <div class="hint">Worker errors (24h): ${{workerErrors24h}}</div>
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <table>
+        <thead><tr><th>Region</th><th>Function</th><th>Memory</th><th>Age</th><th>Invocations (24h)</th><th>Avg runtime</th><th>Errors</th></tr></thead>
+        <tbody>${{workerRows}}</tbody>
+      </table>
     </div>
     <div style="margin-top:16px" class="hint">
       Hosts: ${{data.hosts.total}} total, ${{data.hosts.enabled}} enabled, ${{data.hosts.on_status_page}} on status page, ${{data.hosts.alerts_enabled}} with alerts.
@@ -2537,13 +2852,14 @@ async function loadCostDefaults() {{
   document.getElementById('c-regions').value = defaults.regions ?? 0;
   document.getElementById('c-interval').value = defaults.interval_sec ?? 60;
   document.getElementById('c-days').value = defaults.retention_days ?? 90;
+  document.getElementById('c-cloudfront-plan').value = defaults.cloudfront_plan ?? 'payg';
   await calcCost();
 }}
 
 async function calcCost() {{
   const customDomainInput = document.getElementById('cd-domain');
   const customDomainEnabled = !!(customDomainInput && customDomainInput.value);
-  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value+'&custom_domain='+(customDomainEnabled ? '1' : '0'));
+  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value+'&custom_domain='+(customDomainEnabled ? '1' : '0')+'&cloudfront_plan='+encodeURIComponent(document.getElementById('c-cloudfront-plan').value));
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to calculate costs.');
     return;
@@ -2551,6 +2867,12 @@ async function calcCost() {{
   const b = data.breakdown || {{}};
   const el = document.getElementById('cost-result');
   el.style.display = '';
+  document.getElementById('cost-summary').innerHTML =
+    `Current scheduler: every <strong>${{data.scheduler?.effective_interval_sec || 60}}s</strong>. ` +
+    `Requested interval: every <strong>${{data.scheduler?.requested_interval_sec || 60}}s</strong>. ` +
+    `Checks/day per region: <strong>${{(data.checks_per_day_per_region || 0).toLocaleString()}}</strong>. ` +
+    `Monthly Lambda invocations: <strong>${{(data.monthly_invocations?.total || 0).toLocaleString()}}</strong> ` +
+    `(management ${{(data.monthly_invocations?.management || 0).toLocaleString()}}, workers ${{(data.monthly_invocations?.workers || 0).toLocaleString()}}).`;
   document.getElementById('cost-rows').innerHTML =
     [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
     .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{(v||0).toFixed(4)}}</span></div>`)
@@ -2559,6 +2881,7 @@ async function calcCost() {{
 
 async function boot() {{
   if (!await ensureAuthed()) return;
+  document.getElementById('m-interval').addEventListener('input', updateHostImpact);
   await Promise.all([ensureRegionsLoaded(), loadHosts()]);
 }}
 

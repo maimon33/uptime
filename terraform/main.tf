@@ -132,7 +132,8 @@ resource "aws_iam_role_policy" "management" {
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
-          "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"
+          "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan",
+          "dynamodb:DescribeTable"
         ]
         Resource = [
           aws_dynamodb_table.hosts.arn,
@@ -158,12 +159,19 @@ resource "aws_iam_role_policy" "management" {
           "acm:RequestCertificate",
           "acm:DescribeCertificate",
           "acm:DeleteCertificate",
+          "acm:AddTagsToCertificate",
           "cloudfront:CreateDistribution",
           "cloudfront:GetDistribution",
           "cloudfront:GetDistributionConfig",
           "cloudfront:UpdateDistribution",
           "cloudfront:DeleteDistribution",
         ]
+        Resource = "*"
+      },
+      {
+        Sid      = "Metrics"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:GetMetricStatistics"]
         Resource = "*"
       },
       # ── Permissions to manage monitor Lambdas in any region ──────────────

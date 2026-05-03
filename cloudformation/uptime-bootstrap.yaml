@@ -135,6 +135,7 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Query
                   - dynamodb:Scan
+                  - dynamodb:DescribeTable
                 Resource:
                   - !GetAtt HostsTable.Arn
                   - !GetAtt ChecksTable.Arn
@@ -154,11 +155,17 @@ Resources:
                   - acm:RequestCertificate
                   - acm:DescribeCertificate
                   - acm:DeleteCertificate
+                  - acm:AddTagsToCertificate
                   - cloudfront:CreateDistribution
                   - cloudfront:GetDistribution
                   - cloudfront:GetDistributionConfig
                   - cloudfront:UpdateDistribution
                   - cloudfront:DeleteDistribution
+                Resource: '*'
+              - Sid: Metrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
                 Resource: '*'
               - Sid: MonitorLambda
                 Effect: Allow
