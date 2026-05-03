@@ -158,7 +158,7 @@ Resources:
           AttributeDataType: String
           Mutable: true
           Required: true
-      Tags:
+      UserPoolTags:
         Project: uptime
         ManagedBy: cloudformation
 

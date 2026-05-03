@@ -1451,6 +1451,8 @@ _CLOUDFRONT_PLAN_COSTS = {
     "business": 200.0,
     "premium": 1000.0,
 }
+_COGNITO_ESSENTIALS_DIRECT_MAU_FREE_TIER = 10_000
+_COGNITO_ESSENTIALS_DIRECT_MAU_PRICE = 0.015
 
 
 def _current_scheduler_interval_seconds() -> int:
@@ -1470,6 +1472,8 @@ def _cost_estimate(qs: dict) -> dict:
     days     = int(qs.get("days",     [str(defaults["retention_days"])])[0])
     custom_domain_enabled = str(qs.get("custom_domain", [str(int(defaults.get("custom_domain_enabled", 0)))])[0]).strip().lower() in {"1", "true", "yes", "on"}
     cloudfront_plan = str(qs.get("cloudfront_plan", [defaults.get("cloudfront_plan", "payg")])[0] or "payg").strip().lower()
+    cognito_enabled = str(qs.get("cognito_enabled", [str(int(defaults.get("cognito_enabled", 0)))])[0]).strip().lower() in {"1", "true", "yes", "on"}
+    cognito_admin_mau = max(0, int(qs.get("cognito_admin_mau", [str(defaults.get("cognito_admin_mau", 0))])[0]))
     if cloudfront_plan not in _CLOUDFRONT_PLAN_COSTS:
         cloudfront_plan = "payg"
 
@@ -1493,7 +1497,11 @@ def _cost_estimate(qs: dict) -> dict:
     log_gb       = (checks_mo * 100) / (1024 ** 3)
     log_cost     = max(0, (log_gb - 5) * 0.50)
     cloudfront_custom_domain_cost = _CLOUDFRONT_PLAN_COSTS[cloudfront_plan] if custom_domain_enabled else 0.0
-    total        = lambda_cost + ddb_w_cost + ddb_r_cost + storage_cost + log_cost + cloudfront_custom_domain_cost
+    cognito_auth_cost = 0.0
+    if cognito_enabled:
+        cognito_billable_mau = max(0, cognito_admin_mau - _COGNITO_ESSENTIALS_DIRECT_MAU_FREE_TIER)
+        cognito_auth_cost = cognito_billable_mau * _COGNITO_ESSENTIALS_DIRECT_MAU_PRICE
+    total        = lambda_cost + ddb_w_cost + ddb_r_cost + storage_cost + log_cost + cloudfront_custom_domain_cost + cognito_auth_cost
 
     return _json(200, {
         "inputs": {
@@ -1503,6 +1511,8 @@ def _cost_estimate(qs: dict) -> dict:
             "retention_days": days,
             "custom_domain": custom_domain_enabled,
             "cloudfront_plan": cloudfront_plan,
+            "cognito_enabled": cognito_enabled,
+            "cognito_admin_mau": cognito_admin_mau,
         },
         "defaults": defaults,
         "monthly_checks": checks_mo,
@@ -1523,10 +1533,11 @@ def _cost_estimate(qs: dict) -> dict:
             "dynamodb_reads_usd":   round(ddb_r_cost,   4),
             "dynamodb_storage_usd": round(storage_cost, 4),
             "cloudfront_custom_domain_usd": round(cloudfront_custom_domain_cost, 4),
+            "cognito_auth_usd":     round(cognito_auth_cost, 4),
             "cloudwatch_logs_usd":  round(log_cost,     4),
         },
         "total_usd_per_month": round(total, 4),
-        "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). The current scheduler runs once per minute, so Lambda invocations are driven by worker-region count, not by each host's requested interval. CloudFront uses the selected plan cost; pay-as-you-go request and bandwidth overages are not estimated here.",
+        "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). The current scheduler runs once per minute, so Lambda invocations are driven by worker-region count, not by each host's requested interval. CloudFront uses the selected plan cost; pay-as-you-go request and bandwidth overages are not estimated here. Cognito is estimated as direct sign-in MAUs on the Essentials pricing path and excludes SMS, SES email, and advanced add-ons.",
     })
 
 
@@ -1540,6 +1551,8 @@ def _default_cost_inputs() -> dict:
         "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
         "custom_domain_enabled": 1 if settings.get("custom_domain_name") else 0,
         "cloudfront_plan": "free" if settings.get("custom_domain_name") else "payg",
+        "cognito_enabled": 1 if (os.environ.get("ADMIN_AUTH_MODE") == "cognito" or os.environ.get("COGNITO_USER_POOL_ID")) else 0,
+        "cognito_admin_mau": 5 if (os.environ.get("ADMIN_AUTH_MODE") == "cognito" or os.environ.get("COGNITO_USER_POOL_ID")) else 0,
         "monitor_tiers": RECOMMENDED_MONITOR_TIERS,
     }
 
@@ -2444,6 +2457,11 @@ strong{{color:#f8fafc}}
         <option value="premium">Premium plan ($1000/mo)</option>
       </select>
     </div>
+    <div class="form-group">
+      <label>Cognito Admin MAUs / Month</label>
+      <input id="c-cognito-mau" type="number" value="0" min="0">
+      <div class="hint">Only used when Cognito is deployed. This estimates monthly active admin users, not total user accounts.</div>
+    </div>
   </div>
   <button class="btn btn-primary" onclick="calcCost()" style="margin-bottom:20px">Calculate</button>
   <div class="panel" id="cost-result" style="display:none">
@@ -3305,13 +3323,15 @@ async function loadCostDefaults() {{
   document.getElementById('c-interval').value = defaults.interval_sec ?? 300;
   document.getElementById('c-days').value = defaults.retention_days ?? 90;
   document.getElementById('c-cloudfront-plan').value = defaults.cloudfront_plan ?? 'payg';
+  document.getElementById('c-cognito-mau').value = defaults.cognito_admin_mau ?? 0;
   await calcCost();
 }}
 
 async function calcCost() {{
   const customDomainInput = document.getElementById('cd-domain');
   const customDomainEnabled = !!(customDomainInput && customDomainInput.value);
-  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value+'&custom_domain='+(customDomainEnabled ? '1' : '0')+'&cloudfront_plan='+encodeURIComponent(document.getElementById('c-cloudfront-plan').value));
+  const cognitoEnabled = !!(document.getElementById('c-cognito-mau').value && +document.getElementById('c-cognito-mau').value > 0);
+  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value+'&custom_domain='+(customDomainEnabled ? '1' : '0')+'&cloudfront_plan='+encodeURIComponent(document.getElementById('c-cloudfront-plan').value)+'&cognito_enabled='+(cognitoEnabled ? '1' : '0')+'&cognito_admin_mau='+document.getElementById('c-cognito-mau').value);
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to calculate costs.');
     return;
@@ -3324,9 +3344,10 @@ async function calcCost() {{
     `Requested interval: every <strong>${{data.scheduler?.requested_interval_sec || 60}}s</strong>. ` +
     `Checks/day per region: <strong>${{(data.checks_per_day_per_region || 0).toLocaleString()}}</strong>. ` +
     `Monthly Lambda invocations: <strong>${{(data.monthly_invocations?.total || 0).toLocaleString()}}</strong> ` +
-    `(management ${{(data.monthly_invocations?.management || 0).toLocaleString()}}, workers ${{(data.monthly_invocations?.workers || 0).toLocaleString()}}).`;
+    `(management ${{(data.monthly_invocations?.management || 0).toLocaleString()}}, workers ${{(data.monthly_invocations?.workers || 0).toLocaleString()}}). ` +
+    `Cognito admin MAUs: <strong>${{(data.inputs?.cognito_admin_mau || 0).toLocaleString()}}</strong>.`;
   document.getElementById('cost-rows').innerHTML =
-    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
+    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['Cognito auth', b.cognito_auth_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
     .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{(v||0).toFixed(4)}}</span></div>`)
     .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{data.note||''}}</div>`;
 }}
