@@ -6,6 +6,7 @@ and runs the scheduled cross-region monitoring orchestration.
 Routes (public):
   GET  /           → status page
   GET  /status     → alias
+  GET  /history    → public incident/check history
   GET  /admin      → admin SPA login shell
 
 API (admin key required):
@@ -24,6 +25,7 @@ API (admin key required):
 
 import base64
 import hmac
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -129,6 +131,9 @@ ADMIN_KEY_SECRET = os.environ.get("ADMIN_KEY_SECRET")
 HOME_REGION     = os.environ.get("HOME_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "90"))
 READ_ONLY_MODE  = str(os.environ.get("READ_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+ADMIN_ALLOWED_IP_CIDRS = [cidr.strip() for cidr in os.environ.get("ADMIN_ALLOWED_IP_CIDRS", "").split(",") if cidr.strip()]
+DEFAULT_MONITOR_TIERS = [60, 300]
+RECOMMENDED_MONITOR_TIERS = [60, 300, 900, 3600]
 
 _SETTINGS_DEFAULTS = {
     "status_page_title":       os.environ.get("STATUS_PAGE_TITLE", "System Status"),
@@ -193,11 +198,20 @@ def handler(event, context):
         if path in ("/", "/status"):
             return _serve_status_page()
 
+        if path == "/history":
+            return _serve_history_page(event)
+
         if path == "/admin":
+            if not _admin_ip_allowed(event):
+                _log("warn", "admin_ip_blocked", path=path, client_ip=_client_ip(event), allowed_cidrs=ADMIN_ALLOWED_IP_CIDRS)
+                return _html(403, "<h1>403 Forbidden</h1><p>Admin access from this IP is not allowed.</p>")
             _log("info", "admin_page_served")
             return _html(200, _admin_page())
 
         if path.startswith("/api/"):
+            if not _admin_ip_allowed(event):
+                _log("warn", "api_ip_blocked", method=method, path=path, client_ip=_client_ip(event), allowed_cidrs=ADMIN_ALLOWED_IP_CIDRS)
+                return _json(403, {"error": "Admin access from this IP is not allowed."})
             authed = _auth(event)
             if not authed:
                 _log("warn", "api_request_unauthorized", method=method, path=path)
@@ -274,14 +288,84 @@ def _log_request(event: dict, method: str, path: str) -> None:
     )
 
 
+def _client_ip(event: dict) -> str:
+    headers = event.get("headers") or {}
+    forwarded_for = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For") or ""
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return (((event.get("requestContext") or {}).get("http") or {}).get("sourceIp") or "").strip()
+
+
+def _admin_ip_allowed(event: dict) -> bool:
+    if not ADMIN_ALLOWED_IP_CIDRS:
+        return True
+    client_ip = _client_ip(event)
+    if not client_ip:
+        return False
+    try:
+        candidate = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for cidr in ADMIN_ALLOWED_IP_CIDRS:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if candidate in network:
+            return True
+    return False
+
+
+def _normalize_monitor_tiers(value, *, fallback: list[int] | None = None) -> list[int]:
+    tiers = []
+    raw_values = value if isinstance(value, list) else ([value] if value not in (None, "") else [])
+    for raw in raw_values:
+        try:
+            tier = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if tier < 60 or tier % 60 != 0:
+            continue
+        if tier not in tiers:
+            tiers.append(tier)
+    if tiers:
+        return sorted(tiers)
+    return list(fallback or DEFAULT_MONITOR_TIERS)
+
+
+def _host_monitor_tier_seconds(host: dict) -> int:
+    value = host.get("monitor_tier_seconds", host.get("check_interval_seconds", 60))
+    try:
+        tier = int(value)
+    except (TypeError, ValueError):
+        return 60
+    if tier < 60 or tier % 60 != 0:
+        return 60
+    return tier
+
+
+def _due_monitor_tiers(now: datetime, all_tiers: list[int]) -> list[int]:
+    current_epoch = int(now.timestamp())
+    due = []
+    for tier in sorted(set(all_tiers)):
+        if tier >= 60 and current_epoch % tier == 0:
+            due.append(tier)
+    return due or [60]
+
+
 def _run_orchestration() -> dict:
     if _is_read_only():
         _log("info", "orchestration_skipped_read_only")
         return {"skipped": True, "reason": "read_only_mode"}
     db = _db()
-    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_time = datetime.now(timezone.utc).replace(microsecond=0)
+    run_id = run_time.strftime("%Y-%m-%dT%H:%M:%SZ")
     regions = reg.list_regions(db)
-    _log("info", "orchestration_started", run_id=run_id, configured_regions=len(regions))
+    all_tiers = []
+    for region in regions:
+        all_tiers.extend(_normalize_monitor_tiers(region.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS))
+    due_tiers = _due_monitor_tiers(run_time, all_tiers or DEFAULT_MONITOR_TIERS)
+    _log("info", "orchestration_started", run_id=run_id, configured_regions=len(regions), due_tiers=due_tiers)
 
     if not regions:
         print("No worker regions configured; skipping orchestration run.")
@@ -295,7 +379,7 @@ def _run_orchestration() -> dict:
     worker_results = []
     with ThreadPoolExecutor(max_workers=min(len(regions), 8)) as pool:
         futures = {
-            pool.submit(_invoke_region_worker, region["region"], run_id): region["region"]
+            pool.submit(_invoke_region_worker, region, run_id, due_tiers): region["region"]
             for region in regions
         }
         for fut in as_completed(futures):
@@ -310,12 +394,13 @@ def _run_orchestration() -> dict:
         result_rows.extend(worker.get("results", []))
 
     _apply_aggregate_updates(db, hosts, result_rows, run_id)
-    _log("info", "orchestration_completed", run_id=run_id, regions=len(regions), hosts=len(hosts), results=len(result_rows))
+    _log("info", "orchestration_completed", run_id=run_id, regions=len(regions), hosts=len(hosts), results=len(result_rows), due_tiers=due_tiers)
     return {
         "run_id": run_id,
         "regions": len(regions),
         "hosts": len(hosts),
         "results": len(result_rows),
+        "due_tiers": due_tiers,
     }
 
 
@@ -448,6 +533,14 @@ def _list_host_items() -> list[dict]:
     )
     return result.get("Items", [])
 
+
+def _list_public_hosts() -> list[dict]:
+    result = _db().Table(HOSTS_TABLE).scan(
+        FilterExpression="show_on_status_page = :t AND host_id <> :s AND NOT begins_with(host_id, :r)",
+        ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__"},
+    )
+    return sorted(result.get("Items", []), key=lambda h: h.get("name", ""))
+
 def _get_host(host_id: str) -> dict:
     item = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": host_id}).get("Item")
     return _json(404, {"error": "Host not found"}) if not item else _json(200, item)
@@ -456,19 +549,25 @@ def _create_host(body: dict) -> dict:
     if not body.get("name") or not body.get("url"):
         return _json(400, {"error": "'name' and 'url' are required"})
     now  = datetime.now(timezone.utc).isoformat()
+    monitor_tier_seconds = int(body.get("monitor_tier_seconds", body.get("check_interval_seconds", 60)))
+    target_regions = _normalize_target_regions(body.get("target_regions"))
+    tier_error = _validate_host_monitor_tier(monitor_tier_seconds, target_regions)
+    if tier_error:
+        return _json(400, {"error": tier_error})
     item = {k: v for k, v in {
         "host_id":                str(uuid.uuid4()),
         "name":                   body["name"],
         "url":                    body["url"],
         "check_type":             body.get("check_type", "http"),
-        "check_interval_seconds": int(body.get("check_interval_seconds", 60)),
+        "check_interval_seconds": monitor_tier_seconds,
+        "monitor_tier_seconds":   monitor_tier_seconds,
         "timeout_seconds":        int(body.get("timeout_seconds", 10)),
         "enabled":                bool(body.get("enabled", True)),
         "alert_enabled":          bool(body.get("alert_enabled", False)),
         "alert_sns_arn":          body.get("alert_sns_arn", "") or None,
         "show_on_status_page":    bool(body.get("show_on_status_page", True)),
         "expected_status_code":   int(body.get("expected_status_code", 200)),
-        "target_regions":         _normalize_target_regions(body.get("target_regions")),
+        "target_regions":         target_regions,
         "tags":                   body.get("tags", []),
         "created_at":             now,
         "updated_at":             now,
@@ -479,18 +578,33 @@ def _create_host(body: dict) -> dict:
 
 def _update_host(host_id: str, body: dict) -> dict:
     table = _db().Table(HOSTS_TABLE)
-    if not table.get_item(Key={"host_id": host_id}).get("Item"):
+    existing = table.get_item(Key={"host_id": host_id}).get("Item")
+    if not existing:
         return _json(404, {"error": "Host not found"})
     allowed = {
-        "name", "url", "check_type", "check_interval_seconds", "timeout_seconds",
+        "name", "url", "check_type", "check_interval_seconds", "monitor_tier_seconds", "timeout_seconds",
         "enabled", "alert_enabled", "alert_sns_arn", "show_on_status_page",
         "expected_status_code", "tags", "target_regions",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return _json(400, {"error": "No updatable fields"})
+    if "monitor_tier_seconds" in updates:
+        tier = int(updates["monitor_tier_seconds"])
+        updates["monitor_tier_seconds"] = tier
+        updates["check_interval_seconds"] = tier
+    elif "check_interval_seconds" in updates:
+        tier = int(updates["check_interval_seconds"])
+        updates["check_interval_seconds"] = tier
+        updates["monitor_tier_seconds"] = tier
     if "target_regions" in updates:
         updates["target_regions"] = _normalize_target_regions(updates.get("target_regions"))
+    tier_error = _validate_host_monitor_tier(
+        int(updates.get("monitor_tier_seconds", existing.get("monitor_tier_seconds", existing.get("check_interval_seconds", 60)))),
+        updates.get("target_regions", existing.get("target_regions", [])),
+    )
+    if tier_error:
+        return _json(400, {"error": tier_error})
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     expr   = "SET " + ", ".join(f"#{k} = :{k}" for k in updates)
     table.update_item(
@@ -563,12 +677,18 @@ def _save_settings_item(item: dict) -> None:
     _db().Table(HOSTS_TABLE).put_item(Item=payload)
 
 
-def _invoke_region_worker(region: str, run_id: str) -> dict:
+def _invoke_region_worker(region_info: dict, run_id: str, due_tiers: list[int]) -> dict:
+    region = region_info["region"]
     function_name = f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region}"
+    supported_tiers = _normalize_monitor_tiers(region_info.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
     response = _lambda_client(region).invoke(
         FunctionName=function_name,
         InvocationType="RequestResponse",
-        Payload=json.dumps({"run_id": run_id}).encode(),
+        Payload=json.dumps({
+            "run_id": run_id,
+            "due_tiers": due_tiers,
+            "supported_tiers": supported_tiers,
+        }).encode(),
     )
     payload = response["Payload"].read().decode() or "{}"
     body = json.loads(payload)
@@ -588,6 +708,22 @@ def _normalize_target_regions(value) -> list[str]:
         if region_name and region_name not in cleaned:
             cleaned.append(region_name)
     return cleaned
+
+
+def _validate_host_monitor_tier(monitor_tier_seconds: int, target_regions: list[str]) -> str | None:
+    if monitor_tier_seconds < 60 or monitor_tier_seconds % 60 != 0:
+        return "monitor_tier_seconds must be a whole-minute tier such as 60 or 300"
+    if not target_regions:
+        return None
+    region_records = {region["region"]: region for region in reg.list_regions(_db())}
+    unsupported = []
+    for region_name in target_regions:
+        supported_tiers = _normalize_monitor_tiers((region_records.get(region_name) or {}).get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
+        if monitor_tier_seconds not in supported_tiers:
+            unsupported.append(region_name)
+    if unsupported:
+        return "Selected worker regions do not support this monitor tier: " + ", ".join(sorted(unsupported))
+    return None
 
 
 def _apply_aggregate_updates(db, hosts: list[dict], result_rows: list[dict], run_id: str) -> None:
@@ -704,8 +840,9 @@ def _add_region(body: dict) -> dict:
     if not region:
         return _json(400, {"error": "'region' is required (e.g. 'us-east-1')"})
     memory_mb = int(body.get("memory_mb", 256))
+    supported_tiers = _normalize_monitor_tiers(body.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
     try:
-        info = reg.deploy_region(region, memory_mb)
+        info = reg.deploy_region(region, memory_mb, supported_tiers)
         reg.save_region_record(_db(), info)
         return _json(200, info)
     except Exception as e:
@@ -717,8 +854,9 @@ def _update_region(region: str) -> dict:
     if not existing:
         return _json(404, {"error": f"Region {region} not found. Deploy it first."})
     memory_mb = int(existing.get("memory_mb", 256))
+    supported_tiers = _normalize_monitor_tiers(existing.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
     try:
-        info = reg.deploy_region(region, memory_mb)
+        info = reg.deploy_region(region, memory_mb, supported_tiers)
         reg.save_region_record(_db(), info)
         return _json(200, info)
     except Exception as e:
@@ -1402,6 +1540,7 @@ def _default_cost_inputs() -> dict:
         "retention_days": int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"])),
         "custom_domain_enabled": 1 if settings.get("custom_domain_name") else 0,
         "cloudfront_plan": "free" if settings.get("custom_domain_name") else "payg",
+        "monitor_tiers": RECOMMENDED_MONITOR_TIERS,
     }
 
 
@@ -1424,53 +1563,7 @@ def _serve_status_page() -> dict:
     maintenance_window = settings.get("maintenance_window", _SETTINGS_DEFAULTS["maintenance_window"])
     maintenance_scope = settings.get("maintenance_scope", _SETTINGS_DEFAULTS["maintenance_scope"])
 
-    hosts_result = db.Table(HOSTS_TABLE).scan(
-        FilterExpression="show_on_status_page = :t AND host_id <> :s AND NOT begins_with(host_id, :r)",
-        ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__"},
-    )
-    hosts = sorted(hosts_result.get("Items", []), key=lambda h: h.get("name", ""))
-
-    from boto3.dynamodb.conditions import Key as DKey
-    host_data = []
-    for host in hosts:
-        checks = db.Table(CHECKS_TABLE).query(
-            KeyConditionExpression=DKey("host_id").eq(host["host_id"]),
-            ScanIndexForward=False,
-            Limit=300,
-        ).get("Items", [])
-        grouped = {}
-        for check in checks:
-            run_id = check.get("run_id") or check.get("checked_at")
-            grouped.setdefault(run_id, []).append(check)
-
-        latest_runs = sorted(grouped.keys(), reverse=True)[:90]
-        run_statuses = [_aggregate_status(grouped[run_id]) for run_id in latest_runs]
-        flat_checks = [item for run_id in latest_runs for item in grouped[run_id]]
-
-        if run_statuses:
-            up_count = sum(1 for status in run_statuses if status == "up")
-            uptime_pct = round((up_count / len(run_statuses)) * 100, 1)
-            avg_latency = round(sum(float(c.get("latency_ms", 0)) for c in flat_checks) / len(flat_checks))
-        else:
-            uptime_pct, avg_latency = 100.0, 0
-        latest_latency = host.get("last_latency_ms")
-        region_summary = []
-        for region_name, region_info in sorted((host.get("region_statuses") or {}).items()):
-            region_summary.append({
-                "region": region_name,
-                "status": region_info.get("status", "unknown"),
-                "latency_ms": region_info.get("latency_ms"),
-            })
-        host_data.append({
-            "host":           host,
-            "uptime_pct":     uptime_pct,
-            "avg_latency":    avg_latency,
-            "latest_latency": latest_latency,
-            "region_summary": region_summary,
-            "history":        list(reversed(run_statuses)),
-            "history_available": bool(run_statuses),
-            "current_status": host.get("current_status", "unknown"),
-        })
+    host_data = _build_public_host_data(db, _list_public_hosts(), history_limit=300)
     return _html(
         200,
         _render_status_page(
@@ -1480,6 +1573,7 @@ def _serve_status_page() -> dict:
             logo_url,
             theme,
             host_data,
+            events_by_month,
             {
                 "subscribe_intro": subscribe_intro,
                 "subscribe_email_url": subscribe_email_url,
@@ -1494,7 +1588,127 @@ def _serve_status_page() -> dict:
     )
 
 
-def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, theme: str, host_data: list, page_options: dict) -> str:
+def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> list[dict]:
+    from boto3.dynamodb.conditions import Key as DKey
+
+    host_data = []
+    for host in hosts:
+        checks = db.Table(CHECKS_TABLE).query(
+            KeyConditionExpression=DKey("host_id").eq(host["host_id"]),
+            ScanIndexForward=False,
+            Limit=history_limit,
+        ).get("Items", [])
+        grouped = {}
+        for check in checks:
+            run_id = check.get("run_id") or check.get("checked_at")
+            grouped.setdefault(run_id, []).append(check)
+
+        latest_runs = sorted(grouped.keys(), reverse=True)[:90]
+        run_statuses = [_aggregate_status(grouped[run_id]) for run_id in latest_runs]
+        run_points = []
+        for run_id in latest_runs:
+            run_status = _aggregate_status(grouped[run_id])
+            run_dt = _parse_aws_timestamp(run_id)
+            run_points.append({
+                "run_id": run_id,
+                "status": run_status,
+                "checked_at": run_dt.isoformat() if run_dt else run_id,
+                "month_label": run_dt.strftime("%B %Y") if run_dt else "Unknown month",
+            })
+        flat_checks = [item for run_id in latest_runs for item in grouped[run_id]]
+
+        if run_statuses:
+            up_count = sum(1 for status in run_statuses if status == "up")
+            uptime_pct = round((up_count / len(run_statuses)) * 100, 1)
+            avg_latency = round(sum(float(c.get("latency_ms", 0)) for c in flat_checks) / len(flat_checks))
+        else:
+            uptime_pct, avg_latency = 100.0, 0
+
+        region_summary = []
+        for region_name, region_info in sorted((host.get("region_statuses") or {}).items()):
+            region_summary.append({
+                "region": region_name,
+                "status": region_info.get("status", "unknown"),
+                "latency_ms": region_info.get("latency_ms"),
+            })
+        host_data.append({
+            "host": host,
+            "uptime_pct": uptime_pct,
+            "avg_latency": avg_latency,
+            "latest_latency": host.get("last_latency_ms"),
+            "region_summary": region_summary,
+            "history": list(reversed(run_statuses)),
+            "history_points": list(reversed(run_points)),
+            "history_available": bool(run_statuses),
+            "current_status": host.get("current_status", "unknown"),
+        })
+    return host_data
+
+
+def _collect_public_history_rows(db, hosts: list[dict], checks_limit: int = 120) -> list[dict]:
+    from boto3.dynamodb.conditions import Key as DKey
+
+    rows = []
+    host_names = {host["host_id"]: host.get("name", host["host_id"]) for host in hosts}
+    for host in hosts:
+        checks = db.Table(CHECKS_TABLE).query(
+            KeyConditionExpression=DKey("host_id").eq(host["host_id"]),
+            ScanIndexForward=False,
+            Limit=checks_limit,
+        ).get("Items", [])
+        for check in checks:
+            rows.append({
+                "host_id": host["host_id"],
+                "host_name": host_names[host["host_id"]],
+                "region": check.get("region", ""),
+                "status": check.get("status", "unknown"),
+                "latency_ms": check.get("latency_ms"),
+                "status_code": check.get("status_code"),
+                "checked_at": check.get("checked_at", ""),
+                "error": check.get("error", ""),
+            })
+    rows.sort(key=lambda row: row.get("checked_at", ""), reverse=True)
+    return rows
+
+
+def _serve_history_page(event: dict) -> dict:
+    db = _db()
+    settings = db.Table(HOSTS_TABLE).get_item(Key={"host_id": "__settings__"}).get("Item", {})
+    title = settings.get("status_page_title", _SETTINGS_DEFAULTS["status_page_title"])
+    brand_name = settings.get("status_page_brand_name", _SETTINGS_DEFAULTS["status_page_brand_name"])
+    logo_url = settings.get("status_page_logo_url", _SETTINGS_DEFAULTS["status_page_logo_url"])
+    theme = settings.get("status_page_theme", _SETTINGS_DEFAULTS["status_page_theme"])
+    hosts = _list_public_hosts()
+    query = parse_qs(event.get("rawQueryString") or "")
+    selected_host = (query.get("host", ["all"])[0] or "all").strip()
+    selected_region = (query.get("region", ["all"])[0] or "all").strip()
+
+    history_rows = _collect_public_history_rows(db, hosts)
+    regions = sorted({row["region"] for row in history_rows if row.get("region")})
+
+    filtered_rows = history_rows
+    if selected_host != "all":
+        filtered_rows = [row for row in filtered_rows if row["host_id"] == selected_host]
+    if selected_region != "all":
+        filtered_rows = [row for row in filtered_rows if row["region"] == selected_region]
+
+    return _html(
+        200,
+        _render_history_page(
+            title=title,
+            brand_name=brand_name,
+            logo_url=logo_url,
+            theme=theme,
+            hosts=hosts,
+            regions=regions,
+            selected_host=selected_host,
+            selected_region=selected_region,
+            rows=filtered_rows[:250],
+        ),
+    )
+
+
+def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, theme: str, host_data: list, events_by_month: list, page_options: dict) -> str:
     overall, ocls = "All systems operational", "operational"
     for h in host_data:
         if h["current_status"] == "down":
@@ -1517,21 +1731,6 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   <div class="maintenance-copy">{page_options["maintenance_message"]}</div>
   <div class="maintenance-meta">{' · '.join(maintenance_meta) if maintenance_meta else 'We will post updates here during the maintenance window.'}</div>
 </div>"""
-    upcoming_maintenance_block = ""
-    if page_options.get("maintenance_enabled") and page_options.get("maintenance_message"):
-        upcoming_maintenance_block = f"""<div class="maintenance-list">
-  <div class="maintenance-list-title">Upcoming maintenance</div>
-  <div class="maintenance-list-item">
-    <div class="maintenance-list-copy">{page_options["maintenance_message"]}</div>
-    <div class="maintenance-list-meta">{page_options.get("maintenance_window") or 'Window not set'}{' · Affected: ' + page_options.get("maintenance_scope") if page_options.get("maintenance_scope") else ''}</div>
-  </div>
-</div>"""
-    else:
-        upcoming_maintenance_block = """<div class="maintenance-list">
-  <div class="maintenance-list-title">Upcoming maintenance</div>
-  <div class="maintenance-list-empty">None</div>
-</div>"""
-
     subscribe_links = []
     if page_options.get("subscribe_email_url"):
         subscribe_links.append(f'<a class="subscribe-btn" href="{page_options["subscribe_email_url"]}">Email</a>')
@@ -1564,19 +1763,25 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
             for r in h["region_summary"]
         )
         history_note = "" if h["history_available"] else '<div class="history-note">History appears after checks have been recorded for this host.</div>'
-        cards += f"""<div class="card">
-  <div class="row"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
-  <div class="meta">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {' &nbsp;·&nbsp; '.join(latency_bits)}</div>
+        cards += f"""<details class="card svc-card">
+  <summary class="svc-summary">
+    <div>
+      <div class="row" style="margin-bottom:2px"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
+      <div class="meta" style="margin-bottom:0">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {' &nbsp;·&nbsp; '.join(latency_bits)}</div>
+    </div>
+    <span class="summary-hint">Details</span>
+  </summary>
   <div class="history-title">Recent history</div>
   {history_note}
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
   <div class="regions">{region_pills or '<span class="pill unknown">No regional data yet</span>'}</div>
-</div>"""
+</details>"""
 
     if not host_data:
         cards = '<p class="empty">No services configured for the status page yet.</p>'
 
+    history_href = "/history"
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     brand = ""
     if brand_name or logo_url:
@@ -1586,73 +1791,217 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}}
-.theme-clean{{--bg:#f8fafc;--text:#1e293b;--card:#ffffff;--border:#e2e8f0;--muted:#64748b;--soft:#94a3b8;--hero:#ffffff;--hero-border:#e2e8f0}}
-.theme-midnight{{--bg:#020617;--text:#e2e8f0;--card:#0f172a;--border:#1e293b;--muted:#94a3b8;--soft:#64748b;--hero:#0b1120;--hero-border:#1e293b}}
-.theme-sunrise{{--bg:#fff7ed;--text:#431407;--card:#ffffff;--border:#fed7aa;--muted:#9a3412;--soft:#c2410c;--hero:#fffbeb;--hero-border:#fdba74}}
-.theme-forest{{--bg:#f0fdf4;--text:#14532d;--card:#ffffff;--border:#bbf7d0;--muted:#15803d;--soft:#16a34a;--hero:#ecfdf5;--hero-border:#86efac}}
-.wrap{{max-width:780px;margin:0 auto;padding:40px 20px}}
-.brand{{display:flex;align-items:center;gap:12px;font-size:.95rem;font-weight:700;color:var(--muted);margin-bottom:20px}}
-.brand-logo{{height:36px;width:36px;object-fit:contain;border-radius:10px;background:var(--card);border:1px solid var(--border);padding:4px}}
-h1{{font-size:1.9rem;font-weight:700;margin-bottom:6px}}
-.sub{{color:var(--muted);margin-bottom:32px}}
-.overall{{display:flex;align-items:center;gap:12px;padding:18px 22px;border-radius:10px;margin-bottom:28px;font-weight:600;background:var(--hero);border:1px solid var(--hero-border)}}
-.overall.operational{{background:#f0fdf4;border:1px solid #bbf7d0}}
-.overall.down{{background:#fef2f2;border:1px solid #fecaca}}
-.overall.degraded{{background:#fffbeb;border:1px solid #fde68a}}
-.maintenance,.subscribe{{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;padding:18px 22px;border-radius:10px;margin-bottom:20px;background:var(--hero);border:1px solid var(--hero-border)}}
-.maintenance{{background:#eff6ff;border-color:#bfdbfe}}
-.maintenance-title,.subscribe-title{{font-size:.82rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}}
-.maintenance-copy,.subscribe-copy{{font-size:.96rem;line-height:1.5}}
+:root{{color-scheme:light}}
+body{{font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:
+radial-gradient(circle at top left, rgba(14,165,233,.16), transparent 32%),
+radial-gradient(circle at top right, rgba(15,118,110,.12), transparent 28%),
+linear-gradient(180deg, var(--bg) 0%, var(--bg-alt) 100%);color:var(--text);min-height:100vh;position:relative}}
+body::before{{content:"";position:fixed;inset:0;background:linear-gradient(180deg, rgba(255,255,255,.28), transparent 22%);pointer-events:none}}
+.theme-clean{{--bg:#f4f7fb;--bg-alt:#edf3fb;--text:#0f172a;--card:#ffffff;--border:#d7dee8;--muted:#475569;--soft:#64748b;--hero:#ffffffd8;--hero-border:#d7dee8;--shadow:0 18px 44px rgba(15,23,42,.07);--ring:#0f766e;--wash:#eff6ff;--radius-shell:18px;--radius-card:14px;--radius-pill:999px;--surface-opacity:.9}}
+.theme-midnight{{--bg:#050b15;--bg-alt:#0b1220;--text:#e5eef8;--card:#101828;--border:#22314a;--muted:#a5b4c8;--soft:#7f91ab;--hero:#0d1625d8;--hero-border:#22314a;--shadow:0 26px 72px rgba(2,6,23,.44);--ring:#38bdf8;--wash:#0d2138;--radius-shell:14px;--radius-card:12px;--radius-pill:999px;--surface-opacity:.86}}
+.theme-sunrise{{--bg:#fdf3e8;--bg-alt:#fff7ef;--text:#29180e;--card:#fffdf9;--border:#ead6c0;--muted:#7c5a43;--soft:#a2704f;--hero:#fff8f0d9;--hero-border:#ead6c0;--shadow:0 22px 56px rgba(146,64,14,.1);--ring:#c2410c;--wash:#ffedd5;--radius-shell:22px;--radius-card:18px;--radius-pill:999px;--surface-opacity:.92}}
+.theme-forest{{--bg:#edf8f0;--bg-alt:#e4f3e9;--text:#123021;--card:#fbfefc;--border:#c9e4d2;--muted:#315843;--soft:#4e7b63;--hero:#f8fdf9d8;--hero-border:#c9e4d2;--shadow:0 20px 52px rgba(20,83,45,.1);--ring:#15803d;--wash:#dcfce7;--radius-shell:20px;--radius-card:16px;--radius-pill:999px;--surface-opacity:.9}}
+.wrap{{max-width:960px;margin:0 auto;padding:56px 20px 72px;position:relative}}
+.brand{{display:flex;align-items:center;gap:12px;font-size:.88rem;font-weight:600;color:var(--soft);margin-bottom:22px;letter-spacing:.06em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.brand-logo{{height:42px;width:42px;object-fit:contain;border-radius:12px;background:var(--card);border:1px solid var(--border);padding:5px;box-shadow:var(--shadow)}}
+h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2rem,4vw,3.35rem);line-height:1.02;font-weight:700;margin-bottom:10px;max-width:11ch;letter-spacing:-.04em}}
+.hero{{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;margin-bottom:34px}}
+.sub{{color:var(--muted);margin-bottom:0;max-width:58ch;line-height:1.65;font-size:1.02rem}}
+.hero-copy{{display:flex;flex-direction:column;gap:18px}}
+.hero-actions{{display:flex;flex-wrap:wrap;gap:10px}}
+.overall{{display:inline-flex;align-items:center;gap:12px;padding:14px 18px;border-radius:var(--radius-pill);font-weight:700;background:var(--hero);border:1px solid var(--hero-border);white-space:nowrap;box-shadow:var(--shadow);backdrop-filter:blur(14px);font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
+.overall.operational{{background:#ecfdf3;border:1px solid #9de3b1;color:#166534}}
+.overall.down{{background:#fef2f2;border:1px solid #f5b5b5;color:#991b1b}}
+.overall.degraded{{background:#fffbeb;border:1px solid #f7cf7d;color:#9a4d00}}
+.ghost-link{{display:inline-flex;align-items:center;justify-content:center;padding:11px 14px;border-radius:var(--radius-pill);border:1px solid var(--border);background:rgba(255,255,255,.5);color:var(--text);text-decoration:none;font-weight:700;transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease}}
+.ghost-link:hover{{transform:translateY(-1px);border-color:var(--ring);box-shadow:0 12px 24px rgba(15,23,42,.08)}}
+.maintenance,.subscribe{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;padding:22px 24px;border-radius:var(--radius-shell);margin-bottom:18px;background:var(--hero);border:1px solid var(--hero-border);box-shadow:var(--shadow);backdrop-filter:blur(14px)}}
+.maintenance{{background:linear-gradient(135deg, var(--wash), var(--hero));border-color:color-mix(in srgb, var(--ring) 18%, var(--border))}}
+.maintenance-title,.subscribe-title{{font-size:.78rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;margin-bottom:8px;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.maintenance-copy,.subscribe-copy{{font-size:.99rem;line-height:1.6}}
 .maintenance-meta{{margin-top:8px;color:var(--muted);font-size:.82rem}}
-.maintenance-list{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px 22px;margin-bottom:20px}}
-.maintenance-list-title{{font-size:.82rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;color:var(--soft)}}
-.maintenance-list-item{{display:flex;flex-direction:column;gap:6px}}
+.maintenance-list{{background:var(--card);border:1px solid var(--border);border-radius:24px;padding:18px 20px;margin-bottom:18px;box-shadow:var(--shadow)}}
+.section-summary{{display:flex;justify-content:space-between;align-items:center;gap:12px;cursor:pointer;list-style:none}}
+.section-summary::-webkit-details-marker{{display:none}}
+.section-summary-title{{font-size:.8rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.section-summary-meta{{font-size:.8rem;color:var(--muted);font-weight:600}}
+.maintenance-list-title{{font-size:.8rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;margin-bottom:10px;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.maintenance-list-item{{display:flex;flex-direction:column;gap:6px;margin-top:12px}}
 .maintenance-list-copy{{font-size:.95rem;line-height:1.5}}
 .maintenance-list-meta,.maintenance-list-empty{{font-size:.83rem;color:var(--muted)}}
+.maintenance-list-empty{{margin-top:12px}}
+.events-wrap{{margin-bottom:20px}}
+.section-heading{{font-size:.8rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--soft);margin-bottom:10px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.events-month{{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:14px 18px;margin-bottom:10px;box-shadow:var(--shadow)}}
+.events-list{{display:flex;flex-direction:column;gap:8px;margin-top:12px}}
+.event-item{{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;font-size:.84rem}}
+.event-host{{font-weight:600}}
+.event-time{{color:var(--muted);font-size:.78rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .subscribe-actions{{display:flex;flex-wrap:wrap;gap:10px}}
-.subscribe-btn{{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;font-weight:700;white-space:nowrap}}
-.subscribe-btn:hover{{opacity:.92}}
-.dot{{width:14px;height:14px;border-radius:50%;flex-shrink:0}}
+.subscribe-btn{{display:inline-flex;align-items:center;justify-content:center;padding:11px 15px;border-radius:var(--radius-pill);border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;font-weight:700;white-space:nowrap;transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease}}
+.subscribe-btn:hover{{transform:translateY(-1px);border-color:var(--ring);box-shadow:0 12px 24px rgba(15,23,42,.08)}}
+.dot{{width:14px;height:14px;border-radius:50%;flex-shrink:0;box-shadow:0 0 0 6px rgba(255,255,255,.56)}}
 .operational .dot{{background:#22c55e}}.down .dot{{background:#ef4444}}.degraded .dot{{background:#f59e0b}}
-.card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:14px}}
+.card{{background:color-mix(in srgb, var(--card) calc(var(--surface-opacity) * 100%), transparent);border:1px solid var(--border);border-radius:var(--radius-card);padding:20px 20px 18px;margin-bottom:12px;box-shadow:var(--shadow);transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease}}
+.svc-card[open],.svc-card:hover{{transform:translateY(-1px);border-color:color-mix(in srgb, var(--ring) 24%, var(--border))}}
+.svc-summary{{display:flex;justify-content:space-between;align-items:center;gap:18px;cursor:pointer;list-style:none}}
+.svc-summary::-webkit-details-marker{{display:none}}
+.summary-hint{{font-size:.76rem;color:var(--muted);font-weight:700;white-space:nowrap;font-family:"IBM Plex Mono","SFMono-Regular",monospace;letter-spacing:.08em;text-transform:uppercase}}
 .row{{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}}
-.svc{{font-weight:600}}
-.badge{{font-size:.78rem;font-weight:700;padding:3px 11px;border-radius:20px}}
+.svc{{font-weight:600;font-size:1.06rem;font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
+.badge{{font-size:.76rem;font-weight:700;padding:5px 11px;border-radius:12px;letter-spacing:.04em;text-transform:uppercase}}
 .badge.up{{background:#f0fdf4;color:#16a34a}}.badge.down{{background:#fef2f2;color:#dc2626}}
 .badge.degraded{{background:#fffbeb;color:#d97706}}.badge.unknown{{background:#f1f5f9;color:#64748b}}
-.meta{{font-size:.83rem;color:var(--muted);margin-bottom:10px}}
-.history-title{{font-size:.76rem;color:var(--soft);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}}
+.meta{{font-size:.83rem;color:var(--muted);margin-bottom:12px;line-height:1.5}}
+.history-title{{font-size:.76rem;color:var(--soft);text-transform:uppercase;letter-spacing:.16em;margin-bottom:8px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .history-note{{font-size:.78rem;color:var(--muted);margin-bottom:8px}}
-.bars{{display:flex;gap:2px;height:26px}}
-.b{{flex:1;border-radius:2px;min-width:3px}}
+.bars{{display:flex;gap:4px;height:28px}}
+.b{{flex:1;border-radius:4px;min-width:3px}}
 .b.up{{background:#22c55e}}.b.down{{background:#ef4444}}.b.degraded{{background:#f59e0b}}.b.unknown{{background:#e2e8f0}}
-.bar-lbl{{display:flex;justify-content:space-between;font-size:.72rem;color:var(--soft);margin-top:3px}}
+.bar-lbl{{display:flex;justify-content:space-between;font-size:.72rem;color:var(--soft);margin-top:6px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .regions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
-.pill{{display:inline-flex;align-items:center;padding:4px 9px;border-radius:999px;font-size:.72rem;font-weight:600;background:#f8fafc;color:#475569;border:1px solid var(--border)}}
+.pill{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:12px;font-size:.72rem;font-weight:600;background:#f8fafc;color:#475569;border:1px solid var(--border);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .pill.up{{background:#f0fdf4;color:#166534;border-color:#bbf7d0}}
 .pill.down{{background:#fef2f2;color:#b91c1c;border-color:#fecaca}}
 .pill.degraded{{background:#fffbeb;color:#b45309;border-color:#fde68a}}
 .pill.unknown{{background:#f8fafc;color:#64748b}}
 .empty{{text-align:center;color:var(--soft);padding:40px 0}}
-footer{{text-align:center;margin-top:50px;font-size:.78rem;color:var(--soft)}}
+footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 @media (max-width: 700px) {{
+  .wrap{{padding-top:40px}}
+  .hero{{flex-direction:column}}
+  .hero-copy{{width:100%}}
   .maintenance,.subscribe{{flex-direction:column}}
+  .hero-actions{{width:100%}}
+  .ghost-link{{width:100%}}
   .subscribe-actions{{width:100%}}
   .subscribe-btn{{width:100%}}
 }}
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
   {brand}
-  <h1>{title}</h1><p class="sub">{desc}</p>
-  <div class="overall {ocls}"><div class="dot"></div><span>{overall}</span></div>
+  <div class="hero">
+    <div class="hero-copy"><div><h1>{title}</h1><p class="sub">{desc}</p></div><div class="hero-actions"><a class="ghost-link" href="{history_href}">Explore full history</a></div></div>
+    <div class="overall {ocls}"><div class="dot"></div><span>{overall}</span></div>
+  </div>
   {maintenance_block}
-  {upcoming_maintenance_block}
-  {subscribe_block}
   {cards}
+  {subscribe_block}
   <footer>Updated {now_str}</footer>
+</div></body></html>"""
+
+
+def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], selected_host: str, selected_region: str, rows: list[dict]) -> str:
+    theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
+    brand = ""
+    if brand_name or logo_url:
+        logo = f'<img src="{logo_url}" alt="{brand_name}" class="brand-logo">' if logo_url else ""
+        brand = f'<div class="brand">{logo}<span>{brand_name or title}</span></div>'
+
+    host_options = ['<option value="all">All hosts</option>'] + [
+        f'<option value="{host["host_id"]}"{" selected" if selected_host == host["host_id"] else ""}>{host.get("name", host["host_id"])}</option>'
+        for host in hosts
+    ]
+    region_options = ['<option value="all">All workers</option>'] + [
+        f'<option value="{region}"{" selected" if selected_region == region else ""}>{region}</option>'
+        for region in regions
+    ]
+    row_markup = "".join(
+        f"""<tr>
+  <td>{row["host_name"]}</td>
+  <td><span class="pill {row["status"]}">{row["status"].title()}</span></td>
+  <td>{row["region"] or "—"}</td>
+  <td>{row["latency_ms"] if row["latency_ms"] is not None else "—"} ms</td>
+  <td>{row["status_code"] if row.get("status_code") is not None else "—"}</td>
+  <td>{row["checked_at"].replace("T", " ")[:19]}</td>
+  <td>{(row.get("error") or "—")[:120]}</td>
+</tr>"""
+        for row in rows
+    ) or '<tr><td colspan="7" class="empty-cell">No checks matched the selected filters.</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} History</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:
+radial-gradient(circle at top left, rgba(14,165,233,.16), transparent 32%),
+radial-gradient(circle at top right, rgba(15,118,110,.12), transparent 28%),
+linear-gradient(180deg, var(--bg) 0%, var(--bg-alt) 100%);color:var(--text);min-height:100vh}}
+.theme-clean{{--bg:#f4f7fb;--bg-alt:#edf3fb;--text:#0f172a;--card:#ffffff;--border:#d7dee8;--muted:#475569;--soft:#64748b;--hero:#ffffffd8;--hero-border:#d7dee8;--shadow:0 18px 44px rgba(15,23,42,.07);--ring:#0f766e}}
+.theme-midnight{{--bg:#050b15;--bg-alt:#0b1220;--text:#e5eef8;--card:#101828;--border:#22314a;--muted:#a5b4c8;--soft:#7f91ab;--hero:#0d1625d8;--hero-border:#22314a;--shadow:0 26px 72px rgba(2,6,23,.44);--ring:#38bdf8}}
+.theme-sunrise{{--bg:#fdf3e8;--bg-alt:#fff7ef;--text:#29180e;--card:#fffdf9;--border:#ead6c0;--muted:#7c5a43;--soft:#a2704f;--hero:#fff8f0d9;--hero-border:#ead6c0;--shadow:0 22px 56px rgba(146,64,14,.1);--ring:#c2410c}}
+.theme-forest{{--bg:#edf8f0;--bg-alt:#e4f3e9;--text:#123021;--card:#fbfefc;--border:#c9e4d2;--muted:#315843;--soft:#4e7b63;--hero:#f8fdf9d8;--hero-border:#c9e4d2;--shadow:0 20px 52px rgba(20,83,45,.1);--ring:#15803d}}
+.wrap{{max-width:1160px;margin:0 auto;padding:56px 20px 72px}}
+.brand{{display:flex;align-items:center;gap:12px;font-size:.88rem;font-weight:600;color:var(--soft);margin-bottom:22px;letter-spacing:.06em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.brand-logo{{height:42px;width:42px;object-fit:contain;border-radius:12px;background:var(--card);border:1px solid var(--border);padding:5px;box-shadow:var(--shadow)}}
+.hero{{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;margin-bottom:20px}}
+h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2rem,4vw,3rem);line-height:1.02;font-weight:700;letter-spacing:-.04em;margin-bottom:8px}}
+.sub{{color:var(--muted);line-height:1.65;max-width:64ch}}
+.hero-actions{{display:flex;gap:10px;flex-wrap:wrap}}
+.ghost-link{{display:inline-flex;align-items:center;justify-content:center;padding:11px 14px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.5);color:var(--text);text-decoration:none;font-weight:700}}
+.panel{{background:var(--hero);border:1px solid var(--hero-border);border-radius:14px;padding:18px 18px 16px;box-shadow:var(--shadow);margin-bottom:16px;backdrop-filter:blur(14px)}}
+.filters{{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end}}
+label{{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}}
+select{{width:100%;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;color:var(--text);font-size:.92rem}}
+.filter-btn{{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:12px;border:1px solid var(--border);background:var(--text);color:var(--card);text-decoration:none;font-weight:700}}
+.summary{{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:.92rem}}
+table{{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}}
+th{{background:rgba(148,163,184,.08);color:var(--soft);font-size:.75rem;text-transform:uppercase;letter-spacing:.14em;padding:12px 14px;text-align:left;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertical-align:top}}
+.pill{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:12px;font-size:.72rem;font-weight:600;border:1px solid var(--border);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.pill.up{{background:#f0fdf4;color:#166534;border-color:#bbf7d0}}
+.pill.down{{background:#fef2f2;color:#b91c1c;border-color:#fecaca}}
+.pill.degraded{{background:#fffbeb;color:#b45309;border-color:#fde68a}}
+.pill.unknown{{background:#f8fafc;color:#64748b}}
+.empty-cell{{text-align:center;color:var(--soft);padding:28px}}
+@media (max-width: 900px) {{
+  .filters{{grid-template-columns:1fr}}
+  .hero{{flex-direction:column;align-items:flex-start}}
+  .hero-actions{{width:100%}}
+  .ghost-link,.filter-btn{{width:100%}}
+  .table-wrap{{overflow-x:auto}}
+}}
+</style></head><body class="theme-{theme_class}">
+<div class="wrap">
+  {brand}
+  <div class="hero">
+    <div>
+      <h1>Check History</h1>
+      <p class="sub">Browse recent public checks across services and worker regions. Use filters to narrow the timeline without crowding the main status page.</p>
+    </div>
+    <div class="hero-actions"><a class="ghost-link" href="/status">Back to status</a></div>
+  </div>
+  <form class="panel filters" method="GET" action="/history">
+    <div>
+      <label for="host">Host</label>
+      <select id="host" name="host">{''.join(host_options)}</select>
+    </div>
+    <div>
+      <label for="region">Worker region</label>
+      <select id="region" name="region">{''.join(region_options)}</select>
+    </div>
+    <button class="filter-btn" type="submit">Apply filters</button>
+  </form>
+  <div class="panel summary">
+    <span>Showing <strong>{len(rows)}</strong> recent checks</span>
+    <span>Theme: <strong>{theme_class}</strong></span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Host</th><th>Status</th><th>Worker</th><th>Latency</th><th>HTTP</th><th>Checked</th><th>Detail</th></tr></thead>
+      <tbody>{row_markup}</tbody>
+    </table>
+  </div>
 </div></body></html>"""
 
 
@@ -1682,73 +2031,93 @@ Read-only mode is enabled. Browsing still works, but all mutating admin actions 
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Uptime Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
-nav{{background:#1e293b;border-bottom:1px solid #334155;padding:0 24px;display:flex;align-items:center;height:52px;gap:0}}
-.logo{{font-weight:700;color:#f8fafc;font-size:1.05rem;margin-right:32px;white-space:nowrap}}
+:root{{--bg:#0b1220;--bg-alt:#10192b;--panel:#172235;--panel-strong:#1d2a40;--line:#2d3f5d;--line-soft:rgba(165,180,200,.18);--text:#e5eef8;--muted:#a8b8cd;--soft:#7f91ab;--brand:#0f766e;--brand-strong:#115e59;--sky:#0ea5e9;--success:#16a34a;--warn:#d97706;--danger:#dc2626}}
+body{{font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:
+radial-gradient(circle at top left, rgba(14,165,233,.16), transparent 26%),
+radial-gradient(circle at top right, rgba(15,118,110,.12), transparent 22%),
+linear-gradient(180deg, var(--bg) 0%, #08101d 100%);color:var(--text);min-height:100vh}}
+button,input,select,textarea{{font:inherit}}
+nav{{position:sticky;top:0;z-index:40;background:rgba(11,18,32,.82);backdrop-filter:blur(18px);border-bottom:1px solid var(--line-soft);padding:0 24px;display:flex;align-items:center;min-height:64px;gap:0;box-shadow:0 12px 34px rgba(2,6,23,.25)}}
+.logo{{display:flex;align-items:center;gap:12px;font-weight:700;color:#f8fafc;font-size:1.02rem;margin-right:34px;white-space:nowrap;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.02em}}
+.logo-mark{{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:12px;background:linear-gradient(135deg, var(--brand), var(--sky));color:white;font-size:.82rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace;box-shadow:0 14px 26px rgba(14,165,233,.18)}}
+.logo-version{{font-size:.7rem;color:var(--muted);font-weight:600;font-family:"IBM Plex Mono","SFMono-Regular",monospace;letter-spacing:.08em;text-transform:uppercase}}
 .nav-spacer{{margin-left:auto}}
-.tab{{padding:0 16px;height:52px;display:flex;align-items:center;cursor:pointer;font-size:.9rem;color:#94a3b8;border-bottom:2px solid transparent;white-space:nowrap}}
-.tab.active,.tab:hover{{color:#f8fafc;border-bottom-color:#6366f1}}
-.main{{max-width:960px;margin:0 auto;padding:32px 20px}}
-h2{{font-size:1.3rem;font-weight:700;margin-bottom:20px}}
-h3{{font-size:1rem;font-weight:600;margin:20px 0 8px;color:#e2e8f0}}
-.btn{{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:7px;border:none;cursor:pointer;font-size:.875rem;font-weight:600;transition:all .15s;text-decoration:none}}
-.btn-primary{{background:#6366f1;color:#fff}}.btn-primary:hover{{background:#4f46e5}}
-.btn-success{{background:#16a34a;color:#fff}}.btn-success:hover{{background:#15803d}}
-.btn-danger{{background:#ef4444;color:#fff}}.btn-danger:hover{{background:#dc2626}}
-.btn-warn{{background:#d97706;color:#fff}}.btn-warn:hover{{background:#b45309}}
-.btn-ghost{{background:transparent;color:#94a3b8;border:1px solid #334155}}.btn-ghost:hover{{color:#f8fafc;border-color:#64748b}}
-.btn-sm{{padding:4px 10px;font-size:.8rem}}
-table{{width:100%;border-collapse:collapse;background:#1e293b;border-radius:10px;overflow:hidden}}
-th{{background:#0f172a;color:#64748b;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;padding:10px 14px;text-align:left;white-space:nowrap}}
-td{{padding:12px 14px;border-top:1px solid #334155;font-size:.875rem;vertical-align:middle}}
-.badge{{display:inline-block;padding:2px 9px;border-radius:12px;font-size:.75rem;font-weight:700}}
+.tab{{padding:0 16px;height:64px;display:flex;align-items:center;cursor:pointer;font-size:.88rem;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;transition:color .18s ease,border-color .18s ease}}
+.tab.active,.tab:hover{{color:#f8fafc;border-bottom-color:var(--sky)}}
+.main{{max-width:1180px;margin:0 auto;padding:34px 20px 72px}}
+h2{{font-size:1.55rem;font-weight:700;margin-bottom:18px;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.03em}}
+h3{{font-size:1rem;font-weight:600;margin:20px 0 8px;color:#e2e8f0;font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
+.btn{{display:inline-flex;align-items:center;gap:8px;padding:10px 16px;border-radius:14px;border:none;cursor:pointer;font-size:.875rem;font-weight:600;transition:transform .16s ease,background .16s ease,border-color .16s ease,box-shadow .16s ease;text-decoration:none}}
+.btn:hover{{transform:translateY(-1px)}}
+.btn-primary{{background:linear-gradient(135deg, var(--brand), #0f9f93);color:#fff;box-shadow:0 14px 28px rgba(15,118,110,.22)}}.btn-primary:hover{{background:linear-gradient(135deg, var(--brand-strong), var(--brand))}}
+.btn-success{{background:#166534;color:#fff}}.btn-success:hover{{background:#15803d}}
+.btn-danger{{background:#b91c1c;color:#fff}}.btn-danger:hover{{background:#991b1b}}
+.btn-warn{{background:#b45309;color:#fff}}.btn-warn:hover{{background:#92400e}}
+.btn-ghost{{background:rgba(255,255,255,.02);color:var(--muted);border:1px solid var(--line)}}.btn-ghost:hover{{color:#f8fafc;border-color:#4a6288}}
+.btn-sm{{padding:7px 12px;font-size:.8rem;border-radius:12px}}
+table{{width:100%;border-collapse:separate;border-spacing:0;background:rgba(23,34,53,.92);border:1px solid var(--line-soft);border-radius:22px;overflow:hidden;box-shadow:0 24px 60px rgba(2,6,23,.22)}}
+th{{background:#101a2b;color:var(--soft);font-size:.76rem;text-transform:uppercase;letter-spacing:.14em;padding:12px 14px;text-align:left;white-space:nowrap;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+td{{padding:14px;border-top:1px solid var(--line-soft);font-size:.875rem;vertical-align:middle}}
+.badge{{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.73rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}}
 .badge.up,.badge.active{{background:#166534;color:#bbf7d0}}
 .badge.down{{background:#7f1d1d;color:#fecaca}}
 .badge.degraded{{background:#713f12;color:#fde68a}}
-.badge.unknown,.badge.inactive{{background:#1e293b;color:#64748b;border:1px solid #334155}}
+.badge.unknown,.badge.inactive{{background:#172235;color:var(--soft);border:1px solid var(--line)}}
 .badge.http,.badge.tcp{{background:#1e3a5f;color:#93c5fd}}
-.modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center;z-index:100}}
+.modal-overlay{{position:fixed;inset:0;background:rgba(2,6,23,.82);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}}
 .modal-overlay.open{{display:flex}}
-.modal{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:28px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto}}
+.modal{{background:linear-gradient(180deg, rgba(23,34,53,.98), rgba(17,28,45,.98));border:1px solid var(--line);border-radius:24px;padding:28px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;box-shadow:0 36px 80px rgba(0,0,0,.38)}}
 .modal h3{{font-size:1.1rem;margin-bottom:20px;margin-top:0}}
 .form-group{{margin-bottom:16px}}
-label{{display:block;font-size:.82rem;color:#94a3b8;margin-bottom:5px;font-weight:500}}
-input,select,textarea{{width:100%;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:8px 12px;color:#f8fafc;font-size:.875rem;transition:border .15s}}
-input:focus,select:focus{{outline:none;border-color:#6366f1}}
+label{{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}}
+input,select,textarea{{width:100%;background:#0e1828;border:1px solid var(--line);border-radius:14px;padding:10px 12px;color:#f8fafc;font-size:.875rem;transition:border-color .15s ease, box-shadow .15s ease, background .15s ease}}
+input:focus,select:focus,textarea:focus{{outline:none;border-color:var(--sky);box-shadow:0 0 0 4px rgba(14,165,233,.14);background:#122037}}
 .toggle{{display:flex;align-items:center;gap:10px;cursor:pointer}}
 .toggle input[type=checkbox]{{width:auto;cursor:pointer}}
-.hint{{font-size:.75rem;color:#64748b;margin-top:3px;line-height:1.4}}
-.panel{{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:20px}}
+.hint{{font-size:.75rem;color:var(--soft);margin-top:3px;line-height:1.5}}
+.panel{{background:rgba(23,34,53,.92);border:1px solid var(--line-soft);border-radius:24px;padding:22px;margin-bottom:20px;box-shadow:0 24px 60px rgba(2,6,23,.18)}}
 .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
 .actions{{display:flex;gap:8px;flex-wrap:wrap}}
-.toast{{position:fixed;bottom:24px;right:24px;background:#22c55e;color:#fff;padding:10px 18px;border-radius:8px;font-size:.875rem;font-weight:600;z-index:200;transition:opacity .3s}}
-.toast.error{{background:#ef4444}}
+.toast{{position:fixed;bottom:24px;right:24px;background:var(--success);color:#fff;padding:10px 18px;border-radius:14px;font-size:.875rem;font-weight:600;z-index:200;transition:opacity .3s;box-shadow:0 16px 34px rgba(0,0,0,.28)}}
+.toast.error{{background:var(--danger)}}
 .toast.hidden{{opacity:0;pointer-events:none}}
-.cost-row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #334155;font-size:.875rem}}
-.cost-row:last-child{{border:none;font-weight:700;color:#6366f1;font-size:1rem}}
-pre{{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px;font-size:.78rem;overflow-x:auto;line-height:1.6;color:#a5b4fc}}
-.tip{{background:#1e3a5f;border-left:3px solid #6366f1;padding:10px 14px;border-radius:0 6px 6px 0;font-size:.83rem;color:#93c5fd;margin:12px 0;line-height:1.5}}
-p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
-.region-card{{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}}
+.cost-row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line-soft);font-size:.875rem}}
+.cost-row:last-child{{border:none;font-weight:700;color:#67e8f9;font-size:1rem}}
+pre{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px;font-size:.78rem;overflow-x:auto;line-height:1.6;color:#b9d8ff;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.tip{{background:linear-gradient(135deg, rgba(15,118,110,.12), rgba(14,165,233,.1));border:1px solid rgba(14,165,233,.22);padding:12px 14px;border-radius:16px;font-size:.83rem;color:#c7efff;margin:12px 0;line-height:1.55}}
+p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;max-width:72ch}}
+.region-card{{background:rgba(23,34,53,.92);border:1px solid var(--line-soft);border-radius:22px;padding:16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;box-shadow:0 18px 40px rgba(2,6,23,.16)}}
 .region-info .name{{font-weight:600;margin-bottom:4px}}
-.region-info .meta{{font-size:.8rem;color:#64748b}}
+.region-info .meta{{font-size:.8rem;color:var(--soft)}}
 .section-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}}
 .spinner{{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}}
 .auth-gate{{position:fixed;inset:0;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;z-index:250;padding:20px}}
-.auth-card{{width:100%;max-width:420px;background:#1e293b;border:1px solid #334155;border-radius:16px;padding:28px;box-shadow:0 20px 50px rgba(0,0,0,.35)}}
-.auth-card h1{{font-size:1.25rem;margin-bottom:10px}}
-.auth-card p{{color:#94a3b8;font-size:.9rem;line-height:1.6;margin-bottom:14px}}
-.auth-msg{{font-size:.82rem;color:#94a3b8;min-height:18px;margin-top:10px}}
+.auth-card{{width:100%;max-width:440px;background:linear-gradient(180deg, rgba(23,34,53,.98), rgba(11,18,32,.98));border:1px solid var(--line);border-radius:28px;padding:30px;box-shadow:0 28px 70px rgba(0,0,0,.42)}}
+.auth-card h1{{font-size:1.45rem;margin-bottom:10px;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.03em}}
+.auth-card p{{color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:14px}}
+.auth-msg{{font-size:.82rem;color:var(--muted);min-height:18px;margin-top:10px}}
 .checklist{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:10px}}
-.check-item{{display:flex;align-items:center;gap:8px;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:9px 10px;font-size:.83rem}}
+.check-item{{display:flex;align-items:center;gap:8px;background:#0e1828;border:1px solid var(--line);border-radius:14px;padding:9px 10px;font-size:.83rem}}
 .check-item input{{width:auto}}
+strong{{color:#f8fafc}}
+@media (max-width: 900px) {{
+  nav{{overflow-x:auto}}
+  .main{{padding-top:24px}}
+}}
+@media (max-width: 760px) {{
+  .grid2{{grid-template-columns:1fr}}
+  .section-header,.region-card{{flex-direction:column;align-items:flex-start}}
+}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style>
 </head><body>
 <nav>
-  <span class="logo">⬆ Uptime Admin <span style="font-size:.72rem;color:#94a3b8;font-weight:600">v{build.get("version", "unknown")}</span></span>
+  <span class="logo"><span class="logo-mark">UP</span><span>Uptime Control</span><span class="logo-version">v{build.get("version", "unknown")}</span></span>
   <span class="tab active"  onclick="show('hosts')">Hosts</span>
   <span class="tab"         onclick="show('regions')">Regions</span>
   <span class="tab"         onclick="show('status-page')">Status Page</span>
@@ -1832,10 +2201,10 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
       <div class="form-group">
         <label>Theme</label>
         <select id="sp-theme">
-          <option value="clean">Clean</option>
-          <option value="midnight">Midnight</option>
-          <option value="sunrise">Sunrise</option>
-          <option value="forest">Forest</option>
+          <option value="clean">Clean Control</option>
+          <option value="midnight">Midnight Ops</option>
+          <option value="sunrise">Sunrise Briefing</option>
+          <option value="forest">Forest Calm</option>
         </select>
       </div>
     </div>
@@ -1889,8 +2258,9 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
       <div class="hint">Set any public subscribe or feed links you want shown on the page.</div>
     </div>
     <div class="tip">
-      Theme ideas: <strong>Clean</strong> for neutral SaaS, <strong>Midnight</strong> for infra teams,
-      <strong>Sunrise</strong> for warmer brands, <strong>Forest</strong> for calm/product-trust styling.
+      Themes now change the whole atmosphere, not just the colors:
+      <strong>Clean Control</strong> is crisp and editorial, <strong>Midnight Ops</strong> is sharper and denser,
+      <strong>Sunrise Briefing</strong> is warmer and softer, and <strong>Forest Calm</strong> is quieter and more grounded.
     </div>
     <button class="btn btn-primary" onclick="saveStatusPageSettings()">Save</button>
   </div>
@@ -1903,6 +2273,7 @@ p.desc{{color:#94a3b8;font-size:.875rem;line-height:1.6;margin-bottom:12px}}
   </table>
   <div style="margin-top:20px">
     <a class="btn btn-ghost" href="/" target="_blank">Preview status page</a>
+    <a class="btn btn-ghost" href="/history" target="_blank">Preview history page</a>
   </div>
 
   <h3 style="margin-top:28px">Custom Domain</h3>
@@ -2148,7 +2519,11 @@ Authorization: Bearer &lt;admin-token&gt;</pre>
       </select>
     </div>
     <div class="grid2">
-      <div class="form-group"><label>Check Interval (sec)</label><input id="m-interval" type="number" value="60" min="60" max="3600"></div>
+      <div class="form-group">
+        <label>Monitor Tier</label>
+        <select id="m-tier"></select>
+        <div class="hint">Choose one of the schedules currently supported by your worker fleet.</div>
+      </div>
       <div class="form-group"><label>Timeout (sec)</label><input id="m-timeout" type="number" value="10" min="1" max="60"></div>
     </div>
     <div class="tip" id="m-impact">
@@ -2201,6 +2576,11 @@ Authorization: Bearer &lt;admin-token&gt;</pre>
         <option value="512">512 MB</option>
       </select>
     </div>
+    <div class="form-group">
+      <label>Monitor Tiers</label>
+      <div class="hint">Each worker can support one or more shared schedules. Hosts will choose from these tiers.</div>
+      <div id="r-supported-tiers" class="checklist"></div>
+    </div>
     <div style="display:flex;gap:10px;margin-top:8px">
       <button class="btn btn-primary" id="r-deploy-btn" onclick="deployRegion()">Deploy</button>
       <button class="btn btn-ghost" onclick="closeRegionModal()">Cancel</button>
@@ -2215,6 +2595,8 @@ Authorization: Bearer &lt;admin-token&gt;</pre>
 let KEY = sessionStorage.getItem('uptime_admin_key') || '';
 const queryKey = new URLSearchParams(location.search).get('key') || '';
 let REGIONS_CACHE = [];
+let HOSTS_CACHE = [];
+const RECOMMENDED_MONITOR_TIERS = {json.dumps(RECOMMENDED_MONITOR_TIERS)};
 if (queryKey) {{
   KEY = queryKey;
   sessionStorage.setItem('uptime_admin_key', KEY);
@@ -2304,6 +2686,40 @@ async function ensureRegionsLoaded() {{
   return REGIONS_CACHE;
 }}
 
+function formatTierLabel(seconds) {{
+  const sec = +seconds;
+  if (sec % 3600 === 0) return `Every ${{sec / 3600}} hour${{sec === 3600 ? '' : 's'}}`;
+  if (sec % 60 === 0) return `Every ${{sec / 60}} minute${{sec === 60 ? '' : 's'}}`;
+  return `Every ${{sec}} seconds`;
+}}
+
+function availableMonitorTiers(extra=[]) {{
+  const tiers = new Set(RECOMMENDED_MONITOR_TIERS);
+  REGIONS_CACHE.forEach(region => (region.supported_tiers || []).forEach(tier => tiers.add(+tier)));
+  extra.forEach(tier => tiers.add(+tier));
+  return Array.from(tiers).filter(tier => tier >= 60 && tier % 60 === 0).sort((a, b) => a - b);
+}}
+
+function renderHostTierOptions(selectedTier=60) {{
+  const select = document.getElementById('m-tier');
+  const tiers = availableMonitorTiers([selectedTier]);
+  select.innerHTML = tiers.map(tier => `<option value="${{tier}}" ${{tier === +selectedTier ? 'selected' : ''}}>${{formatTierLabel(tier)}} (${{tier}}s)</option>`).join('');
+}}
+
+function renderRegionTierOptions(selectedTiers=[60, 300]) {{
+  const wrap = document.getElementById('r-supported-tiers');
+  wrap.innerHTML = availableMonitorTiers(selectedTiers).map(tier => `
+    <label class="check-item">
+      <input type="checkbox" value="${{tier}}" ${{selectedTiers.includes(tier) ? 'checked' : ''}}>
+      <span>${{formatTierLabel(tier)}}</span>
+    </label>
+  `).join('');
+}}
+
+function selectedRegionTiers() {{
+  return Array.from(document.querySelectorAll('#r-supported-tiers input[type=checkbox]:checked')).map(el => +el.value).sort((a, b) => a - b);
+}}
+
 function renderTargetRegions(selected=[]) {{
   const wrap = document.getElementById('m-target-regions');
   if (!REGIONS_CACHE.length) {{
@@ -2328,12 +2744,13 @@ async function loadHosts() {{
     showAuthGate('Enter the admin token to load hosts.');
     return;
   }}
+  HOSTS_CACHE = Array.isArray(hosts) ? hosts : [];
   const tbody = document.getElementById('hosts-body');
-  if (!Array.isArray(hosts) || !hosts.length) {{
+  if (!HOSTS_CACHE.length) {{
     tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
     return;
   }}
-  tbody.innerHTML = hosts.map(h => `
+  tbody.innerHTML = HOSTS_CACHE.map(h => `
     <tr>
       <td style="font-weight:600">${{h.name}}</td>
       <td style="color:#64748b;font-size:.8rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{h.url}}">${{h.url}}</td>
@@ -2344,10 +2761,19 @@ async function loadHosts() {{
       <td style="text-align:center">${{h.show_on_status_page ? '✓' : '—'}}</td>
       <td style="text-align:center">${{h.alert_enabled ? '✓' : '—'}}</td>
       <td><div class="actions">
-        <button class="btn btn-ghost btn-sm" onclick='openEditHost(${{JSON.stringify(h)}})'>Edit</button>
+        <button class="btn btn-ghost btn-sm" onclick="openEditHostById('${{h.host_id}}')">Edit</button>
         <button class="btn btn-danger btn-sm" onclick="deleteHost('${{h.host_id}}','${{h.name}}')">Del</button>
       </div></td>
     </tr>`).join('');
+}}
+
+function openEditHostById(hostId) {{
+  const host = HOSTS_CACHE.find(item => item.host_id === hostId);
+  if (!host) {{
+    toast('Unable to find that host in the current list.', true);
+    return;
+  }}
+  openEditHost(host);
 }}
 
 async function openAddHost() {{
@@ -2355,7 +2781,7 @@ async function openAddHost() {{
   document.getElementById('host-modal-title').textContent = 'Add Host';
   ['m-id','m-name','m-url','m-sns'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('m-type').value = 'http';
-  document.getElementById('m-interval').value = 60;
+  renderHostTierOptions(60);
   document.getElementById('m-timeout').value = 10;
   document.getElementById('m-code').value = 200;
   document.getElementById('m-page').checked = true;
@@ -2374,7 +2800,7 @@ async function openEditHost(h) {{
   document.getElementById('m-name').value = h.name;
   document.getElementById('m-url').value = h.url;
   document.getElementById('m-type').value = h.check_type || 'http';
-  document.getElementById('m-interval').value = h.check_interval_seconds || 60;
+  renderHostTierOptions(h.monitor_tier_seconds || h.check_interval_seconds || 60);
   document.getElementById('m-timeout').value = h.timeout_seconds || 10;
   document.getElementById('m-code').value = h.expected_status_code || 200;
   document.getElementById('m-page').checked = !!h.show_on_status_page;
@@ -2392,37 +2818,54 @@ function toggleSNS() {{
 }}
 
 function updateHostImpact() {{
-  const requestedInterval = Math.max(1, +(document.getElementById('m-interval').value || 60));
+  const requestedInterval = Math.max(60, +(document.getElementById('m-tier').value || 60));
   const effectiveInterval = 60;
   const selectedRegions = selectedTargetRegions();
-  const deployedRegions = ALL_REGIONS.length;
-  const regionCount = selectedRegions.length || deployedRegions || 0;
+  const eligibleRegions = (selectedRegions.length ? REGIONS_CACHE.filter(region => selectedRegions.includes(region.region)) : REGIONS_CACHE)
+    .filter(region => (region.supported_tiers || [60,300]).includes(requestedInterval));
+  const regionCount = eligibleRegions.length;
   const requestedChecksPerDayPerRegion = Math.round(86400 / requestedInterval);
   const effectiveChecksPerDayPerRegion = Math.round(86400 / effectiveInterval);
   const effectiveChecksPerDayTotal = effectiveChecksPerDayPerRegion * regionCount;
-  const targetLabel = selectedRegions.length ? (selectedRegions.length + ' selected worker region(s)') : (deployedRegions + ' deployed worker region(s)');
+  const targetLabel = regionCount ? (regionCount + ' worker region(s) currently support this tier') : 'no worker regions currently support this tier';
   document.getElementById('m-impact').innerHTML =
-    `Requested interval: every <strong>${{requestedInterval}}s</strong>, which would be about <strong>${{requestedChecksPerDayPerRegion.toLocaleString()}}</strong> checks/day per region if per-host intervals were enforced.<br>` +
-    `Current scheduler: every <strong>${{effectiveInterval}}s</strong>, so this host is currently checked about <strong>${{effectiveChecksPerDayTotal.toLocaleString()}}</strong> times/day across ${{targetLabel}}.<br>` +
-    `Lambda invocations are driven by the once-per-minute management + worker schedule, so adding this host increases checks and DynamoDB writes, not one Lambda invoke per check.`;
+    `Chosen tier: <strong>${{formatTierLabel(requestedInterval)}}</strong>, which is about <strong>${{requestedChecksPerDayPerRegion.toLocaleString()}}</strong> checks/day per supporting region.<br>` +
+    `Current scheduler heartbeat: every <strong>${{effectiveInterval}}s</strong>. This host is currently eligible for about <strong>${{effectiveChecksPerDayTotal.toLocaleString()}}</strong> checks/day across ${{targetLabel}}.<br>` +
+    `Lambda invocations are driven by the shared management + worker schedule. Adding this host mainly increases checks and DynamoDB writes, not one Lambda invoke per check.`;
 }}
 
 function closeHostModal() {{ document.getElementById('host-modal').classList.remove('open'); }}
 
 async function saveHost() {{
   const id = document.getElementById('m-id').value;
+  const chosenTier = +document.getElementById('m-tier').value;
+  const targets = selectedTargetRegions();
+  const scopedRegions = targets.length ? REGIONS_CACHE.filter(region => targets.includes(region.region)) : REGIONS_CACHE;
+  const unsupportedRegions = scopedRegions.filter(region => !(region.supported_tiers || [60,300]).includes(chosenTier)).map(region => region.region);
+  if (!scopedRegions.length) {{
+    toast('Deploy at least one worker region before saving a host.', true);
+    return;
+  }}
+  if (!targets.length && !scopedRegions.some(region => (region.supported_tiers || [60,300]).includes(chosenTier))) {{
+    toast('No deployed worker region currently supports that monitor tier.', true);
+    return;
+  }}
+  if (targets.length && unsupportedRegions.length) {{
+    toast('These selected worker regions do not support that tier: ' + unsupportedRegions.join(', '), true);
+    return;
+  }}
   const body = {{
     name: document.getElementById('m-name').value,
     url: document.getElementById('m-url').value,
     check_type: document.getElementById('m-type').value,
-    check_interval_seconds: +document.getElementById('m-interval').value,
+    monitor_tier_seconds: chosenTier,
     timeout_seconds: +document.getElementById('m-timeout').value,
     expected_status_code: +document.getElementById('m-code').value,
     show_on_status_page: document.getElementById('m-page').checked,
     alert_enabled: document.getElementById('m-alert').checked,
     alert_sns_arn: document.getElementById('m-sns').value,
     enabled: document.getElementById('m-enabled').checked,
-    target_regions: selectedTargetRegions(),
+    target_regions: targets,
   }};
   const res = await api(id ? '/api/hosts/'+id : '/api/hosts', {{method: id ? 'PUT' : 'POST', body: JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
@@ -2454,7 +2897,7 @@ async function loadRegions() {{
     <div class="region-card">
       <div class="region-info">
         <div class="name">${{r.region}} <span class="badge active" style="margin-left:6px">${{r.status||'active'}}</span></div>
-        <div class="meta">Memory: ${{r.memory_mb||256}}MB · Deployed: ${{r.deployed_at ? new Date(r.deployed_at).toLocaleDateString() : '—'}}</div>
+        <div class="meta">Memory: ${{r.memory_mb||256}}MB · Tiers: ${{(r.supported_tiers || [60,300]).map(formatTierLabel).join(', ')}} · Deployed: ${{r.deployed_at ? new Date(r.deployed_at).toLocaleDateString() : '—'}}</div>
       </div>
       <div class="actions">
         <button class="btn btn-warn btn-sm" onclick="updateRegion('${{r.region}}')">Update Code</button>
@@ -2467,6 +2910,7 @@ function openAddRegion() {{
   document.getElementById('r-status').style.display = 'none';
   document.getElementById('r-deploy-btn').disabled = false;
   document.getElementById('r-deploy-btn').innerHTML = 'Deploy';
+  renderRegionTierOptions([60, 300]);
   document.getElementById('region-modal').classList.add('open');
 }}
 
@@ -2475,7 +2919,15 @@ function closeRegionModal() {{ document.getElementById('region-modal').classList
 async function deployRegion() {{
   const btn = document.getElementById('r-deploy-btn');
   const stat = document.getElementById('r-status');
-  const body = {{region: document.getElementById('r-region').value, memory_mb: +document.getElementById('r-memory').value}};
+  const body = {{
+    region: document.getElementById('r-region').value,
+    memory_mb: +document.getElementById('r-memory').value,
+    supported_tiers: selectedRegionTiers(),
+  }};
+  if (!body.supported_tiers.length) {{
+    toast('Select at least one monitor tier for this worker.', true);
+    return;
+  }}
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Deploying…';
   stat.style.display = '';
@@ -2850,7 +3302,7 @@ async function loadCostDefaults() {{
   const defaults = data.defaults || data.inputs || {{}};
   document.getElementById('c-hosts').value = defaults.hosts ?? 0;
   document.getElementById('c-regions').value = defaults.regions ?? 0;
-  document.getElementById('c-interval').value = defaults.interval_sec ?? 60;
+  document.getElementById('c-interval').value = defaults.interval_sec ?? 300;
   document.getElementById('c-days').value = defaults.retention_days ?? 90;
   document.getElementById('c-cloudfront-plan').value = defaults.cloudfront_plan ?? 'payg';
   await calcCost();
@@ -2881,7 +3333,7 @@ async function calcCost() {{
 
 async function boot() {{
   if (!await ensureAuthed()) return;
-  document.getElementById('m-interval').addEventListener('input', updateHostImpact);
+  document.getElementById('m-tier').addEventListener('change', updateHostImpact);
   await Promise.all([ensureRegionsLoaded(), loadHosts()]);
 }}
 

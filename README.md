@@ -27,6 +27,8 @@ bootstrap path.
 - Per-host worker-region targeting
 - Public status page
 - Admin UI
+- Password-only admin auth, with optional admin IP allowlisting
+- Cognito-ready CloudFormation provisioning for a future hosted-login path
 - Status-page themes, brand name, logo, and title
 - Status-page maintenance notice and public subscribe links
 - Custom-domain deploy/destroy flow from the admin UI using CloudFront + ACM, with manual DNS record instructions
@@ -77,6 +79,35 @@ The stack region becomes the **home region**. That region hosts:
 - EventBridge schedule
 - DynamoDB tables
 - Secrets Manager admin key
+
+## Authentication
+
+Two admin-auth tracks are documented now:
+
+- `Password only`
+  This is the active built-in flow today. The admin key lives in Secrets
+  Manager and `/admin` uses it as a bearer token for the API.
+- `Cognito`
+  CloudFormation can now provision a Cognito User Pool, User Pool Client, and
+  optional managed-login domain so the stack is ready for a later Cognito
+  login/session integration.
+
+If you stay on password-only, strongly consider setting `AdminAllowedIpCidrs`
+to limit `/admin` and `/api/*` to trusted networks.
+
+Full guide:
+
+- [Authentication Guide](/Users/assi/Work/repos/maimon33/uptime/docs/authentication.md)
+
+Fastest Cognito prep:
+
+```bash
+./scripts/prepare-cognito-cf.sh eu-central-1 uptime my-uptime-admin maimons.dev
+./scripts/create-cognito-admin-user.sh eu-central-1 uptime you@maimons.dev
+```
+
+The first script prints the CloudFormation deploy command. The second one
+creates the first Cognito user after the stack is up.
 
 `AdminApiKey` is optional. If you leave it blank, the stack generates one in
 Secrets Manager:

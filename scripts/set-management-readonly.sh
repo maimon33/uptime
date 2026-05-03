@@ -6,19 +6,35 @@ usage() {
 Usage:
   ./scripts/set-management-readonly.sh enable <home-region>
   ./scripts/set-management-readonly.sh disable <home-region>
+  ./scripts/set-management-readonly.sh help
 
-Examples:
-  ./scripts/set-management-readonly.sh enable eu-central-1
-  ./scripts/set-management-readonly.sh disable eu-central-1
+Arguments:
+  enable | disable
+    enable:
+      turns on read-only mode
+    disable:
+      turns off read-only mode
+
+  home-region
+    AWS region where the live uptime-management Lambda is deployed.
 
 Notes:
   - Sets or unsets the READ_ONLY_MODE Lambda environment variable.
   - Adds or removes an explicit deny inline policy on the management role.
   - Reads remain available; writes are explicitly denied while enabled.
+
+Examples:
+  ./scripts/set-management-readonly.sh enable eu-central-1
+  ./scripts/set-management-readonly.sh disable eu-central-1
 EOF
 }
 
-if [[ $# -ne 2 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -ne 2 ]]; then
   usage
   exit 0
 fi

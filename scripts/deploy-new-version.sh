@@ -5,19 +5,33 @@ usage() {
   cat <<'EOF'
 Usage:
   ./scripts/deploy-new-version.sh <home-region> [notify-topic-arn]
+  ./scripts/deploy-new-version.sh help
 
-Examples:
-  ./scripts/deploy-new-version.sh eu-central-1
-  ./scripts/deploy-new-version.sh eu-central-1 arn:aws:sns:eu-central-1:123456789012:uptime-deploys
+Arguments:
+  home-region
+    AWS region where the live uptime-management Lambda is deployed.
+    Supported values:
+      us-east-1
+      eu-west-1
+      eu-central-1
+      ap-southeast-1
+
+  notify-topic-arn
+    Optional SNS topic ARN to notify after a successful deploy.
+    If omitted, the script also checks DEPLOY_NOTIFY_SNS_ARN.
 
 Notes:
   - Publishes the latest artifacts to the template bucket and all supported regional artifact buckets.
   - Updates the management Lambda code in the chosen home region.
   - Optionally sends an SNS notification after a successful deploy.
+
+Examples:
+  ./scripts/deploy-new-version.sh eu-central-1
+  ./scripts/deploy-new-version.sh eu-central-1 arn:aws:sns:eu-central-1:123456789012:uptime-deploys
 EOF
 }
 
-if [[ "${1:-}" == "" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if [[ "${1:-}" == "" || "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
@@ -34,6 +48,63 @@ REGIONAL_BUCKETS=(
   "uptime-artifacts-eu-central-1.maimons.dev"
   "uptime-artifacts-ap-southeast-1.maimons.dev"
 )
+INTERACTIVE=0
+[[ -t 1 ]] && INTERACTIVE=1
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uptime-deploy.XXXXXX")"
+
+cleanup_tmp() {
+  rm -rf "$LOG_DIR"
+}
+trap cleanup_tmp EXIT
+
+render_progress() {
+  local current="$1"
+  local total="$2"
+  local label="$3"
+
+  if [[ "$INTERACTIVE" -eq 1 ]]; then
+    local width=28
+    local filled=$(( current * width / total ))
+    local empty=$(( width - filled ))
+    local filled_bar
+    local empty_bar
+    filled_bar="$(printf '%*s' "$filled" '' | tr ' ' '#')"
+    empty_bar="$(printf '%*s' "$empty" '' | tr ' ' '.')"
+    printf "\r["
+    printf "%s%s] %d/%d %s" "$filled_bar" "$empty_bar" "$current" "$total" "$label"
+  else
+    echo "→ ${label}"
+  fi
+}
+
+finish_progress_line() {
+  [[ "$INTERACTIVE" -eq 1 ]] && printf "\n"
+}
+
+show_log_excerpt() {
+  local log_file="$1"
+  if [[ -f "$log_file" ]]; then
+    echo ""
+    echo "Last log lines from ${log_file}:"
+    tail -n 20 "$log_file" || true
+  fi
+}
+
+run_step() {
+  local current="$1"
+  local total="$2"
+  local label="$3"
+  local log_file="$4"
+  shift 4
+
+  render_progress "$current" "$total" "$label"
+  if ! "$@" >"$log_file" 2>&1; then
+    finish_progress_line
+    echo "error: ${label}"
+    show_log_excerpt "$log_file"
+    exit 1
+  fi
+}
 
 case "$HOME_REGION" in
   us-east-1) ARTIFACT_BUCKET="uptime-artifacts-us-east-1.maimons.dev" ;;
@@ -47,46 +118,110 @@ case "$HOME_REGION" in
     ;;
 esac
 
-ARTIFACT_KEY="${PREFIX%/}/releases/management.zip"
+[[ "$PREFIX" == /* ]] && { echo "error: prefix must be relative (no leading /)"; exit 1; }
+PREFIX_ROOT="${PREFIX%/}"
+ARTIFACT_KEY="${PREFIX_ROOT}/releases/management.zip"
 DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 VERSION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)"
+VERSIONED_PREFIX="${PREFIX_ROOT}/releases/${VERSION}"
+SOURCE_VERSIONED_URI="s3://${TEMPLATE_BUCKET}/${VERSIONED_PREFIX}/"
 
-echo "→ Publishing latest artifacts..."
-bash "$REPO_ROOT/scripts/publish-artifacts.sh" "$TEMPLATE_BUCKET" "$PREFIX"
+replicate_bucket() {
+  local bucket="$1"
+  local log_file="$2"
+  local stage_uri="s3://${bucket}/${PREFIX_ROOT}/staging/${VERSION}/"
+  local versioned_uri="s3://${bucket}/${VERSIONED_PREFIX}/"
+
+  {
+  aws s3 rm "${stage_uri}" --recursive --quiet 2>/dev/null || true
+  aws s3 sync "${SOURCE_VERSIONED_URI}" "${stage_uri}" --delete
+
+  aws s3 cp "${stage_uri}management.zip" "s3://${bucket}/${PREFIX_ROOT}/releases/management.zip"
+  aws s3 cp "${stage_uri}uptime-bootstrap.yaml" "s3://${bucket}/${PREFIX_ROOT}/cloudformation/uptime-bootstrap.yaml"
+  aws s3 cp "${stage_uri}uptime-artifacts.yaml" "s3://${bucket}/${PREFIX_ROOT}/cloudformation/uptime-artifacts.yaml"
+
+  aws s3 mv "${stage_uri}management.zip" "${versioned_uri}management.zip"
+  aws s3 mv "${stage_uri}uptime-bootstrap.yaml" "${versioned_uri}uptime-bootstrap.yaml"
+  aws s3 mv "${stage_uri}uptime-artifacts.yaml" "${versioned_uri}uptime-artifacts.yaml"
+  } >"$log_file" 2>&1 || {
+    aws s3 rm "${stage_uri}" --recursive --quiet 2>/dev/null || true
+    return 1
+  }
+}
+
+TOTAL_STEPS=3
+[[ -n "$NOTIFY_TOPIC_ARN" ]] && TOTAL_STEPS=4
+CURRENT_STEP=1
+
+run_step "$CURRENT_STEP" "$TOTAL_STEPS" "Publishing source artifacts to ${TEMPLATE_BUCKET}" "$LOG_DIR/publish-source.log" \
+  bash "$REPO_ROOT/scripts/publish-artifacts.sh" "$TEMPLATE_BUCKET" "$PREFIX_ROOT"
+
+CURRENT_STEP=$((CURRENT_STEP + 1))
 declare -a PIDS=()
 declare -a PID_BUCKETS=()
+declare -a PID_LOGS=()
+declare -a PID_DONE=()
 for bucket in "${REGIONAL_BUCKETS[@]}"; do
   if [[ "$bucket" == "$TEMPLATE_BUCKET" ]]; then
     continue
   fi
-  echo "→ Publishing regional artifact bundle to ${bucket} in parallel..."
+  log_file="$LOG_DIR/replicate-${bucket}.log"
   (
-    bash "$REPO_ROOT/scripts/publish-artifacts.sh" "$bucket" "$PREFIX"
+    replicate_bucket "$bucket" "$log_file"
   ) &
   PIDS+=("$!")
   PID_BUCKETS+=("$bucket")
+  PID_LOGS+=("$log_file")
+  PID_DONE+=(0)
 done
 
-for i in "${!PIDS[@]}"; do
-  if ! wait "${PIDS[$i]}"; then
-    echo "error: publish failed for ${PID_BUCKETS[$i]}"
-    exit 1
-  fi
+COMPLETED_BUCKETS=0
+TOTAL_BUCKETS="${#PIDS[@]}"
+render_progress "$CURRENT_STEP" "$TOTAL_STEPS" "Replicating artifacts to ${COMPLETED_BUCKETS}/${TOTAL_BUCKETS} regional buckets"
+
+while (( COMPLETED_BUCKETS < TOTAL_BUCKETS )); do
+  for i in "${!PIDS[@]}"; do
+    if [[ "${PID_DONE[$i]}" -eq 1 ]]; then
+      continue
+    fi
+
+    if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
+      if ! wait "${PIDS[$i]}"; then
+        finish_progress_line
+        echo "error: replication failed for ${PID_BUCKETS[$i]}"
+        show_log_excerpt "${PID_LOGS[$i]}"
+        exit 1
+      fi
+      PID_DONE[$i]=1
+      COMPLETED_BUCKETS=$((COMPLETED_BUCKETS + 1))
+      render_progress "$CURRENT_STEP" "$TOTAL_STEPS" "Replicating artifacts to ${COMPLETED_BUCKETS}/${TOTAL_BUCKETS} regional buckets"
+    fi
+  done
+  sleep 0.2
 done
 
-echo ""
-echo "→ Updating ${FUNCTION_NAME} in ${HOME_REGION} from s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
-aws lambda update-function-code \
+CURRENT_STEP=$((CURRENT_STEP + 1))
+render_progress "$CURRENT_STEP" "$TOTAL_STEPS" "Updating ${FUNCTION_NAME} in ${HOME_REGION}"
+if ! aws lambda update-function-code \
   --region "$HOME_REGION" \
   --function-name "$FUNCTION_NAME" \
   --s3-bucket "$ARTIFACT_BUCKET" \
   --s3-key "$ARTIFACT_KEY" \
-  --publish >/tmp/uptime-deploy-update.json
-
-echo "→ Waiting for Lambda update to finish..."
-aws lambda wait function-updated \
+  --publish >"$LOG_DIR/lambda-update.log" 2>&1; then
+  finish_progress_line
+  echo "error: Updating ${FUNCTION_NAME} in ${HOME_REGION}"
+  show_log_excerpt "$LOG_DIR/lambda-update.log"
+  exit 1
+fi
+render_progress "$CURRENT_STEP" "$TOTAL_STEPS" "Waiting for ${FUNCTION_NAME} update to finish"
+if ! aws lambda wait function-updated \
   --region "$HOME_REGION" \
-  --function-name "$FUNCTION_NAME"
+  --function-name "$FUNCTION_NAME" >"$LOG_DIR/lambda-wait.log" 2>&1; then
+  finish_progress_line
+  echo "error: Waiting for ${FUNCTION_NAME} update to finish"
+  show_log_excerpt "$LOG_DIR/lambda-wait.log"
+  exit 1
+fi
 
 FUNCTION_URL="$(
   aws lambda get-function-url-config \
@@ -111,12 +246,13 @@ cat > "$REPO_ROOT/dist/deploy-last.json" <<EOF
 EOF
 
 if [[ -n "$NOTIFY_TOPIC_ARN" ]]; then
-  echo "→ Sending deployment notification to SNS..."
-  aws sns publish \
-    --region "$HOME_REGION" \
-    --topic-arn "$NOTIFY_TOPIC_ARN" \
-    --subject "Uptime deployed: ${VERSION}" \
-    --message "Uptime deployment completed.
+  CURRENT_STEP=$((CURRENT_STEP + 1))
+  run_step "$CURRENT_STEP" "$TOTAL_STEPS" "Sending deployment notification" "$LOG_DIR/sns-publish.log" \
+    aws sns publish \
+      --region "$HOME_REGION" \
+      --topic-arn "$NOTIFY_TOPIC_ARN" \
+      --subject "Uptime deployed: ${VERSION}" \
+      --message "Uptime deployment completed.
 
 Version: ${VERSION}
 Region: ${HOME_REGION}
@@ -124,6 +260,9 @@ Function: ${FUNCTION_NAME}
 URL: ${FUNCTION_URL:-not configured}
 Time: ${DEPLOYED_AT}"
 fi
+
+render_progress "$TOTAL_STEPS" "$TOTAL_STEPS" "Deployment complete"
+finish_progress_line
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {

@@ -14,9 +14,42 @@ Parameters:
     NoEcho: true
     Default: ''
     Description: Admin password/token. Leave blank to auto-generate in Secrets Manager.
+  AdminAuthMode:
+    Type: String
+    Default: password
+    AllowedValues:
+      - password
+      - cognito
+    Description: Authentication mode to prepare for the admin UI. Password keeps the shared admin key flow active. Cognito provisions a user pool/client/domain for a later Cognito login integration.
+  AdminAllowedIpCidrs:
+    Type: String
+    Default: ''
+    Description: Optional comma-separated IPv4/IPv6 CIDRs allowed to access /admin and /api. Leave blank to allow any IP. Useful as a hardening step for password-only mode.
+  CognitoManagedDomainPrefix:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|[a-z0-9-]{3,63}$'
+    Description: Optional Cognito managed-login domain prefix, for example my-uptime-admin. Used only when AdminAuthMode is cognito.
+  CognitoAllowedEmailDomain:
+    Type: String
+    Default: ''
+    Description: Optional operator email domain hint, for example maimons.dev. Stored in Lambda env for the upcoming Cognito login flow.
+  CognitoMfaMode:
+    Type: String
+    Default: OPTIONAL
+    AllowedValues:
+      - OFF
+      - OPTIONAL
+      - ON
+    Description: MFA mode for the Cognito user pool when AdminAuthMode is cognito. TOTP is enabled in the pool.
 
 Conditions:
   HasProvidedAdminApiKey: !Not [!Equals [!Ref AdminApiKey, '']]
+  UseCognitoAuth: !Equals [!Ref AdminAuthMode, cognito]
+  HasCognitoManagedDomainPrefix: !Not [!Equals [!Ref CognitoManagedDomainPrefix, '']]
+  CreateCognitoManagedDomain: !And
+    - !Condition UseCognitoAuth
+    - !Condition HasCognitoManagedDomainPrefix
 
 Mappings:
   # The CloudFormation template itself can be served from any public bucket.
@@ -97,6 +130,58 @@ Resources:
           Value: uptime
         - Key: ManagedBy
           Value: cloudformation
+
+  AdminUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: UseCognitoAuth
+    Properties:
+      UserPoolName: uptime-admin
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      MfaConfiguration: !Ref CognitoMfaMode
+      SoftwareTokenMfaConfiguration:
+        Enabled: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      Tags:
+        Project: uptime
+        ManagedBy: cloudformation
+
+  AdminUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: UseCognitoAuth
+    Properties:
+      ClientName: uptime-admin
+      UserPoolId: !Ref AdminUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthFlowsUserPoolClient: false
+
+  AdminUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: CreateCognitoManagedDomain
+    Properties:
+      Domain: !Ref CognitoManagedDomainPrefix
+      UserPoolId: !Ref AdminUserPool
 
   ManagementLogGroup:
     Type: AWS::Logs::LogGroup
@@ -229,6 +314,16 @@ Resources:
           HOSTS_TABLE: !Ref HostsTable
           CHECKS_TABLE: !Ref ChecksTable
           ADMIN_KEY_SECRET: !Ref AdminKeySecret
+          ADMIN_AUTH_MODE: !Ref AdminAuthMode
+          ADMIN_ALLOWED_IP_CIDRS: !Ref AdminAllowedIpCidrs
+          COGNITO_USER_POOL_ID: !If [UseCognitoAuth, !Ref AdminUserPool, '']
+          COGNITO_USER_POOL_CLIENT_ID: !If [UseCognitoAuth, !Ref AdminUserPoolClient, '']
+          COGNITO_USER_POOL_DOMAIN: !If
+            - CreateCognitoManagedDomain
+            - !Sub 'https://${CognitoManagedDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+            - ''
+          COGNITO_ALLOWED_EMAIL_DOMAIN: !Ref CognitoAllowedEmailDomain
+          COGNITO_MFA_MODE: !If [UseCognitoAuth, !Ref CognitoMfaMode, '']
           HOME_REGION: !Ref AWS::Region
           PROJECT: uptime
           RETENTION_DAYS: '90'
@@ -309,12 +404,35 @@ Outputs:
     Value: !GetAtt ManagementFunctionUrl.FunctionUrl
 
   AdminUrl:
-    Description: Admin UI URL. Append ?key=<your-admin-key>.
+    Description: Admin UI URL. Password mode uses the shared admin key today. Cognito resources may also be provisioned for a later hosted-login integration.
     Value: !Sub '${ManagementFunctionUrl.FunctionUrl}admin'
 
   AdminKeySecretArn:
     Description: Secrets Manager ARN containing the admin key.
     Value: !Ref AdminKeySecret
+
+  AdminAuthMode:
+    Description: Admin auth mode selected for this stack.
+    Value: !Ref AdminAuthMode
+
+  AdminAllowedIpCidrs:
+    Description: Optional admin IP allowlist configured for /admin and /api.
+    Value: !Ref AdminAllowedIpCidrs
+
+  CognitoUserPoolId:
+    Condition: UseCognitoAuth
+    Description: Cognito User Pool ID prepared for admin authentication.
+    Value: !Ref AdminUserPool
+
+  CognitoUserPoolClientId:
+    Condition: UseCognitoAuth
+    Description: Cognito User Pool Client ID prepared for admin authentication.
+    Value: !Ref AdminUserPoolClient
+
+  CognitoManagedLoginDomain:
+    Condition: CreateCognitoManagedDomain
+    Description: Cognito managed-login base URL.
+    Value: !Sub 'https://${CognitoManagedDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
 
   HostsTableName:
     Description: DynamoDB table for hosts, settings, and region records.

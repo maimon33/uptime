@@ -29,7 +29,10 @@ Shared context for Claude Code + Codex collaboration.
   - Collects results, writes aggregate status back to hosts table.
   - Sends SNS alerts on state transitions (centralized, not per-worker).
 - `/admin` now serves a public login shell. The admin token is entered once in-browser and reused from session storage for Bearer-authenticated API calls.
+- `/admin` and `/api/*` now support optional IP allowlisting via `ADMIN_ALLOWED_IP_CIDRS`.
+- CloudFormation can now optionally provision Cognito admin-auth resources (User Pool, Client, optional managed-login domain) and pass Cognito-related env vars into the management Lambda, but the app-side Cognito login/session flow is still a follow-up task.
 - The public status page now supports theme/brand/logo settings and shows recent history plus latency badges per region.
+- The public surface now also includes a dedicated `/history` page with host and worker-region filters so check history does not overload the main status page.
 - The public status page also supports a configurable maintenance notice plus public subscribe links for email/SMS/webhook or RSS destinations.
 - The status-page admin pane can now start and tear down a custom-domain rollout via ACM + CloudFront. DNS stays manual by design: the app returns the exact validation and traffic records the operator should create or remove.
 - The admin UI now includes a Notifications tab for deployment-wide defaults like topic ARN, quiet hours, reminder cadence, sleep windows, TTL, and maintenance muting. These values are stored in settings even where backend enforcement is still pending.
@@ -47,6 +50,8 @@ Shared context for Claude Code + Codex collaboration.
 | `src/management/regions.py` | Both | Deploy/teardown worker Lambdas via boto3 |
 | `src/management/_monitor_handler.py` | Generated | Copy of `src/monitor/handler.py` — bundled in management zip |
 | `src/monitor/handler.py` | Claude | Worker Lambda: runs checks, returns/writes results |
+| `DESIGN.md` | Codex | Semantic design system for the public status page and admin console |
+| `scripts/render_ui_preview.py` | Codex | Renders static HTML previews of the inline status/admin UI into `dist/preview/` |
 | `cloudformation/uptime-bootstrap.yaml` | Codex | Primary infrastructure deployment |
 | `cloudformation/uptime-artifacts.yaml` | Codex | S3 bucket for artifacts |
 | `terraform/main.tf` | Claude | Alternative Terraform deployment (may lag CFN) |
@@ -126,6 +131,8 @@ The management role has permissions to: manage Lambda functions (`uptime-monitor
 
 8. **Custom-domain rollout is intentionally progressive**: the admin API can request the certificate, inspect validation state, create/disable/delete the CloudFront distribution, and tell the operator which DNS records to manage manually. It does not edit DNS itself.
 
+9. **Cognito is infra-prepared, not app-complete**: the bootstrap stack can now create Cognito resources and expose the necessary values, but `/admin` still authenticates with the shared admin token until a dedicated Cognito redirect/callback/session implementation is added.
+
 ---
 
 ## Deploy flow (CloudFormation path)
@@ -193,3 +200,10 @@ terraform output -raw admin_key
 - Fork path documented: users override both params with their own bucket/key
 - `publish-artifacts.sh` now defaults to `www.maimons.dev / uptime` prefix; accepts optional args to publish a fork
 - README rewritten: one-click URL + CLI for standard path; separate fork section
+
+### 2026-05-03 — Design system + preview pipeline
+
+- Added root-level `DESIGN.md` using the Stitch `design-md` skill approach, adapted to this repo's inline Python-rendered UI
+- Refreshed the public status page and admin console styling in `src/management/handler.py` to use a shared visual language
+- Added `scripts/render_ui_preview.py` to render static previews to `dist/preview/status-preview.html` and `dist/preview/admin-preview.html`
+- Expanded status-page themes into full-atmosphere treatments and added `dist/preview/history-preview.html` for the new public history view

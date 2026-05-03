@@ -24,6 +24,38 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/publish-artifacts.sh [bucket] [prefix]
+  ./scripts/publish-artifacts.sh help
+
+Arguments:
+  bucket
+    S3 bucket that will receive the live and versioned artifacts.
+    Default: www.maimons.dev
+
+  prefix
+    Folder prefix inside the bucket.
+    Default: uptime
+
+What it does:
+  - Builds the management zip unless SKIP_PACKAGE=1 is set.
+  - Uploads the zip and CloudFormation templates to a staging path.
+  - Promotes them to the live paths used by CloudFormation.
+  - Archives a versioned copy for pinned deploys.
+
+Examples:
+  ./scripts/publish-artifacts.sh
+  ./scripts/publish-artifacts.sh my-bucket uptime
+EOF
+}
+
+if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
 BUCKET="${1:-www.maimons.dev}"
 PREFIX="${2:-uptime}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -53,8 +85,12 @@ _cleanup() {
 trap _cleanup ERR
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
-echo "→ Packaging (version: ${VERSION})..."
-bash "$REPO_ROOT/scripts/package.sh"
+if [[ "${SKIP_PACKAGE:-0}" != "1" ]]; then
+  echo "→ Packaging (version: ${VERSION})..."
+  bash "$REPO_ROOT/scripts/package.sh"
+else
+  echo "→ Reusing existing package (version: ${VERSION})..."
+fi
 
 # ── 2. Stage all three files ──────────────────────────────────────────────────
 # Any failure here triggers _cleanup — live paths are never touched.

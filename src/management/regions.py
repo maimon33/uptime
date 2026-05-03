@@ -129,7 +129,7 @@ def _ensure_monitor_role() -> str:
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
 
-def deploy_region(region: str, memory_mb: int = 256) -> dict:
+def deploy_region(region: str, memory_mb: int = 256, supported_tiers: list[int] | None = None) -> dict:
     """
     Deploy (or update) a regional worker Lambda in the given region.
     Idempotent — safe to call multiple times; updates code/config on existing deployments.
@@ -195,6 +195,7 @@ def deploy_region(region: str, memory_mb: int = 256) -> dict:
         "function_arn": func_arn,
         "function_name": fname,
         "memory_mb": memory_mb,
+        "supported_tiers": sorted(supported_tiers or [60, 300]),
         "status": "active",
         "deployed_at": datetime.now(timezone.utc).isoformat(),
     }

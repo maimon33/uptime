@@ -40,6 +40,8 @@ MAX_WORKERS = 20
 
 def handler(event, context):
     run_id = (event or {}).get("run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    due_tiers = _normalize_monitor_tiers((event or {}).get("due_tiers"), fallback=[60])
+    supported_tiers = _normalize_monitor_tiers((event or {}).get("supported_tiers"), fallback=[60, 300])
 
     db = _get_dynamodb()
     hosts_table = db.Table(HOSTS_TABLE)
@@ -49,7 +51,7 @@ def handler(event, context):
     )
     hosts = [
         host for host in resp.get("Items", [])
-        if _host_runs_in_region(host, MONITOR_REGION)
+        if _host_runs_in_region(host, MONITOR_REGION) and _host_due_for_tier(host, supported_tiers, due_tiers)
     ]
 
     if not hosts:
@@ -93,11 +95,44 @@ def handler(event, context):
     }
 
 
+def _normalize_monitor_tiers(value, fallback=None) -> list[int]:
+    tiers = []
+    raw_values = value if isinstance(value, list) else ([value] if value not in (None, "") else [])
+    for raw in raw_values:
+        try:
+            tier = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if tier < 60 or tier % 60 != 0:
+            continue
+        if tier not in tiers:
+            tiers.append(tier)
+    return sorted(tiers) if tiers else list(fallback or [60, 300])
+
+
+def _host_monitor_tier_seconds(host: dict) -> int:
+    value = host.get("monitor_tier_seconds", host.get("check_interval_seconds", 60))
+    try:
+        tier = int(value)
+    except (TypeError, ValueError):
+        return 60
+    if tier < 60 or tier % 60 != 0:
+        return 60
+    return tier
+
+
 def _host_runs_in_region(host: dict, region: str) -> bool:
     targets = host.get("target_regions") or []
     if not targets:
         return True
     return region in targets
+
+
+def _host_due_for_tier(host: dict, supported_tiers: list[int], due_tiers: list[int]) -> bool:
+    tier = _host_monitor_tier_seconds(host)
+    if tier not in supported_tiers:
+        return False
+    return tier in due_tiers
 
 
 def _check_and_record(host: dict, run_id: str) -> dict:
