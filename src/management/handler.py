@@ -2064,6 +2064,28 @@ def _build_public_incident_summary(host_data: list[dict]) -> dict:
     }
 
 
+def _format_relative_age(iso_value: str) -> str:
+    if not iso_value:
+        return "unknown"
+    dt = _parse_aws_timestamp(iso_value)
+    if not dt:
+        return iso_value.replace("T", " ")[:16]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+    seconds = max(int(delta.total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
 def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> list[dict]:
     from boto3.dynamodb.conditions import Key as DKey
 
@@ -2107,6 +2129,9 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
                 "status": region_info.get("status", "unknown"),
                 "latency_ms": region_info.get("latency_ms"),
             })
+        incident_points = [point for point in run_points if point.get("status") in {"down", "degraded"}]
+        latest_incident = incident_points[0] if incident_points else None
+        last_checked_at = host.get("last_checked_at", "")
         host_data.append({
             "host": host,
             "uptime_pct": uptime_pct,
@@ -2117,6 +2142,10 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
             "history_points": list(reversed(run_points)),
             "history_available": bool(run_statuses),
             "current_status": host.get("current_status", "unknown"),
+            "last_checked_at": last_checked_at,
+            "last_checked_label": _format_relative_age(last_checked_at),
+            "incident_count": len(incident_points),
+            "latest_incident": latest_incident,
         })
     return host_data
 
@@ -2251,35 +2280,6 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   {maintenance_items}
 </details>"""
 
-    incident_count = int((incident_summary or {}).get("count", 0) or 0)
-    latest_incident = (incident_summary or {}).get("latest") or {}
-    latest_incident_text = ""
-    if latest_incident:
-        latest_incident_text = (
-            f'Latest issue: <strong>{latest_incident.get("host_name", "Host")}</strong> '
-            f'was <strong>{latest_incident.get("status", "unknown")}</strong> at '
-            f'{(latest_incident.get("checked_at") or "").replace("T", " ")[:16]}.'
-        )
-    issue_label = "incident" if incident_count == 1 else "incidents"
-    if incident_count:
-        incident_block = f"""<div class="events-wrap">
-  <div class="section-heading">Past incidents</div>
-  <div class="events-month">
-    <div class="incident-copy">{incident_count} recorded {issue_label} appear in the monitoring history.</div>
-    <div class="incident-meta">{latest_incident_text}</div>
-    <div class="incident-actions"><a class="ghost-link incident-link" href="/history">Review full history</a></div>
-  </div>
-</div>"""
-    else:
-        incident_block = """<div class="events-wrap">
-  <div class="section-heading">Past incidents</div>
-  <div class="events-month">
-    <div class="incident-copy">No recorded degraded or down events yet.</div>
-    <div class="incident-meta">Detailed checks will continue to accumulate in the full history page.</div>
-    <div class="incident-actions"><a class="ghost-link incident-link" href="/history">Open full history</a></div>
-  </div>
-</div>"""
-
     cards = ""
     for h in host_data:
         s     = h["current_status"]
@@ -2290,17 +2290,38 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
         if h["latest_latency"] is not None:
             latency_bits.append(f"{h['latest_latency']} ms latest")
         latency_bits.append(f"{h['avg_latency']} ms avg")
+        latency_bits.append(f"checked {h['last_checked_label']}")
         region_pills = "".join(
             f'<span class="pill {r["status"]}">{r["region"]} · {r["latency_ms"] if r["latency_ms"] is not None else "—"} ms</span>'
             for r in h["region_summary"]
         )
         history_note = "" if h["history_available"] else '<div class="history-note">History appears after checks have been recorded for this host.</div>'
         host_history_href = f'/history?host={quote(h["host"]["host_id"])}'
+        host_incident_count = int(h.get("incident_count", 0) or 0)
+        latest_incident = h.get("latest_incident") or {}
+        if host_incident_count:
+            incident_label = "incident" if host_incident_count == 1 else "incidents"
+            latest_incident_at = (latest_incident.get("checked_at") or "").replace("T", " ")[:16]
+            incident_hint = (
+                f'<div class="incident-hint">'
+                f'<span>{host_incident_count} past {incident_label}'
+                f'{f" · latest {latest_incident_at}" if latest_incident_at else ""}</span>'
+                f'<a class="ghost-link incident-link" href="{host_history_href}">Full history</a>'
+                f'</div>'
+            )
+        else:
+            incident_hint = (
+                f'<div class="incident-hint quiet">'
+                f'<span>No past incidents recorded</span>'
+                f'<a class="ghost-link incident-link" href="{host_history_href}">Full history</a>'
+                f'</div>'
+            )
         cards += f"""<details class="card svc-card">
   <summary class="svc-summary">
     <div>
       <div class="row" style="margin-bottom:2px"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
       <div class="meta" style="margin-bottom:0">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {' &nbsp;·&nbsp; '.join(latency_bits)}</div>
+      {incident_hint}
     </div>
     <span class="summary-hint">Details</span>
   </summary>
@@ -2309,7 +2330,6 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
   <div class="regions">{region_pills or '<span class="pill unknown">No regional data yet</span>'}</div>
-  <div class="svc-actions"><a class="ghost-link svc-history-link" href="{host_history_href}">View full history</a></div>
 </details>"""
 
     if not host_data:
@@ -2324,6 +2344,7 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
 <title>{title}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2392,6 +2413,8 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .badge.up{{background:#f0fdf4;color:#16a34a}}.badge.down{{background:#fef2f2;color:#dc2626}}
 .badge.degraded{{background:#fffbeb;color:#d97706}}.badge.unknown{{background:#f1f5f9;color:#64748b}}
 .meta{{font-size:.83rem;color:var(--muted);margin-bottom:12px;line-height:1.5}}
+.incident-hint{{margin-top:10px;padding-top:8px;border-top:1px solid rgba(148,163,184,.16);display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:.76rem;color:var(--muted);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.incident-hint.quiet{{opacity:.88}}
 .history-title{{font-size:.76rem;color:var(--soft);text-transform:uppercase;letter-spacing:.16em;margin-bottom:8px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .history-note{{font-size:.78rem;color:var(--muted);margin-bottom:8px}}
 .bars{{display:flex;gap:4px;height:28px}}
@@ -2401,6 +2424,7 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .regions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
 .svc-actions{{margin-top:12px}}
 .svc-history-link{{padding:8px 12px;font-size:.78rem}}
+.incident-link{{padding:7px 11px;font-size:.72rem;white-space:nowrap}}
 .pill{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:12px;font-size:.72rem;font-weight:600;background:#f8fafc;color:#475569;border:1px solid var(--border);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .pill.up{{background:#f0fdf4;color:#166534;border-color:#bbf7d0}}
 .pill.down{{background:#fef2f2;color:#b91c1c;border-color:#fecaca}}
@@ -2417,6 +2441,7 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
   .ghost-link{{width:100%}}
   .subscribe-actions{{width:100%}}
   .subscribe-btn{{width:100%}}
+  .incident-hint{{flex-direction:column;align-items:flex-start}}
 }}
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
@@ -2427,7 +2452,7 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
   </div>
   {maintenance_block}
   {maintenance_list_block}
-  {incident_block}
+  <div class="section-heading">Services</div>
   {cards}
   {subscribe_block}
   <footer>Updated {now_str}</footer>
@@ -2663,6 +2688,18 @@ nav{{position:sticky;top:0;z-index:40;background:rgba(11,18,32,.82);backdrop-fil
 .menu-item:hover{{background:rgba(255,255,255,.05)}}
 .menu-item.danger{{color:#fecaca}}
 .menu-sep{{height:1px;background:var(--line-soft);margin:6px 0}}
+.doc-hero{{display:grid;grid-template-columns:1.3fr .9fr;gap:16px;margin-bottom:18px}}
+.doc-card{{background:rgba(23,34,53,.92);border:1px solid var(--line-soft);border-radius:24px;padding:22px;box-shadow:0 24px 60px rgba(2,6,23,.18)}}
+.doc-kicker{{font-size:.72rem;color:#7dd3fc;letter-spacing:.16em;text-transform:uppercase;font-weight:700;font-family:"IBM Plex Mono","SFMono-Regular",monospace;margin-bottom:10px}}
+.doc-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}
+.doc-list{{display:flex;flex-direction:column;gap:8px;margin-top:10px;color:#d7e4f5}}
+.doc-list li{{margin-left:18px;line-height:1.55}}
+.doc-mini{{font-size:.8rem;color:var(--soft);line-height:1.6}}
+.doc-badges{{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}}
+.doc-badge{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:#0e1828;color:#c7d2fe;font-size:.74rem;font-weight:700}}
+.doc-columns{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}}
+.doc-subtitle{{font-size:.84rem;font-weight:700;color:#f8fafc;margin-bottom:6px}}
+.doc-note{{background:linear-gradient(135deg, rgba(14,165,233,.12), rgba(15,118,110,.08));border:1px solid rgba(14,165,233,.22);padding:14px 16px;border-radius:18px;font-size:.82rem;color:#d2f0ff;line-height:1.6;margin-top:14px}}
 .main{{max-width:1180px;margin:0 auto;padding:34px 20px 72px}}
 h2{{font-size:1.55rem;font-weight:700;margin-bottom:18px;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.03em}}
 h3{{font-size:1rem;font-weight:600;margin:20px 0 8px;color:#e2e8f0;font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
@@ -2722,6 +2759,7 @@ strong{{color:#f8fafc}}
 @media (max-width: 900px) {{
   nav{{overflow-x:auto}}
   .main{{padding-top:24px}}
+  .doc-hero,.doc-grid,.doc-columns{{grid-template-columns:1fr}}
 }}
 @media (max-width: 760px) {{
   .grid2{{grid-template-columns:1fr}}
@@ -3142,54 +3180,146 @@ strong{{color:#f8fafc}}
 </div>
 
 <div id="pane-guides" style="display:none">
-  <h2>Guides &amp; Reference</h2>
-
-  <h3>How worker regions work</h3>
+  <h2>Operator Docs</h2>
   <p class="desc">
-    Each orchestration run fans out from the home-region management Lambda to every deployed worker region.
-    Hosts can optionally be limited to only specific workers.
+    This page is the practical runbook for operating the stack: what to deploy, how to secure admin access, which scripts are worth keeping nearby, and what to watch for in corporate-network environments.
   </p>
 
-  <h3>HTTP check vs TCP check</h3>
-  <p class="desc">
-    <strong>HTTP</strong> checks status code, latency, and SSL expiry for HTTPS.
-    <strong>TCP</strong> opens a raw socket to host:port for databases, SMTP, Redis, and similar services.
-  </p>
+  <div class="doc-hero">
+    <div class="doc-card">
+      <div class="doc-kicker">Quick Start</div>
+      <h3 style="margin-top:0">Recommended first production shape</h3>
+      <ul class="doc-list">
+        <li>Keep one home region for the management Lambda and add at least two worker regions for coverage.</li>
+        <li>Use a custom domain through CloudFront instead of sending operators to the raw Lambda Function URL.</li>
+        <li>Turn on Cognito if you want named users and MFA; keep the emergency admin token only as a break-glass path.</li>
+        <li>If you stay on password-only admin, restrict `/admin` and `/api/*` with `AdminAllowedIpCidrs`.</li>
+      </ul>
+      <div class="doc-badges">
+        <span class="doc-badge">Home region: {HOME_REGION}</span>
+        <span class="doc-badge">1-minute orchestrator heartbeat</span>
+        <span class="doc-badge">Regional worker fan-out</span>
+      </div>
+    </div>
+    <div class="doc-card">
+      <div class="doc-kicker">Useful Endpoints</div>
+      <div class="doc-subtitle">Admin</div>
+      <p class="doc-mini">`/admin` is the private control plane. In Cognito mode, operators should sign in with Cognito and use the Account page for password and MFA work.</p>
+      <div class="doc-subtitle" style="margin-top:12px">Public status</div>
+      <p class="doc-mini">`/` or `/status` is the public landing page. `/history` is the detailed timeline and should be the main path for past incidents.</p>
+      <div class="doc-subtitle" style="margin-top:12px">Version check</div>
+      <pre>GET /api/debug/version
+Authorization: Bearer &lt;admin-token-or-cognito-access-token&gt;</pre>
+    </div>
+  </div>
 
-  <h3>Setting up SNS alerts</h3>
-  <p class="desc">Alerts fire on transitions, not on every check.</p>
-  <pre># 1. Create an SNS topic
-aws sns create-topic --name uptime-alerts --region us-east-1
+  <div class="doc-grid">
+    <div class="doc-card">
+      <div class="doc-kicker">Authentication</div>
+      <h3 style="margin-top:0">Password-only vs Cognito</h3>
+      <div class="doc-columns">
+        <div>
+          <div class="doc-subtitle">Password-only</div>
+          <ul class="doc-list">
+            <li>Fastest setup and easiest to bootstrap.</li>
+            <li>Good for a very small trusted team.</li>
+            <li>Shared secret means weaker accountability.</li>
+            <li>Should usually be paired with `AdminAllowedIpCidrs`.</li>
+          </ul>
+        </div>
+        <div>
+          <div class="doc-subtitle">Cognito</div>
+          <ul class="doc-list">
+            <li>Per-user identities, password policy, and MFA support.</li>
+            <li>Better for auditability and operator separation.</li>
+            <li>More moving parts: user setup, MFA enrollment, and IAM calls from the management Lambda.</li>
+            <li>For this project, Cognito is the better long-term admin story.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="doc-note">
+        If you use Cognito, keep the old admin token hidden behind the emergency sign-in path only. It is useful for recovery, but it should not be the default operator path once Cognito is working.
+      </div>
+    </div>
 
-# 2. Subscribe your email
+    <div class="doc-card">
+      <div class="doc-kicker">Hardening</div>
+      <h3 style="margin-top:0">IP restrictions and network policy</h3>
+      <ul class="doc-list">
+        <li>`AdminAllowedIpCidrs` protects `/admin` and `/api/*` without affecting the public status page.</li>
+        <li>Use it when the operator IP range is stable, especially if you are still on password-only auth.</li>
+        <li>When using Cognito, IP allowlisting is still a good extra control for office/VPN traffic.</li>
+      </ul>
+      <pre>AdminAllowedIpCidrs=203.0.113.10/32,198.51.100.0/24</pre>
+      <div class="doc-note">
+        If your operators work from multiple networks, consider allowing only trusted VPN or office CIDRs rather than broad home ISP ranges.
+      </div>
+    </div>
+
+    <div class="doc-card">
+      <div class="doc-kicker">Monitoring Model</div>
+      <h3 style="margin-top:0">What the workers actually do</h3>
+      <ul class="doc-list">
+        <li>The management Lambda runs on a shared one-minute heartbeat.</li>
+        <li>It invokes every deployed worker region that is due for the selected monitor tiers.</li>
+        <li>Hosts do not create their own Lambda schedules. They choose from shared tiers like 60s or 300s.</li>
+        <li>HTTP checks verify status code, latency, and SSL expiry for HTTPS. TCP checks only verify socket reachability.</li>
+      </ul>
+    </div>
+
+    <div class="doc-card">
+      <div class="doc-kicker">Corporate Networks</div>
+      <h3 style="margin-top:0">Split tunnel and firewall notes</h3>
+      <ul class="doc-list">
+        <li>If operators use a split-tunnel VPN, make sure the browser can still resolve and reach the admin endpoint they use: custom status/admin domain, CloudFront domain, or raw `*.lambda-url.{HOME_REGION}.on.aws` host.</li>
+        <li>If you use Cognito, also allow the Cognito domain and login flows to pass through the user firewall path. That includes the managed domain under `*.auth.{HOME_REGION}.amazoncognito.com` if you enabled it.</li>
+        <li>DNS failures can look like a broken admin app even when Lambda itself is healthy. Check local DNS resolution first before debugging the stack.</li>
+      </ul>
+      <pre># Useful local checks on the operator machine
+nslookup your-admin-domain.example.com
+nslookup my-uptime-admin.auth.{HOME_REGION}.amazoncognito.com
+curl -I https://your-admin-domain.example.com/admin</pre>
+    </div>
+  </div>
+
+  <div class="doc-grid" style="margin-top:16px">
+    <div class="doc-card">
+      <div class="doc-kicker">Admin Scripts</div>
+      <h3 style="margin-top:0">Common operator actions</h3>
+      <div class="doc-subtitle">Deploy new management code</div>
+      <pre>./scripts/deploy-new-version.sh {HOME_REGION}</pre>
+      <div class="doc-subtitle" style="margin-top:12px">Publish artifacts only</div>
+      <pre>./scripts/publish-artifacts.sh</pre>
+      <div class="doc-subtitle" style="margin-top:12px">Enable or disable read-only mode</div>
+      <pre>./scripts/set-management-readonly.sh enable {HOME_REGION}
+./scripts/set-management-readonly.sh disable {HOME_REGION}</pre>
+      <div class="doc-subtitle" style="margin-top:12px">Prepare a Cognito CloudFormation command</div>
+      <pre>./scripts/prepare-cognito-cf.sh {HOME_REGION} uptime my-uptime-admin maimons.dev OPTIONAL 203.0.113.10/32</pre>
+      <div class="doc-subtitle" style="margin-top:12px">Create a Cognito admin user</div>
+      <pre>./scripts/create-cognito-admin-user.sh {HOME_REGION} uptime you@maimons.dev 'StrongTempPass123!'</pre>
+    </div>
+
+    <div class="doc-card">
+      <div class="doc-kicker">Operational Notes</div>
+      <h3 style="margin-top:0">Useful one-off tasks</h3>
+      <div class="doc-subtitle">Set up SNS alerts</div>
+      <pre>aws sns create-topic --name uptime-alerts --region {HOME_REGION}
 aws sns subscribe \\
-  --topic-arn arn:aws:sns:us-east-1:ACCOUNT_ID:uptime-alerts \\
+  --topic-arn arn:aws:sns:{HOME_REGION}:ACCOUNT_ID:uptime-alerts \\
   --protocol email \\
   --notification-endpoint you@example.com</pre>
-
-  <h3>Custom domain / DNS</h3>
-  <p class="desc">
-    A direct DNS CNAME to a Lambda Function URL is usually not the cleanest production setup.
-    The recommended route is CloudFront + ACM + your own DNS record. If you want, we can add that setup next.
-  </p>
-
-  <h3>Rotating the admin key</h3>
-  <pre>NEW_KEY=$(openssl rand -hex 20)
+      <div class="doc-subtitle" style="margin-top:12px">Rotate the emergency admin key</div>
+      <pre>NEW_KEY=$(openssl rand -hex 20)
 aws secretsmanager put-secret-value \\
   --secret-id uptime/admin-key \\
   --secret-string "$NEW_KEY" \\
-  --region {HOME_REGION}
-echo "New key: $NEW_KEY"</pre>
-
-  <h3>Backing up check history</h3>
-  <pre>aws dynamodb create-backup \\
+  --region {HOME_REGION}</pre>
+      <div class="doc-subtitle" style="margin-top:12px">Back up check history</div>
+      <pre>aws dynamodb create-backup \\
   --table-name uptime-checks \\
   --backup-name uptime-backup-$(date +%Y%m%d)</pre>
-
-  <h3>Debugging deployed version</h3>
-  <p class="desc">This deployment exposes a tiny version endpoint so you can confirm exactly which management build is live.</p>
-  <pre>GET /api/debug/version
-Authorization: Bearer &lt;admin-token&gt;</pre>
+    </div>
+  </div>
 </div>
 
 </div>
@@ -3733,10 +3863,14 @@ async function loadHosts() {{
 function renderSslCell(host) {{
   const url = (host.url || '').toLowerCase();
   const isHttps = url.startsWith('https://');
-  const days = host.ssl_days_remaining;
   if (!isHttps) return '<span style="color:#64748b">—</span>';
-  if (typeof days === 'number') {{
-    return `<span title="Certificate currently verifies. Days remaining: ${{days}}">✓</span>`;
+  const regionStatuses = Object.values(host.region_statuses || {{}});
+  const sslDays = regionStatuses
+    .map(region => region && typeof region.ssl_days_remaining === 'number' ? region.ssl_days_remaining : null)
+    .filter(days => days != null);
+  if (sslDays.length) {{
+    const minDays = Math.min(...sslDays);
+    return `<span title="Certificate currently verifies. Lowest observed days remaining across workers: ${{minDays}}">✓</span>`;
   }}
   return '<span title="No recent successful SSL verification was recorded.">×</span>';
 }}
