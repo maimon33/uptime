@@ -147,6 +147,22 @@ resource "aws_iam_role_policy" "management" {
         Resource = aws_ssm_parameter.admin_key.arn
       },
       {
+        Sid    = "CognitoAdminAuth"
+        Effect = "Allow"
+        Action = [
+          "cognito-idp:AssociateSoftwareToken",
+          "cognito-idp:ChangePassword",
+          "cognito-idp:DeleteUserAttributes",
+          "cognito-idp:InitiateAuth",
+          "cognito-idp:SetUserMFAPreference",
+          "cognito-idp:RespondToAuthChallenge",
+          "cognito-idp:GetUser",
+          "cognito-idp:UpdateUserAttributes",
+          "cognito-idp:VerifySoftwareToken",
+        ]
+        Resource = "*"
+      },
+      {
         Sid      = "Alerts"
         Effect   = "Allow"
         Action   = ["sns:Publish"]

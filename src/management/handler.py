@@ -11,6 +11,9 @@ Routes (public):
 
 API (admin key required):
   GET              /api/auth
+  GET/POST         /api/account
+  POST             /api/cognito/login
+  POST             /api/cognito/respond
   GET/POST         /api/hosts
   GET/PUT/DELETE   /api/hosts/:id
   GET              /api/hosts/:id/checks
@@ -35,9 +38,10 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import boto3
+from botocore.exceptions import ClientError
 
 import regions as reg
 
@@ -52,6 +56,7 @@ _cloudfront = None
 _route53 = None
 _dynamodb_client = None
 _cloudwatch = {}
+_cognito_idp = None
 
 def _db():
     global _dynamodb
@@ -123,6 +128,13 @@ def _cloudwatch_client(region_name: str):
         _cloudwatch[region_name] = client
     return client
 
+
+def _cognito_idp_client():
+    global _cognito_idp
+    if _cognito_idp is None:
+        _cognito_idp = boto3.client("cognito-idp", region_name=HOME_REGION)
+    return _cognito_idp
+
 # ── Config ────────────────────────────────────────────────────────────────────
 HOSTS_TABLE     = os.environ["HOSTS_TABLE"]
 CHECKS_TABLE    = os.environ["CHECKS_TABLE"]
@@ -132,6 +144,11 @@ HOME_REGION     = os.environ.get("HOME_REGION", os.environ.get("AWS_REGION", "us
 RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "90"))
 READ_ONLY_MODE  = str(os.environ.get("READ_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
 ADMIN_ALLOWED_IP_CIDRS = [cidr.strip() for cidr in os.environ.get("ADMIN_ALLOWED_IP_CIDRS", "").split(",") if cidr.strip()]
+ADMIN_AUTH_MODE = (os.environ.get("ADMIN_AUTH_MODE", "password") or "password").strip().lower()
+COGNITO_USER_POOL_ID = (os.environ.get("COGNITO_USER_POOL_ID", "") or "").strip()
+COGNITO_USER_POOL_CLIENT_ID = (os.environ.get("COGNITO_USER_POOL_CLIENT_ID", "") or "").strip()
+COGNITO_USER_POOL_DOMAIN = (os.environ.get("COGNITO_USER_POOL_DOMAIN", "") or "").strip()
+COGNITO_ALLOWED_EMAIL_DOMAIN = (os.environ.get("COGNITO_ALLOWED_EMAIL_DOMAIN", "") or "").strip().lower()
 DEFAULT_MONITOR_TIERS = [60, 300]
 RECOMMENDED_MONITOR_TIERS = [60, 300, 900, 3600]
 
@@ -178,6 +195,7 @@ _SETTINGS_DEFAULTS = {
 
 _cached_admin_key = None
 _build_info_cache = None
+_cognito_access_token_cache = {}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -212,10 +230,14 @@ def handler(event, context):
             if not _admin_ip_allowed(event):
                 _log("warn", "api_ip_blocked", method=method, path=path, client_ip=_client_ip(event), allowed_cidrs=ADMIN_ALLOWED_IP_CIDRS)
                 return _json(403, {"error": "Admin access from this IP is not allowed."})
+            if _is_public_api_path(method, path):
+                response = _route_api(method, path, event)
+                _log("info", "api_public_request_completed", method=method, path=path, status_code=response.get("statusCode"))
+                return response
             authed = _auth(event)
             if not authed:
                 _log("warn", "api_request_unauthorized", method=method, path=path)
-                return _json(401, {"error": "Unauthorized. Sign in at /admin or send Authorization: Bearer <key>"})
+                return _json(401, {"error": "Unauthorized. Sign in at /admin or send a valid admin token."})
             response = _route_api(method, path, event)
             _log("info", "api_request_completed", method=method, path=path, status_code=response.get("statusCode"))
             return response
@@ -247,6 +269,10 @@ def _is_read_only() -> bool:
     return READ_ONLY_MODE
 
 
+def _is_cognito_enabled() -> bool:
+    return ADMIN_AUTH_MODE == "cognito" and bool(COGNITO_USER_POOL_ID and COGNITO_USER_POOL_CLIENT_ID)
+
+
 def _build_info() -> dict:
     global _build_info_cache
     if _build_info_cache is None:
@@ -256,6 +282,12 @@ def _build_info() -> dict:
             "region": HOME_REGION,
             "function_name": os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "uptime-management"),
             "read_only_mode": _is_read_only(),
+            "admin_auth_mode": ADMIN_AUTH_MODE,
+            "cognito_enabled": _is_cognito_enabled(),
+            "cognito_user_pool_id": COGNITO_USER_POOL_ID,
+            "cognito_user_pool_client_id": COGNITO_USER_POOL_CLIENT_ID,
+            "cognito_user_pool_domain": COGNITO_USER_POOL_DOMAIN,
+            "cognito_allowed_email_domain": COGNITO_ALLOWED_EMAIL_DOMAIN,
         }
         try:
             path = Path(__file__).with_name("_build_info.json")
@@ -426,20 +458,403 @@ def _get_admin_key() -> str:
             raise RuntimeError("Missing ADMIN_KEY_SECRET or ADMIN_KEY_PARAM environment variable")
     return _cached_admin_key
 
-def _auth(event: dict) -> bool:
+
+def _extract_bearer_token(event: dict) -> str:
     headers = event.get("headers") or {}
-    auth    = headers.get("authorization") or headers.get("Authorization") or ""
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
     if auth.lower().startswith("bearer "):
-        token = auth[7:]
-    else:
-        qs    = event.get("rawQueryString") or ""
-        token = parse_qs(qs).get("key", [""])[0]
+        return auth[7:].strip()
+    qs = event.get("rawQueryString") or ""
+    return (parse_qs(qs).get("key", [""])[0] or "").strip()
+
+
+def _matches_admin_key(token: str) -> bool:
     if not token:
-        _log("warn", "auth_missing_token")
         return False
-    ok = hmac.compare_digest(token.strip(), _get_admin_key().strip())
-    _log("info" if ok else "warn", "auth_checked", ok=ok, token_length=len(token.strip()))
-    return ok
+    try:
+        return hmac.compare_digest(token, _get_admin_key().strip())
+    except Exception as exc:
+        _log("warn", "admin_key_match_failed", error=str(exc))
+        return False
+
+
+def _cache_cognito_identity(token: str, username: str, attrs: dict, ttl_seconds: int = 240) -> None:
+    if token:
+        _cognito_access_token_cache[token] = {
+            "username": username,
+            "attributes": attrs,
+            "expires_at": time.time() + ttl_seconds,
+        }
+
+
+def _get_cached_cognito_identity(token: str) -> dict | None:
+    entry = _cognito_access_token_cache.get(token)
+    if not entry:
+        return None
+    if entry["expires_at"] <= time.time():
+        _cognito_access_token_cache.pop(token, None)
+        return None
+    return entry
+
+
+def _email_domain_allowed(email: str) -> bool:
+    if not COGNITO_ALLOWED_EMAIL_DOMAIN:
+        return True
+    domain = (email or "").split("@")[-1].strip().lower()
+    return bool(domain) and domain == COGNITO_ALLOWED_EMAIL_DOMAIN
+
+
+def _cognito_identity_from_access_token(token: str, *, use_cache: bool = True) -> tuple[bool, dict]:
+    if not token or not _is_cognito_enabled():
+        return False, {}
+    if use_cache:
+        cached = _get_cached_cognito_identity(token)
+        if cached:
+            return True, cached
+    try:
+        response = _cognito_idp_client().get_user(AccessToken=token)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_get_user_failed", error_code=code)
+        return False, {}
+    attrs = {item.get("Name"): item.get("Value", "") for item in response.get("UserAttributes", [])}
+    email = attrs.get("email", "")
+    if not _email_domain_allowed(email):
+        _log("warn", "cognito_email_domain_rejected", email=email, allowed_domain=COGNITO_ALLOWED_EMAIL_DOMAIN)
+        return False, {}
+    identity = {"username": response.get("Username", ""), "attributes": attrs}
+    _cache_cognito_identity(token, identity["username"], identity["attributes"])
+    return True, identity
+
+
+def _auth_context(event: dict) -> dict:
+    token = _extract_bearer_token(event)
+    if not token:
+        return {"ok": False, "mode": "missing", "token": ""}
+    admin_ok = _matches_admin_key(token)
+    if admin_ok:
+        return {"ok": True, "mode": "admin_key", "token": token, "identity": {}}
+    if _is_cognito_enabled():
+        cognito_ok, identity = _cognito_identity_from_access_token(token)
+        if cognito_ok:
+            return {"ok": True, "mode": "cognito", "token": token, "identity": identity}
+    return {"ok": False, "mode": "unknown", "token": token, "identity": {}}
+
+
+def _auth(event: dict) -> bool:
+    ctx = _auth_context(event)
+    if not ctx["ok"]:
+        if ctx["mode"] == "missing":
+            _log("warn", "auth_missing_token")
+        else:
+            _log("warn", "auth_checked", ok=False, mode=ctx["mode"], token_length=len(ctx.get("token", "")))
+        return False
+    _log("info", "auth_checked", ok=True, mode=ctx["mode"], username=(ctx.get("identity") or {}).get("username"), token_length=len(ctx.get("token", "")))
+    return True
+
+
+def _is_public_api_path(method: str, path: str) -> bool:
+    return method == "POST" and path in {"/api/cognito/login", "/api/cognito/respond"}
+
+
+def _cognito_auth_response(payload: dict) -> dict:
+    result = payload.get("AuthenticationResult") or {}
+    if result.get("AccessToken"):
+        token = result["AccessToken"]
+        ok, identity = _cognito_identity_from_access_token(token, use_cache=False)
+        if not ok:
+            return _json(403, {"error": "This Cognito account is not allowed to access the admin UI."})
+        return _json(200, {
+            "ok": True,
+            "mode": "cognito",
+            "access_token": token,
+            "expires_in": result.get("ExpiresIn", 3600),
+            "username": identity.get("username", ""),
+        })
+    challenge_name = payload.get("ChallengeName", "")
+    challenge_parameters = payload.get("ChallengeParameters") or {}
+    challenge_map = {
+        "SOFTWARE_TOKEN_MFA": "SOFTWARE_TOKEN_MFA",
+        "SMS_MFA": "SMS_MFA",
+        "NEW_PASSWORD_REQUIRED": "NEW_PASSWORD_REQUIRED",
+        "MFA_SETUP": "MFA_SETUP",
+    }
+    if challenge_name in challenge_map:
+        return _json(200, {
+            "ok": False,
+            "mode": "cognito",
+            "challenge": challenge_map[challenge_name],
+            "session": payload.get("Session", ""),
+            "challenge_parameters": challenge_parameters,
+        })
+    return _json(400, {"error": f"Unsupported Cognito challenge: {challenge_name or 'unknown'}"})
+
+
+def _cognito_login(body: dict) -> dict:
+    if not _is_cognito_enabled():
+        return _json(400, {"error": "Cognito admin authentication is not enabled for this deployment."})
+    username = (body.get("username") or body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not username or not password:
+        return _json(400, {"error": "Email/username and password are required."})
+    try:
+        response = _cognito_idp_client().initiate_auth(
+            ClientId=COGNITO_USER_POOL_CLIENT_ID,
+            AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": username, "PASSWORD": password},
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_login_failed", error_code=code, username=username)
+        if code in {"NotAuthorizedException", "UserNotFoundException"}:
+            return _json(401, {"error": "Invalid Cognito credentials."})
+        if code == "PasswordResetRequiredException":
+            return _json(401, {"error": "Password reset required for this Cognito user."})
+        return _json(400, {"error": f"Cognito login failed: {code}"})
+    _log("info", "cognito_login_started", username=username, challenge=response.get("ChallengeName"))
+    return _cognito_auth_response(response)
+
+
+def _cognito_respond(body: dict) -> dict:
+    if not _is_cognito_enabled():
+        return _json(400, {"error": "Cognito admin authentication is not enabled for this deployment."})
+    challenge = (body.get("challenge") or "").strip()
+    session = (body.get("session") or "").strip()
+    username = (body.get("username") or body.get("email") or "").strip()
+    if not challenge or not session or not username:
+        return _json(400, {"error": "Challenge, session, and username are required."})
+    challenge_responses = {"USERNAME": username}
+    if challenge == "SOFTWARE_TOKEN_MFA":
+        code = (body.get("code") or body.get("mfa_code") or "").strip()
+        if not code:
+            return _json(400, {"error": "Enter the authenticator code."})
+        challenge_responses["SOFTWARE_TOKEN_MFA_CODE"] = code
+    elif challenge == "SMS_MFA":
+        code = (body.get("code") or "").strip()
+        if not code:
+            return _json(400, {"error": "Enter the MFA code."})
+        challenge_responses["SMS_MFA_CODE"] = code
+    elif challenge == "NEW_PASSWORD_REQUIRED":
+        new_password = body.get("new_password") or ""
+        if not new_password:
+            return _json(400, {"error": "Enter a new password to complete sign-in."})
+        challenge_responses["NEW_PASSWORD"] = new_password
+    else:
+        return _json(400, {"error": f"Unsupported Cognito challenge: {challenge}"})
+    try:
+        response = _cognito_idp_client().respond_to_auth_challenge(
+            ClientId=COGNITO_USER_POOL_CLIENT_ID,
+            ChallengeName=challenge,
+            Session=session,
+            ChallengeResponses=challenge_responses,
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_challenge_failed", error_code=code, username=username, challenge=challenge)
+        if code == "CodeMismatchException":
+            return _json(401, {"error": "That MFA code was not accepted."})
+        if code == "ExpiredCodeException":
+            return _json(401, {"error": "That MFA code expired. Start sign-in again."})
+        if code == "InvalidPasswordException":
+            return _json(400, {"error": "The new password does not meet the pool policy."})
+        return _json(400, {"error": f"Cognito challenge failed: {code}"})
+    _log("info", "cognito_challenge_completed", username=username, challenge=challenge, next_challenge=response.get("ChallengeName"))
+    return _cognito_auth_response(response)
+
+
+def _require_cognito_account_context(event: dict) -> tuple[dict | None, dict | None]:
+    if not _is_cognito_enabled():
+        return None, _json(400, {"error": "Cognito admin authentication is not enabled for this deployment."})
+    ctx = _auth_context(event)
+    if not ctx.get("ok"):
+        return None, _json(401, {"error": "Sign in to continue."})
+    if ctx.get("mode") != "cognito":
+        return None, _json(400, {"error": "Account details are available only when you are signed in with Cognito. Sign out and use Cognito instead of the emergency admin token."})
+    return ctx, None
+
+
+def _cognito_user_payload(identity: dict) -> dict:
+    attrs = identity.get("attributes") or {}
+    return {
+        "mode": "cognito",
+        "username": identity.get("username", ""),
+        "email": attrs.get("email", ""),
+        "email_verified": attrs.get("email_verified", "").lower() == "true",
+        "phone_number": attrs.get("phone_number", ""),
+        "phone_verified": attrs.get("phone_number_verified", "").lower() == "true",
+        "preferred_mfa": identity.get("preferred_mfa_setting") or "",
+        "mfa_methods": identity.get("user_mfa_settings") or [],
+        "allowed_email_domain": COGNITO_ALLOWED_EMAIL_DOMAIN,
+    }
+
+
+def _get_account(event: dict) -> dict:
+    if not _is_cognito_enabled():
+        return _json(200, {
+            "mode": "password",
+            "note": "This deployment is using the shared admin token flow, so there is no per-user Cognito account profile to manage here.",
+        })
+    ctx = _auth_context(event)
+    if not ctx.get("ok"):
+        return _json(401, {"error": "Sign in to continue."})
+    if ctx.get("mode") != "cognito":
+        return _json(200, {
+            "mode": "admin_key",
+            "note": "You are using the emergency admin token. Sign out and sign back in with Cognito to manage your own account profile, password, and MFA.",
+        })
+    ok, identity = _cognito_identity_from_access_token(ctx["token"], use_cache=False)
+    if not ok:
+        return _json(401, {"error": "Your Cognito session expired. Sign in again."})
+    identity["preferred_mfa_setting"] = identity["attributes"].get("preferredMfaSetting", identity.get("preferred_mfa_setting", ""))
+    try:
+        user_response = _cognito_idp_client().get_user(AccessToken=ctx["token"])
+        identity["preferred_mfa_setting"] = user_response.get("PreferredMfaSetting", "")
+        identity["user_mfa_settings"] = user_response.get("UserMFASettingList", [])
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_account_get_user_failed", error_code=code)
+        identity["preferred_mfa_setting"] = ""
+        identity["user_mfa_settings"] = []
+    return _json(200, _cognito_user_payload(identity))
+
+
+def _run_account_action(body: dict, event: dict) -> dict:
+    action = (body.get("action") or "").strip()
+    if action == "update_profile":
+        return _account_update_profile(body, event)
+    if action == "change_password":
+        return _account_change_password(body, event)
+    if action == "begin_totp":
+        return _account_begin_totp(event)
+    if action == "verify_totp":
+        return _account_verify_totp(body, event)
+    if action == "disable_totp":
+        return _account_disable_totp(event)
+    return _json(400, {"error": "Unknown account action."})
+
+
+def _account_update_profile(body: dict, event: dict) -> dict:
+    ctx, error = _require_cognito_account_context(event)
+    if error:
+        return error
+    email = (body.get("email") or "").strip()
+    phone = (body.get("phone_number") or "").strip()
+    attrs = []
+    if email:
+        if not _email_domain_allowed(email):
+            return _json(400, {"error": f"Email must match @{COGNITO_ALLOWED_EMAIL_DOMAIN}."})
+        attrs.append({"Name": "email", "Value": email})
+    if phone:
+        attrs.append({"Name": "phone_number", "Value": phone})
+    try:
+        if attrs:
+            _cognito_idp_client().update_user_attributes(AccessToken=ctx["token"], UserAttributes=attrs)
+        delete_attrs = []
+        if phone == "":
+            delete_attrs.append("phone_number")
+            delete_attrs.append("phone_number_verified")
+        if delete_attrs:
+            _cognito_idp_client().delete_user_attributes(AccessToken=ctx["token"], UserAttributeNames=delete_attrs)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_account_update_profile_failed", error_code=code)
+        return _json(400, {"error": f"Profile update failed: {code}"})
+    _cognito_access_token_cache.pop(ctx["token"], None)
+    return _get_account(event)
+
+
+def _account_change_password(body: dict, event: dict) -> dict:
+    ctx, error = _require_cognito_account_context(event)
+    if error:
+        return error
+    current_password = body.get("current_password") or ""
+    new_password = body.get("new_password") or ""
+    if not current_password or not new_password:
+        return _json(400, {"error": "Current password and new password are required."})
+    try:
+        _cognito_idp_client().change_password(
+            AccessToken=ctx["token"],
+            PreviousPassword=current_password,
+            ProposedPassword=new_password,
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_account_change_password_failed", error_code=code)
+        if code == "NotAuthorizedException":
+            return _json(401, {"error": "Current password was not accepted."})
+        if code == "InvalidPasswordException":
+            return _json(400, {"error": "The new password does not meet the Cognito password policy."})
+        return _json(400, {"error": f"Password change failed: {code}"})
+    return _json(200, {"ok": True, "message": "Password updated."})
+
+
+def _account_begin_totp(event: dict) -> dict:
+    ctx, error = _require_cognito_account_context(event)
+    if error:
+        return error
+    identity = ctx.get("identity") or {}
+    issuer = (_SETTINGS_DEFAULTS.get("status_page_brand_name") or "Uptime").strip() or "Uptime"
+    label = identity.get("attributes", {}).get("email") or identity.get("username", "admin")
+    try:
+        response = _cognito_idp_client().associate_software_token(AccessToken=ctx["token"])
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_account_begin_totp_failed", error_code=code)
+        return _json(400, {"error": f"Unable to start authenticator setup: {code}"})
+    secret_code = response.get("SecretCode", "")
+    otpauth_uri = f"otpauth://totp/{quote(issuer)}:{quote(label)}?secret={secret_code}&issuer={quote(issuer)}"
+    return _json(200, {
+        "ok": True,
+        "secret_code": secret_code,
+        "otpauth_uri": otpauth_uri,
+        "label": label,
+        "issuer": issuer,
+    })
+
+
+def _account_verify_totp(body: dict, event: dict) -> dict:
+    ctx, error = _require_cognito_account_context(event)
+    if error:
+        return error
+    code = (body.get("code") or "").strip()
+    preferred = bool(body.get("preferred", True))
+    if not code:
+        return _json(400, {"error": "Enter the 6-digit authenticator code."})
+    try:
+        verify = _cognito_idp_client().verify_software_token(
+            AccessToken=ctx["token"],
+            UserCode=code,
+            FriendlyDeviceName=(body.get("device_name") or "Authenticator").strip() or "Authenticator",
+        )
+        if verify.get("Status") != "SUCCESS":
+            return _json(400, {"error": "Authenticator verification was not accepted."})
+        _cognito_idp_client().set_user_mfa_preference(
+            AccessToken=ctx["token"],
+            SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": preferred},
+        )
+    except ClientError as exc:
+        code_name = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_account_verify_totp_failed", error_code=code_name)
+        if code_name in {"CodeMismatchException", "EnableSoftwareTokenMFAException"}:
+            return _json(400, {"error": "That authenticator code was not accepted. Double-check the secret and current 6-digit code."})
+        return _json(400, {"error": f"Authenticator setup failed: {code_name}"})
+    return _get_account(event)
+
+
+def _account_disable_totp(event: dict) -> dict:
+    ctx, error = _require_cognito_account_context(event)
+    if error:
+        return error
+    try:
+        _cognito_idp_client().set_user_mfa_preference(
+            AccessToken=ctx["token"],
+            SoftwareTokenMfaSettings={"Enabled": False, "PreferredMfa": False},
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        _log("warn", "cognito_account_disable_totp_failed", error_code=code)
+        return _json(400, {"error": f"Unable to disable authenticator MFA: {code}"})
+    return _get_account(event)
 
 
 # ── API router ────────────────────────────────────────────────────────────────
@@ -473,7 +888,19 @@ def _route_api(method: str, path: str, event: dict) -> dict:
     # ── /api/settings ─────────────────────────────────────────────────────────
     if resource == "auth":
         if method == "GET":
-            return _json(200, {"ok": True})
+            return _json(200, {"ok": True, "mode": "cognito" if _is_cognito_enabled() else "password"})
+
+    if resource == "account":
+        if method == "GET":
+            return _get_account(event)
+        if method == "POST":
+            return _run_account_action(body, event)
+
+    if resource == "cognito":
+        if method == "POST" and rid == "login":
+            return _cognito_login(body)
+        if method == "POST" and rid == "respond":
+            return _cognito_respond(body)
 
     if resource == "debug" and rid == "version":
         if method == "GET":
@@ -1577,6 +2004,7 @@ def _serve_status_page() -> dict:
     maintenance_scope = settings.get("maintenance_scope", _SETTINGS_DEFAULTS["maintenance_scope"])
 
     host_data = _build_public_host_data(db, _list_public_hosts(), history_limit=300)
+    incident_summary = _build_public_incident_summary(host_data)
     return _html(
         200,
         _render_status_page(
@@ -1586,7 +2014,7 @@ def _serve_status_page() -> dict:
             logo_url,
             theme,
             host_data,
-            events_by_month,
+            incident_summary,
             {
                 "subscribe_intro": subscribe_intro,
                 "subscribe_email_url": subscribe_email_url,
@@ -1599,6 +2027,41 @@ def _serve_status_page() -> dict:
             },
         ),
     )
+
+
+def _build_public_incident_summary(host_data: list[dict]) -> dict:
+    events = []
+    seen = set()
+    for host_entry in host_data:
+        host_meta = host_entry.get("host", {})
+        host_id = host_meta.get("host_id") or ""
+        host_name = host_meta.get("name") or host_id or "Host"
+        for point in host_entry.get("history_points", []):
+            status = point.get("status", "unknown")
+            if status not in {"down", "degraded"}:
+                continue
+            run_id = point.get("run_id") or point.get("checked_at") or ""
+            dedupe_key = (host_id or host_name, run_id, status)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            checked_at = point.get("checked_at") or run_id
+            checked_dt = _parse_aws_timestamp(checked_at) or _parse_aws_timestamp(run_id)
+            events.append({
+                "host_id": host_id,
+                "host_name": host_name,
+                "status": status,
+                "checked_at": checked_at,
+                "sort_key": checked_dt.isoformat() if checked_dt else checked_at,
+            })
+
+    events.sort(key=lambda item: item.get("sort_key", ""), reverse=True)
+    latest = events[0] if events else None
+    return {
+        "count": len(events),
+        "latest": latest,
+        "history_href": "/history",
+    }
 
 
 def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> list[dict]:
@@ -1695,15 +2158,19 @@ def _serve_history_page(event: dict) -> dict:
     query = parse_qs(event.get("rawQueryString") or "")
     selected_host = (query.get("host", ["all"])[0] or "all").strip()
     selected_region = (query.get("region", ["all"])[0] or "all").strip()
+    selected_status = (query.get("status", ["all"])[0] or "all").strip()
 
     history_rows = _collect_public_history_rows(db, hosts)
     regions = sorted({row["region"] for row in history_rows if row.get("region")})
+    statuses = sorted({row["status"] for row in history_rows if row.get("status")})
 
     filtered_rows = history_rows
     if selected_host != "all":
         filtered_rows = [row for row in filtered_rows if row["host_id"] == selected_host]
     if selected_region != "all":
         filtered_rows = [row for row in filtered_rows if row["region"] == selected_region]
+    if selected_status != "all":
+        filtered_rows = [row for row in filtered_rows if row["status"] == selected_status]
 
     return _html(
         200,
@@ -1714,14 +2181,16 @@ def _serve_history_page(event: dict) -> dict:
             theme=theme,
             hosts=hosts,
             regions=regions,
+            statuses=statuses,
             selected_host=selected_host,
             selected_region=selected_region,
+            selected_status=selected_status,
             rows=filtered_rows[:250],
         ),
     )
 
 
-def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, theme: str, host_data: list, events_by_month: list, page_options: dict) -> str:
+def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, theme: str, host_data: list, incident_summary: dict, page_options: dict) -> str:
     overall, ocls = "All systems operational", "operational"
     for h in host_data:
         if h["current_status"] == "down":
@@ -1760,6 +2229,56 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   </div>
   <div class="subscribe-actions">{''.join(subscribe_links)}</div>
 </div>"""
+    maintenance_summary = "1 scheduled window" if page_options.get("maintenance_enabled") and page_options.get("maintenance_message") else "None"
+    maintenance_items = ""
+    if page_options.get("maintenance_enabled") and page_options.get("maintenance_message"):
+        maintenance_meta = []
+        if page_options.get("maintenance_window"):
+            maintenance_meta.append(page_options["maintenance_window"])
+        if page_options.get("maintenance_scope"):
+            maintenance_meta.append(page_options["maintenance_scope"])
+        maintenance_items = f"""<div class="maintenance-list-item">
+  <div class="maintenance-list-copy">{page_options["maintenance_message"]}</div>
+  <div class="maintenance-list-meta">{' · '.join(maintenance_meta) if maintenance_meta else 'Scheduled window details will appear here.'}</div>
+</div>"""
+    else:
+        maintenance_items = '<div class="maintenance-list-empty">None</div>'
+    maintenance_list_block = f"""<details class="maintenance-list">
+  <summary class="section-summary">
+    <span class="section-summary-title">Upcoming maintenance</span>
+    <span class="section-summary-meta">{maintenance_summary}</span>
+  </summary>
+  {maintenance_items}
+</details>"""
+
+    incident_count = int((incident_summary or {}).get("count", 0) or 0)
+    latest_incident = (incident_summary or {}).get("latest") or {}
+    latest_incident_text = ""
+    if latest_incident:
+        latest_incident_text = (
+            f'Latest issue: <strong>{latest_incident.get("host_name", "Host")}</strong> '
+            f'was <strong>{latest_incident.get("status", "unknown")}</strong> at '
+            f'{(latest_incident.get("checked_at") or "").replace("T", " ")[:16]}.'
+        )
+    issue_label = "incident" if incident_count == 1 else "incidents"
+    if incident_count:
+        incident_block = f"""<div class="events-wrap">
+  <div class="section-heading">Past incidents</div>
+  <div class="events-month">
+    <div class="incident-copy">{incident_count} recorded {issue_label} appear in the monitoring history.</div>
+    <div class="incident-meta">{latest_incident_text}</div>
+    <div class="incident-actions"><a class="ghost-link incident-link" href="/history">Review full history</a></div>
+  </div>
+</div>"""
+    else:
+        incident_block = """<div class="events-wrap">
+  <div class="section-heading">Past incidents</div>
+  <div class="events-month">
+    <div class="incident-copy">No recorded degraded or down events yet.</div>
+    <div class="incident-meta">Detailed checks will continue to accumulate in the full history page.</div>
+    <div class="incident-actions"><a class="ghost-link incident-link" href="/history">Open full history</a></div>
+  </div>
+</div>"""
 
     cards = ""
     for h in host_data:
@@ -1776,6 +2295,7 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
             for r in h["region_summary"]
         )
         history_note = "" if h["history_available"] else '<div class="history-note">History appears after checks have been recorded for this host.</div>'
+        host_history_href = f'/history?host={quote(h["host"]["host_id"])}'
         cards += f"""<details class="card svc-card">
   <summary class="svc-summary">
     <div>
@@ -1789,6 +2309,7 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
   <div class="regions">{region_pills or '<span class="pill unknown">No regional data yet</span>'}</div>
+  <div class="svc-actions"><a class="ghost-link svc-history-link" href="{host_history_href}">View full history</a></div>
 </details>"""
 
     if not host_data:
@@ -1851,10 +2372,10 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .events-wrap{{margin-bottom:20px}}
 .section-heading{{font-size:.8rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--soft);margin-bottom:10px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .events-month{{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:14px 18px;margin-bottom:10px;box-shadow:var(--shadow)}}
-.events-list{{display:flex;flex-direction:column;gap:8px;margin-top:12px}}
-.event-item{{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;font-size:.84rem}}
-.event-host{{font-weight:600}}
-.event-time{{color:var(--muted);font-size:.78rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.incident-copy{{font-size:1rem;line-height:1.55;font-weight:600}}
+.incident-meta{{margin-top:8px;color:var(--muted);font-size:.84rem;line-height:1.6}}
+.incident-actions{{margin-top:14px}}
+.incident-link{{padding:9px 13px;font-size:.82rem}}
 .subscribe-actions{{display:flex;flex-wrap:wrap;gap:10px}}
 .subscribe-btn{{display:inline-flex;align-items:center;justify-content:center;padding:11px 15px;border-radius:var(--radius-pill);border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;font-weight:700;white-space:nowrap;transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease}}
 .subscribe-btn:hover{{transform:translateY(-1px);border-color:var(--ring);box-shadow:0 12px 24px rgba(15,23,42,.08)}}
@@ -1878,6 +2399,8 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .b.up{{background:#22c55e}}.b.down{{background:#ef4444}}.b.degraded{{background:#f59e0b}}.b.unknown{{background:#e2e8f0}}
 .bar-lbl{{display:flex;justify-content:space-between;font-size:.72rem;color:var(--soft);margin-top:6px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .regions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
+.svc-actions{{margin-top:12px}}
+.svc-history-link{{padding:8px 12px;font-size:.78rem}}
 .pill{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:12px;font-size:.72rem;font-weight:600;background:#f8fafc;color:#475569;border:1px solid var(--border);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .pill.up{{background:#f0fdf4;color:#166534;border-color:#bbf7d0}}
 .pill.down{{background:#fef2f2;color:#b91c1c;border-color:#fecaca}}
@@ -1903,13 +2426,15 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
     <div class="overall {ocls}"><div class="dot"></div><span>{overall}</span></div>
   </div>
   {maintenance_block}
+  {maintenance_list_block}
+  {incident_block}
   {cards}
   {subscribe_block}
   <footer>Updated {now_str}</footer>
 </div></body></html>"""
 
 
-def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], selected_host: str, selected_region: str, rows: list[dict]) -> str:
+def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], statuses: list[str], selected_host: str, selected_region: str, selected_status: str, rows: list[dict]) -> str:
     theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
     brand = ""
     if brand_name or logo_url:
@@ -1923,6 +2448,10 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
     region_options = ['<option value="all">All workers</option>'] + [
         f'<option value="{region}"{" selected" if selected_region == region else ""}>{region}</option>'
         for region in regions
+    ]
+    status_options = ['<option value="all">All statuses</option>'] + [
+        f'<option value="{status}"{" selected" if selected_status == status else ""}>{status.title()}</option>'
+        for status in statuses
     ]
     row_markup = "".join(
         f"""<tr>
@@ -1963,7 +2492,7 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2rem,
 .hero-actions{{display:flex;gap:10px;flex-wrap:wrap}}
 .ghost-link{{display:inline-flex;align-items:center;justify-content:center;padding:11px 14px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.5);color:var(--text);text-decoration:none;font-weight:700}}
 .panel{{background:var(--hero);border:1px solid var(--hero-border);border-radius:14px;padding:18px 18px 16px;box-shadow:var(--shadow);margin-bottom:16px;backdrop-filter:blur(14px)}}
-.filters{{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end}}
+.filters{{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end}}
 label{{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}}
 select{{width:100%;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;color:var(--text);font-size:.92rem}}
 .filter-btn{{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:12px;border:1px solid var(--border);background:var(--text);color:var(--card);text-decoration:none;font-weight:700}}
@@ -2003,6 +2532,10 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
       <label for="region">Worker region</label>
       <select id="region" name="region">{''.join(region_options)}</select>
     </div>
+    <div>
+      <label for="status">Status</label>
+      <select id="status" name="status">{''.join(status_options)}</select>
+    </div>
     <button class="filter-btn" type="submit">Apply filters</button>
   </form>
   <div class="panel summary">
@@ -2023,6 +2556,13 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
 def _admin_page() -> str:
     # All AWS regions available for monitor deployment
     build = _build_info()
+    cognito_enabled = _is_cognito_enabled()
+    auth_config = {
+        "mode": "cognito" if cognito_enabled else "password",
+        "cognito_enabled": cognito_enabled,
+        "cognito_domain": COGNITO_USER_POOL_DOMAIN,
+        "allowed_email_domain": COGNITO_ALLOWED_EMAIL_DOMAIN,
+    }
     read_only_banner = ""
     if _is_read_only():
         read_only_banner = """<div class="tip" style="margin-bottom:16px;background:#3f1d1d;border-left-color:#ef4444;color:#fecaca">
@@ -2039,6 +2579,58 @@ Read-only mode is enabled. Browsing still works, but all mutating admin actions 
         "sa-east-1","af-south-1","me-south-1","me-central-1","il-central-1","mx-central-1",
     ]
     region_options = "\n".join(f'<option value="{r}">{r}</option>' for r in all_regions)
+    if cognito_enabled:
+        auth_intro = "Sign in with your Cognito operator account. The access token stays only in this browser session."
+        auth_fields = f"""
+    <div class="form-group" style="margin-bottom:10px">
+      <label>Email / Username</label>
+      <input id="auth-username" type="text" autocomplete="username" placeholder="you@{COGNITO_ALLOWED_EMAIL_DOMAIN or 'company.com'}">
+    </div>
+    <div class="form-group" style="margin-bottom:10px">
+      <label>Password</label>
+      <input id="auth-password" type="password" autocomplete="current-password" placeholder="Enter your Cognito password">
+    </div>
+    <div class="form-group" id="auth-new-password-wrap" style="margin-bottom:10px;display:none">
+      <label>New Password</label>
+      <input id="auth-new-password" type="password" autocomplete="new-password" placeholder="Set a new password">
+      <div class="hint">Shown when Cognito requires a first-time password change.</div>
+    </div>
+    <div class="form-group" id="auth-mfa-wrap" style="margin-bottom:10px;display:none">
+      <label>Authenticator Code</label>
+      <input id="auth-mfa" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456">
+      <div class="hint" id="auth-mfa-hint">Shown when Cognito requests MFA.</div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="loginAdmin()">Sign in with Cognito</button>
+      <button class="btn btn-ghost" type="button" onclick="toggleTokenLogin()">Use emergency admin token</button>
+    </div>
+    <div id="auth-token-wrap" style="display:none;margin-top:14px">
+      <div class="form-group" style="margin-bottom:10px">
+        <label>Emergency Admin Token</label>
+        <input id="auth-key" type="password" placeholder="Paste the break-glass admin token">
+        <div class="hint">This keeps the legacy admin-key path available while Cognito is being rolled out.</div>
+      </div>
+      <button class="btn btn-ghost" onclick="loginWithAdminKey()">Unlock with token</button>
+    </div>"""
+        auth_footer = ""
+        if COGNITO_ALLOWED_EMAIL_DOMAIN:
+            auth_footer = f'<p style="margin-top:18px">Only <strong>@{COGNITO_ALLOWED_EMAIL_DOMAIN}</strong> accounts are accepted for admin access.</p>'
+    else:
+        auth_intro = "Enter the admin password/token for this deployment. It stays in this browser session and is sent as a bearer token to the admin API."
+        auth_fields = """
+    <div class="form-group" style="margin-bottom:10px">
+      <label>Admin Password / Token</label>
+      <input id="auth-key" type="password" placeholder="Paste the admin key">
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-primary" onclick="loginAdmin()">Unlock Admin</button>
+    </div>"""
+        auth_footer = f"""<p style="margin-top:18px">If the stack generated the token for you, retrieve it with:</p>
+    <pre>aws secretsmanager get-secret-value \\
+  --secret-id uptime/admin-key \\
+  --query SecretString \\
+  --output text \\
+  --region {HOME_REGION}</pre>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -2062,6 +2654,15 @@ nav{{position:sticky;top:0;z-index:40;background:rgba(11,18,32,.82);backdrop-fil
 .nav-spacer{{margin-left:auto}}
 .tab{{padding:0 16px;height:64px;display:flex;align-items:center;cursor:pointer;font-size:.88rem;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;transition:color .18s ease,border-color .18s ease}}
 .tab.active,.tab:hover{{color:#f8fafc;border-bottom-color:var(--sky)}}
+.menu-wrap{{position:relative;display:flex;align-items:center;height:64px}}
+.menu-btn{{height:40px;padding:0 14px;border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--muted);display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:.85rem;font-weight:600;transition:color .18s ease,border-color .18s ease,transform .16s ease}}
+.menu-btn:hover{{color:#f8fafc;border-color:#4a6288;transform:translateY(-1px)}}
+.menu-panel{{position:absolute;top:54px;right:0;min-width:220px;background:linear-gradient(180deg, rgba(23,34,53,.98), rgba(11,18,32,.98));border:1px solid var(--line);border-radius:18px;padding:8px;box-shadow:0 28px 60px rgba(0,0,0,.34);display:none;z-index:60}}
+.menu-panel.open{{display:block}}
+.menu-item{{display:flex;align-items:center;width:100%;padding:11px 12px;border-radius:12px;background:transparent;border:none;color:var(--text);cursor:pointer;text-align:left;font-size:.85rem;font-weight:600}}
+.menu-item:hover{{background:rgba(255,255,255,.05)}}
+.menu-item.danger{{color:#fecaca}}
+.menu-sep{{height:1px;background:var(--line-soft);margin:6px 0}}
 .main{{max-width:1180px;margin:0 auto;padding:34px 20px 72px}}
 h2{{font-size:1.55rem;font-weight:700;margin-bottom:18px;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.03em}}
 h3{{font-size:1rem;font-weight:600;margin:20px 0 8px;color:#e2e8f0;font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
@@ -2131,35 +2732,31 @@ strong{{color:#f8fafc}}
 </head><body>
 <nav>
   <span class="logo"><span class="logo-mark">UP</span><span>Uptime Control</span><span class="logo-version">v{build.get("version", "unknown")}</span></span>
-  <span class="tab active"  onclick="show('hosts')">Hosts</span>
-  <span class="tab"         onclick="show('regions')">Regions</span>
-  <span class="tab"         onclick="show('status-page')">Status Page</span>
-  <span class="tab"         onclick="show('notifications')">Notifications</span>
-  <span class="tab"         onclick="show('management')">Management</span>
-  <span class="tab"         onclick="show('settings')">Settings</span>
-  <span class="tab"         onclick="show('cost')">Cost</span>
-  <span class="tab"         onclick="show('guides')">Guides</span>
+  <span class="tab active" data-tab="hosts" onclick="show('hosts')">Hosts</span>
+  <span class="tab" data-tab="regions" onclick="show('regions')">Regions</span>
+  <span class="tab" data-tab="status-page" onclick="show('status-page')">Status Page</span>
+  <span class="tab" data-tab="notifications" onclick="show('notifications')">Notifications</span>
+  <span class="tab" data-tab="management" onclick="show('management')">Management</span>
+  <span class="tab" data-tab="cost" onclick="show('cost')">Cost</span>
   <span class="nav-spacer"></span>
-  <button class="btn btn-ghost btn-sm" onclick="logoutAdmin()">Sign out</button>
+  <div class="menu-wrap">
+    <button class="menu-btn" id="more-menu-btn" type="button" onclick="toggleMoreMenu()">More ▾</button>
+    <div class="menu-panel" id="more-menu">
+      <button class="menu-item" type="button" onclick="openMenuTab('account')">Account</button>
+      <button class="menu-item" type="button" onclick="openMenuTab('settings')">Global Settings</button>
+      <button class="menu-item" type="button" onclick="openMenuTab('guides')">Docs</button>
+      <div class="menu-sep"></div>
+      <button class="menu-item danger" type="button" onclick="logoutAdmin()">Sign out</button>
+    </div>
+  </div>
 </nav>
 <div class="auth-gate" id="auth-gate">
   <div class="auth-card">
     <h1>Admin access</h1>
-    <p>Enter the admin password/token for this deployment. It stays in this browser session and is sent as a bearer token to the admin API.</p>
-    <div class="form-group" style="margin-bottom:10px">
-      <label>Admin Password / Token</label>
-      <input id="auth-key" type="password" placeholder="Paste the admin key">
-    </div>
-    <div style="display:flex;gap:10px">
-      <button class="btn btn-primary" onclick="loginAdmin()">Unlock Admin</button>
-    </div>
+    <p>{auth_intro}</p>
+    {auth_fields}
     <div class="auth-msg" id="auth-msg"></div>
-    <p style="margin-top:18px">If the stack generated the token for you, retrieve it with:</p>
-    <pre>aws secretsmanager get-secret-value \\
-  --secret-id uptime/admin-key \\
-  --query SecretString \\
-  --output text \\
-  --region {HOME_REGION}</pre>
+    {auth_footer}
   </div>
 </div>
 <div class="main">
@@ -2174,10 +2771,10 @@ strong{{color:#f8fafc}}
   <table>
     <thead><tr>
       <th>Name</th><th>URL</th><th>Type</th><th>Status</th>
-      <th>Uptime</th><th>Latency</th><th>Page</th><th>Alert</th><th></th>
+      <th>Uptime</th><th>Latency</th><th>SSL</th><th>Page</th><th>Alert</th><th></th>
     </tr></thead>
     <tbody id="hosts-body">
-      <tr><td colspan="9" style="text-align:center;color:#64748b;padding:32px">Loading…</td></tr>
+      <tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">Loading…</td></tr>
     </tbody>
   </table>
 </div>
@@ -2373,6 +2970,80 @@ strong{{color:#f8fafc}}
       Current behavior: transition alerts are already sent via each host's configured SNS topic. Delay, reminder cadence, quiet hours, sleep, and maintenance muting are stored here for the next alerting pass, but are not fully enforced by the backend yet.
     </div>
     <button class="btn btn-primary" onclick="saveNotificationSettings()">Save Notification Settings</button>
+  </div>
+</div>
+
+<div id="pane-account" style="display:none">
+  <h2>Account</h2>
+  <p class="desc">
+    Review the current signed-in operator, update contact details, change your password, and manage authenticator MFA.
+  </p>
+  <div class="panel">
+    <div id="account-summary" style="color:#94a3b8">Loading…</div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Profile</h3>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Email</label>
+        <input id="acct-email" type="email" placeholder="you@example.com">
+        <div class="hint">If an allowed email domain is configured, the updated email must still match it.</div>
+      </div>
+      <div class="form-group">
+        <label>Phone Number</label>
+        <input id="acct-phone" placeholder="+15551234567">
+        <div class="hint">Use E.164 format for the best Cognito compatibility. Leave blank to remove the phone number.</div>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="saveAccountProfile()">Save Profile</button>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Password</h3>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Current Password</label>
+        <input id="acct-current-password" type="password" autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label>New Password</label>
+        <input id="acct-new-password" type="password" autocomplete="new-password">
+        <div class="hint">Cognito currently requires at least 14 characters, plus uppercase, lowercase, number, and symbol.</div>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="changeAccountPassword()">Change Password</button>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Authenticator MFA</h3>
+    <div id="acct-mfa-summary" class="hint" style="margin-bottom:12px">Loading MFA status…</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <button class="btn btn-primary" onclick="beginTotpSetup()">Set Up Authenticator</button>
+      <button class="btn btn-ghost" onclick="disableTotp()">Disable Authenticator</button>
+    </div>
+    <div id="acct-totp-setup" style="display:none">
+      <div class="form-group">
+        <label>Authenticator Secret</label>
+        <input id="acct-totp-secret" readonly>
+      </div>
+      <div class="form-group">
+        <label>OTPAuth URI</label>
+        <textarea id="acct-totp-uri" rows="3" readonly></textarea>
+        <div class="hint">Paste the secret into your authenticator app manually, or use the full URI in a QR-code tool if you prefer.</div>
+      </div>
+      <div class="grid2">
+        <div class="form-group">
+          <label>Authenticator Code</label>
+          <input id="acct-totp-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456">
+        </div>
+        <div class="form-group">
+          <label>Preferred MFA</label>
+          <select id="acct-totp-preferred">
+            <option value="true" selected>Yes</option>
+            <option value="false">No</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="verifyTotp()">Verify Authenticator</button>
+    </div>
   </div>
 </div>
 
@@ -2610,7 +3281,13 @@ Authorization: Bearer &lt;admin-token&gt;</pre>
 <div class="toast hidden" id="toast"></div>
 
 <script>
+const AUTH_CONFIG = {json.dumps(auth_config)};
 let KEY = sessionStorage.getItem('uptime_admin_key') || '';
+let COGNITO_TOKEN = sessionStorage.getItem('uptime_admin_cognito_access_token') || '';
+let COGNITO_CHALLENGE = '';
+let COGNITO_SESSION = '';
+let COGNITO_USERNAME = '';
+let ACCOUNT_CACHE = null;
 const queryKey = new URLSearchParams(location.search).get('key') || '';
 let REGIONS_CACHE = [];
 let HOSTS_CACHE = [];
@@ -2622,9 +3299,10 @@ if (queryKey) {{
 }}
 
 function api(path, opts={{}}) {{
+  const authToken = COGNITO_TOKEN || KEY;
   return fetch(path, {{
     ...opts,
-    headers: {{ Authorization: 'Bearer ' + KEY, 'Content-Type': 'application/json', ...(opts.headers||{{}}) }}
+    headers: {{ ...(authToken ? {{ Authorization: 'Bearer ' + authToken }} : {{}}), 'Content-Type': 'application/json', ...(opts.headers||{{}}) }}
   }}).then(async r => {{
     const data = await r.json().catch(() => ({{}}));
     if (r.status === 401) return {{...data, error: data.error || 'Unauthorized', unauthorized: true}};
@@ -2651,52 +3329,318 @@ function hideAuthGate() {{
 }}
 
 async function ensureAuthed() {{
-  if (!KEY) {{
-    showAuthGate('Enter the admin token to continue.');
+  if (!COGNITO_TOKEN && !KEY) {{
+    showAuthGate(AUTH_CONFIG.cognito_enabled ? 'Sign in with Cognito to continue.' : 'Enter the admin token to continue.');
     return false;
   }}
   const probe = await api('/api/auth');
   if (probe.unauthorized || probe.error) {{
-    showAuthGate('That token was rejected. Check the value and try again.');
+    showAuthGate(AUTH_CONFIG.cognito_enabled ? 'Your sign-in expired or was rejected. Sign in again.' : 'That token was rejected. Check the value and try again.');
     return false;
   }}
   hideAuthGate();
   return true;
 }}
 
-async function loginAdmin() {{
-  KEY = document.getElementById('auth-key').value.trim();
+function clearCognitoChallenge() {{
+  COGNITO_CHALLENGE = '';
+  COGNITO_SESSION = '';
+  const mfaWrap = document.getElementById('auth-mfa-wrap');
+  const mfaInput = document.getElementById('auth-mfa');
+  const mfaHint = document.getElementById('auth-mfa-hint');
+  const newPasswordWrap = document.getElementById('auth-new-password-wrap');
+  const newPasswordInput = document.getElementById('auth-new-password');
+  if (mfaWrap) mfaWrap.style.display = 'none';
+  if (mfaInput) mfaInput.value = '';
+  if (mfaHint) mfaHint.textContent = 'Shown when Cognito requests MFA.';
+  if (newPasswordWrap) newPasswordWrap.style.display = 'none';
+  if (newPasswordInput) newPasswordInput.value = '';
+}}
+
+function toggleTokenLogin() {{
+  const wrap = document.getElementById('auth-token-wrap');
+  if (!wrap) return;
+  wrap.style.display = wrap.style.display === 'none' ? '' : 'none';
+}}
+
+function rememberCognitoToken(token) {{
+  COGNITO_TOKEN = token || '';
+  if (COGNITO_TOKEN) sessionStorage.setItem('uptime_admin_cognito_access_token', COGNITO_TOKEN);
+  else sessionStorage.removeItem('uptime_admin_cognito_access_token');
+}}
+
+async function finishCognitoAuth(res) {{
+  if (res.ok && res.access_token) {{
+    KEY = '';
+    sessionStorage.removeItem('uptime_admin_key');
+    rememberCognitoToken(res.access_token);
+    clearCognitoChallenge();
+    const password = document.getElementById('auth-password');
+    const username = document.getElementById('auth-username');
+    if (password) password.value = '';
+    if (username) username.value = '';
+    hideAuthGate();
+    boot();
+    return;
+  }}
+  if (!res.challenge) {{
+    showAuthGate(res.error || 'Cognito sign-in failed.');
+    return;
+  }}
+  COGNITO_CHALLENGE = res.challenge;
+  COGNITO_SESSION = res.session || '';
+  const mfaWrap = document.getElementById('auth-mfa-wrap');
+  const mfaHint = document.getElementById('auth-mfa-hint');
+  const newPasswordWrap = document.getElementById('auth-new-password-wrap');
+  if (res.challenge === 'SOFTWARE_TOKEN_MFA' || res.challenge === 'SMS_MFA') {{
+    if (mfaWrap) mfaWrap.style.display = '';
+    if (mfaHint) mfaHint.textContent = res.challenge === 'SOFTWARE_TOKEN_MFA' ? 'Enter the 6-digit code from your authenticator app.' : 'Enter the MFA code sent by Cognito.';
+    showAuthGate('Complete the MFA challenge to finish signing in.');
+    return;
+  }}
+  if (res.challenge === 'NEW_PASSWORD_REQUIRED') {{
+    if (newPasswordWrap) newPasswordWrap.style.display = '';
+    showAuthGate('Set a new password to complete your first Cognito sign-in.');
+    return;
+  }}
+  if (res.challenge === 'MFA_SETUP') {{
+    showAuthGate('This Cognito user still needs MFA setup. Finish initial setup in Cognito before using the admin UI.');
+    return;
+  }}
+  showAuthGate('Cognito requested an unsupported sign-in challenge.');
+}}
+
+async function loginWithCognito() {{
+  const username = document.getElementById('auth-username')?.value.trim() || '';
+  const password = document.getElementById('auth-password')?.value || '';
+  if (!username || !password) {{
+    showAuthGate('Enter your Cognito username/email and password first.');
+    return;
+  }}
+  COGNITO_USERNAME = username;
+  if (COGNITO_CHALLENGE) {{
+    const body = {{ username: COGNITO_USERNAME, challenge: COGNITO_CHALLENGE, session: COGNITO_SESSION }};
+    if (COGNITO_CHALLENGE === 'SOFTWARE_TOKEN_MFA' || COGNITO_CHALLENGE === 'SMS_MFA') {{
+      body.code = document.getElementById('auth-mfa')?.value.trim() || '';
+    }} else if (COGNITO_CHALLENGE === 'NEW_PASSWORD_REQUIRED') {{
+      body.new_password = document.getElementById('auth-new-password')?.value || '';
+    }}
+    const res = await api('/api/cognito/respond', {{ method:'POST', body: JSON.stringify(body), headers: {{}} }});
+    return finishCognitoAuth(res);
+  }}
+  const res = await api('/api/cognito/login', {{ method:'POST', body: JSON.stringify({{ username, password }}), headers: {{}} }});
+  return finishCognitoAuth(res);
+}}
+
+async function loginWithAdminKey() {{
+  KEY = document.getElementById('auth-key')?.value.trim() || '';
   if (!KEY) {{
     showAuthGate('Enter the admin token first.');
     return;
   }}
   sessionStorage.setItem('uptime_admin_key', KEY);
+  rememberCognitoToken('');
+  clearCognitoChallenge();
   if (await ensureAuthed()) {{
-    document.getElementById('auth-key').value = '';
+    const keyInput = document.getElementById('auth-key');
+    if (keyInput) keyInput.value = '';
     boot();
   }}
 }}
 
+async function loginAdmin() {{
+  if (AUTH_CONFIG.cognito_enabled) return loginWithCognito();
+  return loginWithAdminKey();
+}}
+
 function logoutAdmin() {{
   KEY = '';
+  rememberCognitoToken('');
   sessionStorage.removeItem('uptime_admin_key');
+  ACCOUNT_CACHE = null;
+  clearCognitoChallenge();
+  closeMoreMenu();
   showAuthGate('Signed out.');
 }}
 
-const PANES = ['hosts','regions','status-page','notifications','management','settings','cost','guides'];
+function toggleMoreMenu() {{
+  document.getElementById('more-menu').classList.toggle('open');
+}}
+
+function closeMoreMenu() {{
+  document.getElementById('more-menu').classList.remove('open');
+}}
+
+function openMenuTab(tab) {{
+  closeMoreMenu();
+  show(tab);
+}}
+
+function renderAccountModeNote(message, warn=false) {{
+  const summary = document.getElementById('account-summary');
+  const mfa = document.getElementById('acct-mfa-summary');
+  summary.innerHTML = `<div class="tip" style="margin:0;${{warn ? 'background:#3f2a16;border-color:#d97706;color:#fde68a' : ''}}">${{message}}</div>`;
+  mfa.textContent = 'Authenticator MFA controls are unavailable in the current auth mode.';
+  ['acct-email','acct-phone','acct-current-password','acct-new-password','acct-totp-secret','acct-totp-uri','acct-totp-code'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  }});
+  document.getElementById('acct-totp-setup').style.display = 'none';
+}}
+
+function renderAccount(data) {{
+  ACCOUNT_CACHE = data || null;
+  if (!AUTH_CONFIG.cognito_enabled) {{
+    renderAccountModeNote('This deployment is using the shared admin token flow, so there is no per-user Cognito account profile to manage here.');
+    return;
+  }}
+  if ((data || {{}}).mode === 'admin_key') {{
+    renderAccountModeNote(data.note || 'Sign out and sign back in with Cognito to manage your own account profile.', true);
+    return;
+  }}
+  if ((data || {{}}).mode !== 'cognito') {{
+    renderAccountModeNote((data || {{}}).note || 'Account details are unavailable right now.', true);
+    return;
+  }}
+  const summary = document.getElementById('account-summary');
+  const methods = (data.mfa_methods || []).length ? data.mfa_methods.join(', ') : 'None configured';
+  summary.innerHTML = `
+    <div class="grid2">
+      <div><strong>Username</strong><div class="hint">${{data.username || '—'}}</div></div>
+      <div><strong>Email</strong><div class="hint">${{data.email || '—'}} ${{data.email_verified ? '· verified' : '· unverified'}}</div></div>
+      <div><strong>Phone</strong><div class="hint">${{data.phone_number || '—'}} ${{data.phone_verified ? '· verified' : data.phone_number ? '· unverified' : ''}}</div></div>
+      <div><strong>Preferred MFA</strong><div class="hint">${{data.preferred_mfa || 'None'}}</div></div>
+    </div>
+  `;
+  document.getElementById('acct-email').value = data.email || '';
+  document.getElementById('acct-phone').value = data.phone_number || '';
+  document.getElementById('acct-mfa-summary').textContent = `Enabled methods: ${{methods}}. Preferred: ${{data.preferred_mfa || 'None'}}.`;
+  document.getElementById('acct-totp-setup').style.display = 'none';
+}}
+
+async function loadAccount() {{
+  if (!AUTH_CONFIG.cognito_enabled) {{
+    renderAccountModeNote('This deployment is using the shared admin token flow, so there is no per-user Cognito account profile to manage here.');
+    return;
+  }}
+  if (!COGNITO_TOKEN) {{
+    renderAccountModeNote('Sign out and sign back in with Cognito to see your account details, change your password, or manage authenticator MFA.', true);
+    return;
+  }}
+  const data = await api('/api/account');
+  if (data.unauthorized) {{
+    showAuthGate('Your Cognito session expired. Sign in again.');
+    return;
+  }}
+  if (data.error) {{
+    renderAccountModeNote(data.error, true);
+    return;
+  }}
+  renderAccount(data);
+}}
+
+async function saveAccountProfile() {{
+  if (!COGNITO_TOKEN) {{
+    toast('Sign in with Cognito to update your profile.', true);
+    return;
+  }}
+  const res = await api('/api/account', {{
+    method:'POST',
+    body: JSON.stringify({{
+      action:'update_profile',
+      email: document.getElementById('acct-email').value.trim(),
+      phone_number: document.getElementById('acct-phone').value.trim()
+    }})
+  }});
+  if (res.error) {{ toast(res.error, true); return; }}
+  renderAccount(res);
+  toast('Account profile updated');
+}}
+
+async function changeAccountPassword() {{
+  if (!COGNITO_TOKEN) {{
+    toast('Sign in with Cognito to change your password.', true);
+    return;
+  }}
+  const res = await api('/api/account', {{
+    method:'POST',
+    body: JSON.stringify({{
+      action:'change_password',
+      current_password: document.getElementById('acct-current-password').value,
+      new_password: document.getElementById('acct-new-password').value
+    }})
+  }});
+  if (res.error) {{ toast(res.error, true); return; }}
+  document.getElementById('acct-current-password').value = '';
+  document.getElementById('acct-new-password').value = '';
+  toast(res.message || 'Password updated');
+}}
+
+async function beginTotpSetup() {{
+  if (!COGNITO_TOKEN) {{
+    toast('Sign in with Cognito to set up authenticator MFA.', true);
+    return;
+  }}
+  const res = await api('/api/account', {{method:'POST', body: JSON.stringify({{action:'begin_totp'}})}});
+  if (res.error) {{ toast(res.error, true); return; }}
+  document.getElementById('acct-totp-secret').value = res.secret_code || '';
+  document.getElementById('acct-totp-uri').value = res.otpauth_uri || '';
+  document.getElementById('acct-totp-code').value = '';
+  document.getElementById('acct-totp-setup').style.display = '';
+  toast('Authenticator secret generated');
+}}
+
+async function verifyTotp() {{
+  if (!COGNITO_TOKEN) {{
+    toast('Sign in with Cognito to verify authenticator MFA.', true);
+    return;
+  }}
+  const res = await api('/api/account', {{
+    method:'POST',
+    body: JSON.stringify({{
+      action:'verify_totp',
+      code: document.getElementById('acct-totp-code').value.trim(),
+      preferred: document.getElementById('acct-totp-preferred').value === 'true'
+    }})
+  }});
+  if (res.error) {{ toast(res.error, true); return; }}
+  renderAccount(res);
+  toast('Authenticator MFA enabled');
+}}
+
+async function disableTotp() {{
+  if (!COGNITO_TOKEN) {{
+    toast('Sign in with Cognito to disable authenticator MFA.', true);
+    return;
+  }}
+  const res = await api('/api/account', {{method:'POST', body: JSON.stringify({{action:'disable_totp'}})}});
+  if (res.error) {{ toast(res.error, true); return; }}
+  renderAccount(res);
+  toast('Authenticator MFA disabled');
+}}
+
+const PANES = ['hosts','regions','status-page','notifications','account','management','settings','cost','guides'];
 function show(tab) {{
   PANES.forEach((t,i) => {{
     document.getElementById('pane-'+t).style.display = t===tab ? '' : 'none';
-    document.querySelectorAll('.tab')[i].classList.toggle('active', t===tab);
   }});
+  document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
+  closeMoreMenu();
   if (tab === 'hosts') loadHosts();
   if (tab === 'regions') loadRegions();
   if (tab === 'status-page') loadStatusPage();
   if (tab === 'notifications') loadNotificationSettings();
+  if (tab === 'account') loadAccount();
   if (tab === 'management') loadManagement();
   if (tab === 'settings') loadSettings();
   if (tab === 'cost') loadCostDefaults();
 }}
+document.addEventListener('click', (event) => {{
+  const menu = document.getElementById('more-menu');
+  const btn = document.getElementById('more-menu-btn');
+  if (!menu || !btn) return;
+  if (!menu.contains(event.target) && !btn.contains(event.target)) closeMoreMenu();
+}});
 
 async function ensureRegionsLoaded() {{
   const list = await api('/api/regions');
@@ -2765,7 +3709,7 @@ async function loadHosts() {{
   HOSTS_CACHE = Array.isArray(hosts) ? hosts : [];
   const tbody = document.getElementById('hosts-body');
   if (!HOSTS_CACHE.length) {{
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
     return;
   }}
   tbody.innerHTML = HOSTS_CACHE.map(h => `
@@ -2776,6 +3720,7 @@ async function loadHosts() {{
       <td><span class="badge ${{h.current_status||'unknown'}}">${{h.current_status||'unknown'}}</span></td>
       <td>${{h.uptime_pct != null ? h.uptime_pct+'%' : '—'}}</td>
       <td>${{h.last_latency_ms != null ? h.last_latency_ms+' ms' : '—'}}</td>
+      <td>${{renderSslCell(h)}}</td>
       <td style="text-align:center">${{h.show_on_status_page ? '✓' : '—'}}</td>
       <td style="text-align:center">${{h.alert_enabled ? '✓' : '—'}}</td>
       <td><div class="actions">
@@ -2783,6 +3728,17 @@ async function loadHosts() {{
         <button class="btn btn-danger btn-sm" onclick="deleteHost('${{h.host_id}}','${{h.name}}')">Del</button>
       </div></td>
     </tr>`).join('');
+}}
+
+function renderSslCell(host) {{
+  const url = (host.url || '').toLowerCase();
+  const isHttps = url.startsWith('https://');
+  const days = host.ssl_days_remaining;
+  if (!isHttps) return '<span style="color:#64748b">—</span>';
+  if (typeof days === 'number') {{
+    return `<span title="Certificate currently verifies. Days remaining: ${{days}}">✓</span>`;
+  }}
+  return '<span title="No recent successful SSL verification was recorded.">×</span>';
 }}
 
 function openEditHostById(hostId) {{

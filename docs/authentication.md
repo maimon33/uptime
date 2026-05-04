@@ -6,9 +6,9 @@ prepares the stack for an optional `Cognito` path.
 Important boundary:
 
 - `Password mode` is fully active today.
-- `Cognito mode` is provisioned at the infrastructure layer today.
-- The management app still needs a follow-up app-side login/session pass before
-  Cognito hosted login becomes the primary `/admin` sign-in flow.
+- `Cognito mode` is also active today for direct `/admin` sign-in.
+- The current app uses Cognito username/password plus Cognito challenges such
+  as MFA or first-login password change.
 
 Use this guide to choose the right path for your deployment.
 
@@ -62,8 +62,7 @@ What the stack can provision now:
 - Cognito User Pool Client
 - optional Cognito managed-login domain
 - TOTP-ready MFA configuration
-- environment variables on the management Lambda for the future app-side auth
-  integration
+- environment variables on the management Lambda for the app-side auth flow
 
 Recommended Cognito settings:
 
@@ -96,17 +95,18 @@ Why TOTP is recommended:
 - avoids delivery issues
 - good fit for a handful of operators
 
-What still needs a follow-up implementation:
+What the app supports today:
 
-- redirect from `/admin` to Cognito managed login
-- callback handling after sign-in
-- JWT/session validation in the management app
-- optional domain-based allow/deny logic using Cognito claims
+- Cognito username/password sign-in at `/admin`
+- MFA challenge handling
+- first-login password-change challenge handling
+- optional allowed-email-domain enforcement using Cognito user attributes
 
-So today, selecting Cognito in CloudFormation should be treated as:
+What is not the primary path yet:
 
-- `provision the identity resources now`
-- `switch the app auth flow in a follow-up change`
+- redirecting `/admin` to the Cognito hosted login page
+- doing first-time TOTP enrollment directly inside the app when Cognito returns
+  `MFA_SETUP`
 
 ## Fastest Cognito Setup
 
@@ -116,8 +116,7 @@ If you want the simplest possible path:
 2. Pick a globally unique Cognito domain prefix
 3. Deploy the stack with `AdminAuthMode=cognito`
 4. Create your first Cognito user
-5. Keep using the shared admin token for `/admin` until the app-side Cognito
-   login integration lands
+5. Open `/admin` and sign in with that Cognito user
 
 Prep script:
 
@@ -138,6 +137,16 @@ That script:
 - reads the Cognito outputs from the CloudFormation stack
 - creates the first Cognito admin user
 - prints the managed-login domain if it exists
+
+After that:
+
+1. Open `/admin`
+2. Sign in with the Cognito email and password
+3. If Cognito requires a password change, enter the new password in the admin
+   login prompt
+4. If MFA is enabled, enter the authenticator code when prompted
+
+If you set `CognitoAllowedEmailDomain`, the user email must match that domain.
 
 ## Choosing Between Them
 
@@ -231,4 +240,4 @@ Right now the best practical path is:
 
 1. run `password + AdminAllowedIpCidrs` if you need immediate production use
 2. provision `cognito` if you already know that is your target end state
-3. switch the app-side login flow to Cognito in a follow-up change
+3. use Cognito directly in `/admin` once the stack and user are in place

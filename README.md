@@ -28,7 +28,7 @@ bootstrap path.
 - Public status page
 - Admin UI
 - Password-only admin auth, with optional admin IP allowlisting
-- Cognito-ready CloudFormation provisioning for a future hosted-login path
+- Optional Cognito admin sign-in with MFA support
 - Status-page themes, brand name, logo, and title
 - Status-page maintenance notice and public subscribe links
 - Custom-domain deploy/destroy flow from the admin UI using CloudFront + ACM, with manual DNS record instructions
@@ -89,8 +89,8 @@ Two admin-auth tracks are documented now:
   Manager and `/admin` uses it as a bearer token for the API.
 - `Cognito`
   CloudFormation can now provision a Cognito User Pool, User Pool Client, and
-  optional managed-login domain so the stack is ready for a later Cognito
-  login/session integration.
+  optional managed-login domain, and `/admin` can sign in directly with
+  Cognito username/password plus MFA when enabled.
 
 If you stay on password-only, strongly consider setting `AdminAllowedIpCidrs`
 to limit `/admin` and `/api/*` to trusted networks.
@@ -99,7 +99,7 @@ Full guide:
 
 - [Authentication Guide](/Users/assi/Work/repos/maimon33/uptime/docs/authentication.md)
 
-Fastest Cognito prep:
+Fastest Cognito setup:
 
 ```bash
 ./scripts/prepare-cognito-cf.sh eu-central-1 uptime my-uptime-admin maimons.dev
@@ -108,6 +108,38 @@ Fastest Cognito prep:
 
 The first script prints the CloudFormation deploy command. The second one
 creates the first Cognito user after the stack is up.
+
+### Simple Cognito User Setup
+
+1. Deploy the stack with `AdminAuthMode=cognito`.
+2. Create the first Cognito user:
+
+```bash
+./scripts/create-cognito-admin-user.sh eu-central-1 uptime you@maimons.dev
+```
+
+3. If you want to choose the first temporary password yourself:
+
+```bash
+./scripts/create-cognito-admin-user.sh eu-central-1 uptime you@maimons.dev 'StrongTempPass123!'
+```
+
+4. Open `/admin`.
+5. Sign in with the Cognito email and password.
+6. If Cognito requires it:
+   change the temporary password on first sign-in.
+7. If MFA is enabled:
+   enter the authenticator code when prompted.
+
+What the script does:
+
+- looks up the Cognito User Pool from your stack outputs
+- creates the Cognito user
+- marks the email as verified
+- prints the user pool and client IDs for reference
+
+If you set `CognitoAllowedEmailDomain`, make sure the user email matches that
+domain or admin sign-in will be rejected.
 
 `AdminApiKey` is optional. If you leave it blank, the stack generates one in
 Secrets Manager:

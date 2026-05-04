@@ -46,6 +46,7 @@ Parameters:
 Conditions:
   HasProvidedAdminApiKey: !Not [!Equals [!Ref AdminApiKey, '']]
   UseCognitoAuth: !Equals [!Ref AdminAuthMode, cognito]
+  CognitoMfaEnabled: !Not [!Equals [!Ref CognitoMfaMode, OFF]]
   HasCognitoManagedDomainPrefix: !Not [!Equals [!Ref CognitoManagedDomainPrefix, '']]
   CreateCognitoManagedDomain: !And
     - !Condition UseCognitoAuth
@@ -143,8 +144,10 @@ Resources:
       AdminCreateUserConfig:
         AllowAdminCreateUserOnly: true
       MfaConfiguration: !Ref CognitoMfaMode
-      SoftwareTokenMfaConfiguration:
-        Enabled: true
+      EnabledMfas: !If
+        - CognitoMfaEnabled
+        - [SOFTWARE_TOKEN_MFA]
+        - !Ref AWS::NoValue
       Policies:
         PasswordPolicy:
           MinimumLength: 14
@@ -229,6 +232,19 @@ Resources:
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: !Ref AdminKeySecret
+              - Sid: CognitoAdminAuth
+                Effect: Allow
+                Action:
+                  - cognito-idp:AssociateSoftwareToken
+                  - cognito-idp:ChangePassword
+                  - cognito-idp:DeleteUserAttributes
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:SetUserMFAPreference
+                  - cognito-idp:RespondToAuthChallenge
+                  - cognito-idp:GetUser
+                  - cognito-idp:UpdateUserAttributes
+                  - cognito-idp:VerifySoftwareToken
+                Resource: '*'
               - Sid: Alerts
                 Effect: Allow
                 Action:

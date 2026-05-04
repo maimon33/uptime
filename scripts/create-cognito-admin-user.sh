@@ -101,7 +101,8 @@ fi
 cat <<EOF
 
 Notes:
-  - The user should complete the invite / password setup flow from the Cognito email.
-  - If MFA is OPTIONAL or ON, the user should enroll a TOTP authenticator after first sign-in.
-  - The uptime admin app still uses the shared admin token today until the Cognito app-login flow is implemented.
+  - Open /admin and sign in with this Cognito user.
+  - If the user is in FORCE_CHANGE_PASSWORD, the admin login screen will ask for the new password during first sign-in.
+  - If MFA is OPTIONAL or ON, the admin login screen will ask for the authenticator code when Cognito challenges for it.
+  - If you configured CognitoAllowedEmailDomain, make sure this email matches that domain.
 EOF
