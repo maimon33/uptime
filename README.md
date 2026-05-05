@@ -72,6 +72,12 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
+Template updates:
+
+```bash
+./scripts/deploy-cf-template.sh eu-central-1
+```
+
 The stack region becomes the **home region**. That region hosts:
 
 - management Lambda

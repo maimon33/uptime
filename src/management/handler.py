@@ -205,10 +205,12 @@ _SETTINGS_DEFAULTS = {
     "default_check_interval":  60,
     "default_timeout":         10,
 }
+PROJECT_GITHUB_URL = os.environ.get("PROJECT_GITHUB_URL", "https://github.com/maimon33/uptime")
 
 _cached_admin_key = None
 _build_info_cache = None
 _cognito_access_token_cache = {}
+AUDIT_RETENTION_DAYS = 30
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -355,14 +357,32 @@ def _log_request(event: dict, method: str, path: str) -> None:
 
 def _client_ip(event: dict) -> str:
     headers = event.get("headers") or {}
+    cloudfront_viewer_address = headers.get("cloudfront-viewer-address") or headers.get("CloudFront-Viewer-Address") or ""
+    if cloudfront_viewer_address:
+        return cloudfront_viewer_address.split(",")[0].split(":")[0].strip()
     forwarded_for = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For") or ""
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()
     return (((event.get("requestContext") or {}).get("http") or {}).get("sourceIp") or "").strip()
 
 
+def _request_via_cloudfront(event: dict) -> bool:
+    headers = event.get("headers") or {}
+    via = str(headers.get("via") or headers.get("Via") or "").lower()
+    return bool(
+        headers.get("x-amz-cf-id")
+        or headers.get("X-Amz-Cf-Id")
+        or headers.get("cloudfront-viewer-address")
+        or headers.get("CloudFront-Viewer-Address")
+        or "cloudfront" in via
+    )
+
+
 def _admin_ip_allowed(event: dict) -> bool:
     if not ADMIN_ALLOWED_IP_CIDRS:
+        return True
+    if _request_via_cloudfront(event):
+        _log("info", "admin_ip_allowlist_skipped_cloudfront", path=(event.get("rawPath") or "/"), client_ip=_client_ip(event))
         return True
     client_ip = _client_ip(event)
     if not client_ip:
@@ -961,6 +981,10 @@ def _route_api(method: str, path: str, event: dict) -> dict:
         if method == "GET":
             return _get_logs(qs)
 
+    if resource == "dynamodb":
+        if method == "GET":
+            return _get_dynamodb_data(qs)
+
     # ── /api/cost ─────────────────────────────────────────────────────────────
     if resource == "cost":
         return _cost_estimate(qs)
@@ -1030,6 +1054,8 @@ def _create_host(body: dict) -> dict:
         "alert_enabled":          bool(body.get("alert_enabled", False)),
         "alert_sns_arn":          body.get("alert_sns_arn", "") or None,
         "show_on_status_page":    bool(body.get("show_on_status_page", True)),
+        "public_link_enabled":    bool(body.get("public_link_enabled", False)),
+        "public_link_url":        body.get("public_link_url", "") or None,
         "expected_status_code":   int(body.get("expected_status_code", 200)),
         "target_regions":         target_regions,
         "tags":                   body.get("tags", []),
@@ -1048,7 +1074,7 @@ def _update_host(host_id: str, body: dict) -> dict:
     allowed = {
         "name", "url", "check_type", "check_interval_seconds", "monitor_tier_seconds", "timeout_seconds",
         "enabled", "alert_enabled", "alert_sns_arn", "show_on_status_page",
-        "expected_status_code", "tags", "target_regions",
+        "public_link_enabled", "public_link_url", "expected_status_code", "tags", "target_regions",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
@@ -1139,6 +1165,35 @@ def _load_settings_item() -> dict:
 def _save_settings_item(item: dict) -> None:
     payload = {"host_id": "__settings__", **{k: v for k, v in item.items() if k != "host_id"}}
     _db().Table(HOSTS_TABLE).put_item(Item=payload)
+
+
+def _audit_event(event_type: str, *, status: str = "ok", actor: str = "system", **fields) -> None:
+    now = datetime.now(timezone.utc)
+    item = {
+        "host_id": f"__audit__{now.strftime('%Y%m%dT%H%M%S%fZ')}#{uuid.uuid4().hex[:8]}",
+        "event_type": event_type,
+        "status": status,
+        "actor": actor,
+        "created_at": now.isoformat(),
+        "ttl": int((now + timedelta(days=AUDIT_RETENTION_DAYS)).timestamp()),
+    }
+    item.update({k: v for k, v in fields.items() if v not in (None, "")})
+    try:
+        _db().Table(HOSTS_TABLE).put_item(Item=item)
+    except Exception as exc:
+        _log("warn", "audit_event_write_failed", event_type=event_type, error=str(exc))
+
+
+def _list_audit_events(limit: int = 50) -> list[dict]:
+    result = _db().Table(HOSTS_TABLE).scan(
+        FilterExpression="begins_with(host_id, :p)",
+        ExpressionAttributeValues={":p": "__audit__"},
+    )
+    rows = [dict(item) for item in result.get("Items", [])]
+    rows.sort(key=lambda row: row.get("created_at", ""), reverse=True)
+    for row in rows:
+        row.pop("host_id", None)
+    return rows[:limit]
 
 
 def _invoke_region_worker(region_info: dict, run_id: str, due_tiers: list[int]) -> dict:
@@ -1308,8 +1363,17 @@ def _add_region(body: dict) -> dict:
     try:
         info = reg.deploy_region(region, memory_mb, supported_tiers)
         reg.save_region_record(_db(), info)
+        _audit_event(
+            "worker_add",
+            actor="admin",
+            region=region,
+            memory_mb=memory_mb,
+            supported_tiers=supported_tiers,
+            monitor_build_version=info.get("monitor_build_version", ""),
+        )
         return _json(200, info)
     except Exception as e:
+        _audit_event("worker_add", status="error", actor="admin", region=region, error=str(e))
         return _json(500, {"error": str(e)})
 
 def _update_region(region: str) -> dict:
@@ -1322,8 +1386,17 @@ def _update_region(region: str) -> dict:
     try:
         info = reg.deploy_region(region, memory_mb, supported_tiers)
         reg.save_region_record(_db(), info)
+        _audit_event(
+            "worker_update",
+            actor="admin",
+            region=region,
+            memory_mb=memory_mb,
+            supported_tiers=supported_tiers,
+            monitor_build_version=info.get("monitor_build_version", ""),
+        )
         return _json(200, info)
     except Exception as e:
+        _audit_event("worker_update", status="error", actor="admin", region=region, error=str(e))
         return _json(500, {"error": str(e)})
 
 def _remove_region(region: str) -> dict:
@@ -1334,8 +1407,10 @@ def _remove_region(region: str) -> dict:
         remaining = reg.list_regions(_db())
         if not remaining:
             reg.delete_monitor_role()
+        _audit_event("worker_delete", actor="admin", region=region, remaining_regions=len(remaining))
         return _json(200, {"removed": region})
     except Exception as e:
+        _audit_event("worker_delete", status="error", actor="admin", region=region, error=str(e))
         return _json(500, {"error": str(e)})
 
 
@@ -1540,6 +1615,7 @@ def _get_management_summary() -> dict:
 def _run_management_action(body: dict) -> dict:
     action = str(body.get("action") or "").strip()
     _log("info", "management_action_requested", action=action, body=body)
+    _audit_event("management_action_requested", actor="admin", action=action)
     if action == "purge_checks":
         older_than_days = int(body.get("older_than_days", 30))
         max_delete = int(body.get("max_delete", 500))
@@ -1570,6 +1646,14 @@ def _force_update_probes() -> dict:
         try:
             info = reg.deploy_region(region_name, memory_mb, supported_tiers)
             reg.save_region_record(_db(), info)
+            _audit_event(
+                "worker_force_update",
+                actor="system",
+                region=region_name,
+                memory_mb=memory_mb,
+                supported_tiers=supported_tiers,
+                monitor_build_version=info.get("monitor_build_version", ""),
+            )
             updated.append({
                 "region": region_name,
                 "monitor_build_version": info.get("monitor_build_version", ""),
@@ -1577,6 +1661,7 @@ def _force_update_probes() -> dict:
                 "deployed_at": info.get("deployed_at", ""),
             })
         except Exception as exc:
+            _audit_event("worker_force_update", status="error", actor="system", region=region_name, error=str(exc))
             failed.append({"region": region_name, "error": str(exc)})
 
     status = 200 if not failed else 500
@@ -1935,6 +2020,97 @@ def _get_logs(qs: dict) -> dict:
         "summary": summary,
         "issues": issues,
         "entries": entries,
+    })
+
+
+def _get_dynamodb_data(qs: dict) -> dict:
+    from boto3.dynamodb.conditions import Key as DKey
+
+    db = _db()
+    view = (qs.get("view", ["overview"])[0] or "overview").strip().lower()
+    host_filter = (qs.get("host_id", [""])[0] or "").strip()
+    region_filter = (qs.get("region", ["all"])[0] or "all").strip()
+    checks_limit = max(10, min(100, _safe_int(qs.get("checks_limit", ["50"])[0], 50)))
+
+    hosts_rows = sorted(_list_host_items(), key=lambda item: item.get("name", ""))
+    settings_item = _load_settings_item()
+    settings_item.pop("host_id", None)
+    region_rows = reg.list_regions(db)
+
+    selected_host = host_filter or (hosts_rows[0]["host_id"] if hosts_rows else "")
+    checks_rows = []
+    if selected_host:
+        checks_rows = db.Table(CHECKS_TABLE).query(
+            KeyConditionExpression=DKey("host_id").eq(selected_host),
+            ScanIndexForward=False,
+            Limit=checks_limit,
+        ).get("Items", [])
+    if region_filter != "all":
+        checks_rows = [item for item in checks_rows if str(item.get("region", "")) == region_filter]
+
+    audit_rows = _list_audit_events(limit=checks_limit)
+    if region_filter != "all":
+        audit_rows = [item for item in audit_rows if str(item.get("region", "")) == region_filter]
+
+    def compact_host(item: dict) -> dict:
+        return {
+            "host_id": item.get("host_id", ""),
+            "name": item.get("name", ""),
+            "enabled": bool(item.get("enabled", False)),
+            "url": item.get("url", ""),
+            "monitor_tier_seconds": int(item.get("monitor_tier_seconds", item.get("check_interval_seconds", 60)) or 60),
+            "target_regions": item.get("target_regions") or [],
+            "current_status": item.get("current_status", "unknown"),
+            "last_checked_at": item.get("last_checked_at", ""),
+        }
+
+    def compact_check(item: dict) -> dict:
+        return {
+            "checked_at": item.get("checked_at", ""),
+            "run_id": item.get("run_id", ""),
+            "region": item.get("region", ""),
+            "status": item.get("status", "unknown"),
+            "latency_ms": item.get("latency_ms"),
+            "status_code": item.get("status_code"),
+            "error": item.get("error", ""),
+        }
+
+    settings_preview = {
+        "status_page_title": settings_item.get("status_page_title", _SETTINGS_DEFAULTS["status_page_title"]),
+        "brand_name": settings_item.get("status_page_brand_name", _SETTINGS_DEFAULTS["status_page_brand_name"]),
+        "custom_domain_name": settings_item.get("custom_domain_name", ""),
+        "retention_days": settings_item.get("retention_days", RETENTION_DAYS),
+        "default_check_interval": settings_item.get("default_check_interval", 60),
+    }
+
+    return _json(200, {
+        "view": view,
+        "hosts_table": {
+            "name": HOSTS_TABLE,
+            "hosts": [compact_host(item) for item in hosts_rows],
+            "settings": settings_preview,
+            "regions": [
+                {
+                    "region": row.get("region", ""),
+                    "memory_mb": row.get("memory_mb"),
+                    "supported_tiers": row.get("supported_tiers") or [],
+                    "status": row.get("status", "unknown"),
+                    "deployed_at": row.get("deployed_at", ""),
+                }
+                for row in region_rows
+            ],
+        },
+        "checks_table": {
+            "name": CHECKS_TABLE,
+            "selected_host_id": selected_host,
+            "selected_host_name": next((item.get("name", "") for item in hosts_rows if item.get("host_id") == selected_host), ""),
+            "rows": [compact_check(item) for item in checks_rows],
+            "limit": checks_limit,
+        },
+        "audit": {
+            "rows": audit_rows,
+            "limit": checks_limit,
+        },
     })
 
 
@@ -2645,10 +2821,10 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
         summary_bits = []
         if h["uptime_pct"] is not None:
             summary_bits.append(f"{_format_percent(h['uptime_pct'])} uptime")
-        if h["latest_latency"] is not None:
-            summary_bits.append(f"{h['latest_latency']} ms")
-        elif h["avg_latency"]:
+        if h["avg_latency"]:
             summary_bits.append(f"{h['avg_latency']} ms avg")
+        elif h["latest_latency"] is not None:
+            summary_bits.append(f"{h['latest_latency']} ms latest")
         target_pills = "".join(
             f'<span class="pill">{region}</span>'
             for region in h["target_regions"]
@@ -2657,6 +2833,9 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
             f'<span class="pill {r["status"]}">{r["region"]} · {r["latency_ms"] if r["latency_ms"] is not None else "—"} ms</span>'
             for r in h["region_summary"]
         )
+        public_link = ""
+        if h["host"].get("public_link_enabled") and h["host"].get("public_link_url"):
+            public_link = f'<div class="svc-actions"><a class="ghost-link svc-history-link" href="{h["host"]["public_link_url"]}" target="_blank" rel="noopener noreferrer">Open service</a></div>'
         history_note = "" if h["history_available"] else ""
         host_history_href = f'/history?host={quote(h["host"]["host_id"])}'
         host_incident_count = int(h.get("incident_count", 0) or 0)
@@ -2701,6 +2880,11 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
       <div class="regions">{region_pills or '<span class="pill unknown">No probe results yet</span>'}</div>
     </div>
   </div>
+  <div class="meta" style="margin-top:14px">
+    Latest latency: {f"{h['latest_latency']} ms" if h["latest_latency"] is not None else "—"} &nbsp;·&nbsp;
+    Average latency: {f"{h['avg_latency']} ms" if h["avg_latency"] else "—"}
+  </div>
+  {public_link}
 </details>"""
 
     if not host_data:
@@ -2836,6 +3020,9 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
   <div class="section-heading">Services</div>
   {cards}
   {subscribe_block}
+<footer>
+  <div>Built for calm operations. Open source on <a class="ghost-link svc-history-link" href="{PROJECT_GITHUB_URL}" target="_blank" rel="noopener noreferrer">GitHub</a>.</div>
+</footer>
 </div></body></html>"""
 
 
@@ -2851,7 +3038,7 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
         f'<option value="{host["host_id"]}"{" selected" if selected_host == host["host_id"] else ""}>{host.get("name", host["host_id"])}</option>'
         for host in hosts
     ]
-    region_options = ['<option value="all">All workers</option>'] + [
+    region_options = ['<option value="all">All regions</option>'] + [
         f'<option value="{region}"{" selected" if selected_region == region else ""}>{region}</option>'
         for region in regions
     ]
@@ -2863,14 +3050,13 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
         f"""<tr>
   <td>{row["host_name"]}</td>
   <td><span class="pill {row["status"]}">{row["status"].title()}</span></td>
-  <td>{row["region"] or "—"}</td>
   <td>{row["latency_ms"] if row["latency_ms"] is not None else "—"} ms</td>
   <td>{row["status_code"] if row.get("status_code") is not None else "—"}</td>
   <td>{row["checked_at"].replace("T", " ")[:19]}</td>
   <td>{(row.get("error") or "—")[:120]}</td>
 </tr>"""
         for row in rows
-    ) or '<tr><td colspan="7" class="empty-cell">No checks matched the selected filters.</td></tr>'
+    ) or '<tr><td colspan="6" class="empty-cell">No checks matched the selected filters.</td></tr>'
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -2927,7 +3113,7 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
   <div class="hero">
     <div>
       <h1>Check History</h1>
-      <p class="sub">Browse recent public checks across services and check locations. Use filters to narrow the timeline without crowding the main status page.</p>
+      <p class="sub">Browse recent public checks across services. Use filters to narrow the timeline without crowding the main status page.</p>
     </div>
     <div class="hero-actions"><a class="ghost-link" href="/status">Back to status</a></div>
   </div>
@@ -2935,10 +3121,6 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
     <div>
       <label for="host">Host</label>
       <select id="host" name="host">{''.join(host_options)}</select>
-    </div>
-    <div>
-      <label for="region">Worker region</label>
-      <select id="region" name="region">{''.join(region_options)}</select>
     </div>
     <div>
       <label for="status">Status</label>
@@ -2952,7 +3134,7 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Host</th><th>Status</th><th>Worker</th><th>Latency</th><th>HTTP</th><th>Checked</th><th>Detail</th></tr></thead>
+      <thead><tr><th>Host</th><th>Status</th><th>Latency</th><th>HTTP</th><th>Checked</th><th>Detail</th></tr></thead>
       <tbody>{row_markup}</tbody>
     </table>
   </div>
@@ -3140,6 +3322,42 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .log-entry-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:8px}}
 .log-entry-meta{{font-size:.76rem;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .log-entry pre{{margin-top:10px;margin-bottom:0;white-space:pre-wrap;word-break:break-word}}
+.choice-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+.choice-card{{display:flex;align-items:flex-start;gap:12px;padding:16px 18px;border-radius:18px;border:1px solid var(--line);background:#0e1828;cursor:pointer;transition:border-color .16s ease,background .16s ease,transform .16s ease,box-shadow .16s ease}}
+.choice-card:hover{{border-color:#4a6288;transform:translateY(-1px)}}
+.choice-card input{{width:auto;margin-top:3px;accent-color:var(--sky)}}
+.choice-card.active{{border-color:rgba(14,165,233,.55);background:linear-gradient(180deg, rgba(14,165,233,.12), rgba(15,118,110,.08));box-shadow:0 18px 36px rgba(2,6,23,.18)}}
+.choice-card-title{{font-size:.88rem;font-weight:700;color:#f8fafc;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.01em}}
+.choice-card-copy{{font-size:.8rem;color:var(--soft);line-height:1.55;margin-top:4px}}
+.probe-scope-panel{{margin-top:12px;padding:14px 16px;border-radius:18px;border:1px solid var(--line);background:#0e1828;transition:border-color .16s ease,background .16s ease,opacity .16s ease}}
+.probe-scope-panel.inactive{{opacity:.72}}
+.probe-scope-header{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}}
+.probe-scope-title{{font-size:.82rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#cbd5e1;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.probe-region-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}}
+.probe-region-pill{{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:16px;border:1px solid var(--line);background:#111c2d;transition:border-color .16s ease,background .16s ease,transform .16s ease}}
+.probe-region-pill:hover{{border-color:#44617f;transform:translateY(-1px)}}
+.probe-region-pill input{{width:auto;accent-color:var(--sky)}}
+.probe-region-pill-name{{font-size:.86rem;font-weight:700;color:#e5eef8}}
+.probe-region-pill-meta{{font-size:.74rem;color:var(--soft);margin-top:2px}}
+.coverage-grid{{display:flex;flex-direction:column;gap:12px}}
+.coverage-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px 16px}}
+.coverage-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px}}
+.coverage-title{{font-size:.94rem;font-weight:700;color:#f8fafc}}
+.coverage-subtitle{{font-size:.78rem;color:var(--soft);margin-top:4px}}
+.coverage-pills{{display:flex;flex-wrap:wrap;gap:8px}}
+.coverage-pill{{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:999px;border:1px solid var(--line);background:#111c2d;font-size:.76rem;color:#dbe7f3}}
+.coverage-pill.ok{{border-color:rgba(34,197,94,.35);background:rgba(22,101,52,.18);color:#bbf7d0}}
+.coverage-pill.warn{{border-color:rgba(245,158,11,.3);background:rgba(120,53,15,.18);color:#fde68a}}
+.coverage-pill.off{{opacity:.68}}
+.diag-kv{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
+.diag-kv-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
+.diag-kv-card .label{{font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.diag-kv-card .value{{margin-top:8px;font-size:.96rem;font-weight:700;color:#f8fafc}}
+.diag-stack{{display:flex;flex-direction:column;gap:10px}}
+.diag-row{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
+.diag-row-title{{font-size:.88rem;font-weight:700;color:#f8fafc}}
+.diag-row-meta{{font-size:.78rem;color:var(--soft);margin-top:5px;line-height:1.5}}
+.diag-table{{margin-top:12px}}
 .badge.error{{background:#7f1d1d;color:#fecaca}}
 .badge.warn{{background:#713f12;color:#fde68a}}
 .badge.info{{background:#16314b;color:#93c5fd}}
@@ -3160,6 +3378,7 @@ strong{{color:#f8fafc}}
 }}
 @media (max-width: 760px) {{
   .grid2{{grid-template-columns:1fr}}
+  .choice-grid{{grid-template-columns:1fr}}
   .section-header,.region-card{{flex-direction:column;align-items:flex-start}}
 }}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
@@ -3172,7 +3391,7 @@ strong{{color:#f8fafc}}
   <span class="tab" data-tab="status-page" onclick="show('status-page')">Status Page</span>
   <span class="tab" data-tab="notifications" onclick="show('notifications')">Notifications</span>
   <span class="tab" data-tab="management" onclick="show('management')">Management</span>
-  <span class="tab" data-tab="logs" onclick="show('logs')">Logs</span>
+  <span class="tab" data-tab="diagnostics" onclick="show('diagnostics')">Diagnostics</span>
   <span class="tab" data-tab="cost" onclick="show('cost')">Cost</span>
   <span class="nav-spacer"></span>
   <div class="menu-wrap">
@@ -3214,6 +3433,15 @@ strong{{color:#f8fafc}}
       <tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">Loading…</td></tr>
     </tbody>
   </table>
+  <div class="panel" style="margin-top:18px">
+    <div class="section-header" style="margin-bottom:10px">
+      <div>
+        <h3 style="margin:0">Probe Routing</h3>
+        <div class="hint">See where each host can run right now, and why a probe would skip it.</div>
+      </div>
+    </div>
+    <div id="host-coverage" style="color:#94a3b8">Loading host coverage…</div>
+  </div>
 </div>
 
 <div id="pane-regions" style="display:none">
@@ -3553,12 +3781,18 @@ strong{{color:#f8fafc}}
   </div>
 </div>
 
-<div id="pane-logs" style="display:none">
-  <h2>Logs</h2>
+<div id="pane-diagnostics" style="display:none">
+  <h2>Diagnostics</h2>
   <p class="desc">
-    Read recent CloudWatch logs, surface likely issues first, and then inspect the raw event details when you need the full context.
+    Inspect recent runtime signals in two ways: CloudWatch logs for behavior and DynamoDB views for what the system is storing.
   </p>
-  <div class="panel">
+  <details class="panel" open>
+    <summary class="section-summary">
+      <span class="section-summary-title">CloudWatch Logs</span>
+      <span class="section-summary-meta">Management and worker runtime output</span>
+    </summary>
+    <h3 style="margin-top:0">CloudWatch Logs</h3>
+    <div class="hint" style="margin-bottom:14px">Times are shown in your browser timezone for easier debugging.</div>
     <div class="grid2">
       <div class="form-group">
         <label>Source</label>
@@ -3612,6 +3846,56 @@ strong{{color:#f8fafc}}
     <h3 style="margin-top:0">Recent Entries</h3>
     <div id="logs-entries" style="color:#94a3b8">No log scan has run yet.</div>
   </div>
+  </details>
+  <details class="panel" open>
+    <summary class="section-summary">
+      <span class="section-summary-title">DynamoDB</span>
+      <span class="section-summary-meta">Hosts, checks, region records, and audit history</span>
+    </summary>
+    <div class="section-header" style="margin-bottom:12px">
+      <div>
+        <h3 style="margin:0">DynamoDB</h3>
+        <div class="hint">Formatted snapshots of hosts, settings, region records, and recent checks.</div>
+      </div>
+      <button class="btn btn-ghost" onclick="loadDynamoData()">Refresh Data</button>
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Table View</label>
+        <select id="ddb-view-select" onchange="loadDynamoData()">
+          <option value="overview">Overview</option>
+          <option value="hosts">Hosts</option>
+          <option value="checks">Checks</option>
+          <option value="audit">Audit</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Checks Host</label>
+        <select id="ddb-host-filter" onchange="loadDynamoData()">
+          <option value="">Auto-select first host</option>
+        </select>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Region Filter</label>
+        <select id="ddb-region-filter" onchange="loadDynamoData()">
+          <option value="all">All regions</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Row Limit</label>
+        <select id="ddb-check-limit" onchange="loadDynamoData()">
+          <option value="20">20 rows</option>
+          <option value="50" selected>50 rows</option>
+          <option value="100">100 rows</option>
+        </select>
+      </div>
+    </div>
+    <div id="ddb-summary" style="color:#94a3b8">Loading DynamoDB data…</div>
+    <div id="ddb-hosts" style="margin-top:16px;color:#94a3b8"></div>
+    <div id="ddb-checks" style="margin-top:16px;color:#94a3b8"></div>
+  </details>
 </div>
 
 <div id="pane-settings" style="display:none">
@@ -3681,7 +3965,7 @@ strong{{color:#f8fafc}}
         <li>Keep one home region for the management Lambda and add at least two probe regions for coverage.</li>
         <li>Use a custom domain through CloudFront instead of sending operators to the raw Lambda Function URL.</li>
         <li>Turn on Cognito if you want named users and MFA; keep the emergency admin token only as a break-glass path.</li>
-        <li>If you stay on password-only admin, restrict `/admin` and `/api/*` with `AdminAllowedIpCidrs`.</li>
+        <li>If you stay on password-only admin without CloudFront, restrict `/admin` and `/api/*` with `AdminAllowedIpCidrs`.</li>
       </ul>
       <div class="doc-badges">
         <span class="doc-badge">Home region: {HOME_REGION}</span>
@@ -3712,7 +3996,7 @@ Authorization: Bearer &lt;admin-token-or-cognito-access-token&gt;</pre>
             <li>Fastest setup and easiest to bootstrap.</li>
             <li>Good for a very small trusted team.</li>
             <li>Shared secret means weaker accountability.</li>
-            <li>Should usually be paired with `AdminAllowedIpCidrs`.</li>
+            <li>Behind CloudFront, prefer WAF or CloudFront rules for viewer IP allowlisting.</li>
           </ul>
         </div>
         <div>
@@ -3734,7 +4018,7 @@ Authorization: Bearer &lt;admin-token-or-cognito-access-token&gt;</pre>
       <div class="doc-kicker">Hardening</div>
       <h3 style="margin-top:0">IP restrictions and network policy</h3>
       <ul class="doc-list">
-        <li>`AdminAllowedIpCidrs` protects `/admin` and `/api/*` without affecting the public status page.</li>
+        <li>`AdminAllowedIpCidrs` protects the raw Lambda URL admin path without affecting the public status page.</li>
         <li>Use it when the operator IP range is stable, especially if you are still on password-only auth.</li>
         <li>When using Cognito, IP allowlisting is still a good extra control for office/VPN traffic.</li>
       </ul>
@@ -3840,14 +4124,40 @@ aws secretsmanager put-secret-value \\
       <label>Expected HTTP Status Code</label>
       <input id="m-code" type="number" value="200">
     </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label class="toggle"><input type="checkbox" id="m-public-link-enabled" onchange="togglePublicLink()"> Show public host link</label>
+      </div>
+      <div class="form-group" id="m-public-link-group" style="display:none">
+        <label>Public Link URL</label>
+        <input id="m-public-link-url" placeholder="https://status.example.com/app">
+      </div>
+    </div>
     <div class="form-group">
       <label>Probes</label>
-      <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">
-        <label class="toggle"><input type="radio" name="m-region-mode" id="m-region-mode-all" value="all" checked onchange="toggleTargetRegionMode()"> Run on all deployed probes</label>
-        <label class="toggle"><input type="radio" name="m-region-mode" id="m-region-mode-selected" value="selected" onchange="toggleTargetRegionMode()"> Run only on selected probes</label>
+      <div class="choice-grid">
+        <label class="choice-card" id="m-region-card-all">
+          <input type="radio" name="m-region-mode" id="m-region-mode-all" value="all" checked onchange="toggleTargetRegionMode()">
+          <span>
+            <div class="choice-card-title">Run on all deployed probes</div>
+            <div class="choice-card-copy">Best when you want broad coverage by default. New probes will pick this host up automatically.</div>
+          </span>
+        </label>
+        <label class="choice-card" id="m-region-card-selected">
+          <input type="radio" name="m-region-mode" id="m-region-mode-selected" value="selected" onchange="toggleTargetRegionMode()">
+          <span>
+            <div class="choice-card-title">Run only on selected probes</div>
+            <div class="choice-card-copy">Use this when a host should stay scoped to specific regions, networks, or customer edges.</div>
+          </span>
+        </label>
       </div>
-      <div class="hint" id="m-target-regions-hint">All deployed probes will run this host unless you switch to selected probes.</div>
-      <div id="m-target-regions" class="checklist"></div>
+      <div class="probe-scope-panel inactive" id="m-target-regions-panel">
+        <div class="probe-scope-header">
+          <div class="probe-scope-title">Probe selection</div>
+          <div class="hint" id="m-target-regions-hint">All deployed probes will run this host unless you switch to selected probes.</div>
+        </div>
+        <div id="m-target-regions" class="probe-region-grid"></div>
+      </div>
     </div>
     <div class="form-group">
       <label class="toggle"><input type="checkbox" id="m-page" checked> Show on public status page</label>
@@ -4243,7 +4553,7 @@ async function disableTotp() {{
   toast('Authenticator MFA disabled');
 }}
 
-const PANES = ['hosts','regions','status-page','notifications','account','management','logs','settings','cost','guides'];
+const PANES = ['hosts','regions','status-page','notifications','account','management','diagnostics','settings','cost','guides'];
 function show(tab) {{
   PANES.forEach((t,i) => {{
     document.getElementById('pane-'+t).style.display = t===tab ? '' : 'none';
@@ -4256,7 +4566,7 @@ function show(tab) {{
   if (tab === 'notifications') loadNotificationSettings();
   if (tab === 'account') loadAccount();
   if (tab === 'management') loadManagement();
-  if (tab === 'logs') loadLogs();
+  if (tab === 'diagnostics') loadDiagnostics();
   if (tab === 'settings') loadSettings();
   if (tab === 'cost') loadCostDefaults();
 }}
@@ -4325,9 +4635,12 @@ function renderTargetRegions(selected=[]) {{
     return;
   }}
   wrap.innerHTML = REGIONS_CACHE.map(r => `
-    <label class="check-item">
+    <label class="probe-region-pill">
       <input type="checkbox" value="${{r.region}}" ${{selected.includes(r.region) ? 'checked' : ''}} onchange="updateHostImpact()">
-      <span>${{r.region}}</span>
+      <span>
+        <div class="probe-region-pill-name">${{r.region}}</div>
+        <div class="probe-region-pill-meta">${{(r.supported_tiers || [60,300]).map(t => formatTierLabel(t)).join(' · ')}}</div>
+      </span>
     </label>
   `).join('');
   toggleTargetRegionMode();
@@ -4344,20 +4657,98 @@ function targetRegionMode() {{
 function toggleTargetRegionMode() {{
   const selectedMode = targetRegionMode() === 'selected';
   const hint = document.getElementById('m-target-regions-hint');
+  const panel = document.getElementById('m-target-regions-panel');
+  const allCard = document.getElementById('m-region-card-all');
+  const selectedCard = document.getElementById('m-region-card-selected');
   const checkboxes = Array.from(document.querySelectorAll('#m-target-regions input[type=checkbox]'));
+  if (allCard) allCard.classList.toggle('active', !selectedMode);
+  if (selectedCard) selectedCard.classList.toggle('active', selectedMode);
+  if (panel) panel.classList.toggle('inactive', !selectedMode);
   checkboxes.forEach(el => {{
     el.disabled = !selectedMode;
     if (!selectedMode) el.checked = false;
   }});
   if (hint) {{
     hint.textContent = selectedMode
-      ? 'Only the checked probes will run this host.'
-      : 'All deployed probes will run this host.';
+      ? 'Only the checked probes will run this host. Choose the exact regions below.'
+      : 'This host will run on every deployed probe. The list below is shown for reference.';
   }}
   updateHostImpact();
 }}
 
+function describeHostScope(host) {{
+  const targets = Array.isArray(host.target_regions) ? host.target_regions : [];
+  return targets.length ? `Selected probes: ${{targets.join(', ')}}` : 'All deployed probes';
+}}
+
+function hostTierSeconds(host) {{
+  return +(host.monitor_tier_seconds || host.check_interval_seconds || 60);
+}}
+
+function computeHostProbeCoverage(host) {{
+  const targets = Array.isArray(host.target_regions) ? host.target_regions : [];
+  const tier = hostTierSeconds(host);
+  const regions = REGIONS_CACHE.map(region => {{
+    const scopedOut = targets.length > 0 && !targets.includes(region.region);
+    const supportsTier = (region.supported_tiers || [60,300]).includes(tier);
+    const eligible = !scopedOut && supportsTier;
+    let reason = '';
+    if (scopedOut) reason = 'Not selected for this host';
+    else if (!supportsTier) reason = `Does not support ${{formatTierLabel(tier)}}`;
+    else reason = `Supports ${{formatTierLabel(tier)}}`;
+    return {{
+      region: region.region,
+      eligible,
+      reason,
+    }};
+  }});
+  return {{
+    tier,
+    eligible: regions.filter(region => region.eligible),
+    blocked: regions.filter(region => !region.eligible),
+    regions,
+  }};
+}}
+
+function renderHostCoverage() {{
+  const wrap = document.getElementById('host-coverage');
+  if (!wrap) return;
+  if (!HOSTS_CACHE.length) {{
+    wrap.innerHTML = '<div class="hint">Add a host to see probe coverage.</div>';
+    return;
+  }}
+  if (!REGIONS_CACHE.length) {{
+    wrap.innerHTML = '<div class="hint">Deploy at least one probe region to see coverage.</div>';
+    return;
+  }}
+  wrap.innerHTML = `<div class="coverage-grid">${{HOSTS_CACHE.map(host => {{
+    const coverage = computeHostProbeCoverage(host);
+    const eligibleHtml = coverage.eligible.length
+      ? coverage.eligible.map(region => `<span class="coverage-pill ok">${{region.region}}</span>`).join('')
+      : '<span class="coverage-pill warn">No eligible probes</span>';
+    const blockedHtml = coverage.blocked.length
+      ? coverage.blocked.map(region => `<span class="coverage-pill off" title="${{region.reason}}">${{region.region}} · ${{region.reason}}</span>`).join('')
+      : '<span class="coverage-pill ok">No exclusions</span>';
+    return `
+      <div class="coverage-card">
+        <div class="coverage-head">
+          <div>
+            <div class="coverage-title">${{host.name}}</div>
+            <div class="coverage-subtitle">${{describeHostScope(host)}} · Interval: ${{formatTierLabel(coverage.tier)}} · ${{host.enabled === false ? 'Disabled host' : 'Enabled host'}}</div>
+          </div>
+          <span class="badge ${{host.enabled === false ? 'inactive' : coverage.eligible.length ? 'active' : 'warn'}}">${{host.enabled === false ? 'disabled' : coverage.eligible.length ? coverage.eligible.length + ' routes' : 'blocked'}}</span>
+        </div>
+        <div class="hint" style="margin-bottom:8px">Will run from</div>
+        <div class="coverage-pills" style="margin-bottom:10px">${{eligibleHtml}}</div>
+        <div class="hint" style="margin-bottom:8px">Skipped by</div>
+        <div class="coverage-pills">${{blockedHtml}}</div>
+      </div>
+    `;
+  }}).join('')}}</div>`;
+}}
+
 async function loadHosts() {{
+  await ensureRegionsLoaded();
   const hosts = await api('/api/hosts');
   if (hosts.unauthorized) {{
     showAuthGate('Enter the admin token to load hosts.');
@@ -4367,6 +4758,7 @@ async function loadHosts() {{
   const tbody = document.getElementById('hosts-body');
   if (!HOSTS_CACHE.length) {{
     tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
+    renderHostCoverage();
     return;
   }}
   tbody.innerHTML = HOSTS_CACHE.map(h => `
@@ -4385,6 +4777,7 @@ async function loadHosts() {{
         <button class="btn btn-danger btn-sm" onclick="deleteHost('${{h.host_id}}','${{h.name}}')">Del</button>
       </div></td>
     </tr>`).join('');
+  renderHostCoverage();
 }}
 
 function renderSslCell(host) {{
@@ -4414,17 +4807,19 @@ function openEditHostById(hostId) {{
 async function openAddHost() {{
   await ensureRegionsLoaded();
   document.getElementById('host-modal-title').textContent = 'Add Host';
-  ['m-id','m-name','m-url','m-sns'].forEach(id => document.getElementById(id).value = '');
+  ['m-id','m-name','m-url','m-sns','m-public-link-url'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('m-type').value = 'http';
   renderHostTierOptions(60);
   document.getElementById('m-timeout').value = 10;
   document.getElementById('m-code').value = 200;
   document.getElementById('m-page').checked = true;
+  document.getElementById('m-public-link-enabled').checked = false;
   document.getElementById('m-alert').checked = false;
   document.getElementById('m-enabled').checked = true;
   document.getElementById('m-region-mode-all').checked = true;
   document.getElementById('m-region-mode-selected').checked = false;
   document.getElementById('m-sns-group').style.display = 'none';
+  document.getElementById('m-public-link-group').style.display = 'none';
   renderTargetRegions([]);
   document.getElementById('host-modal').classList.add('open');
 }}
@@ -4440,6 +4835,8 @@ async function openEditHost(h) {{
   document.getElementById('m-timeout').value = h.timeout_seconds || 10;
   document.getElementById('m-code').value = h.expected_status_code || 200;
   document.getElementById('m-page').checked = !!h.show_on_status_page;
+  document.getElementById('m-public-link-enabled').checked = !!h.public_link_enabled;
+  document.getElementById('m-public-link-url').value = h.public_link_url || '';
   document.getElementById('m-alert').checked = !!h.alert_enabled;
   document.getElementById('m-sns').value = h.alert_sns_arn || '';
   document.getElementById('m-enabled').checked = h.enabled !== false;
@@ -4447,12 +4844,17 @@ async function openEditHost(h) {{
   document.getElementById('m-region-mode-all').checked = !hasScopedRegions;
   document.getElementById('m-region-mode-selected').checked = hasScopedRegions;
   document.getElementById('m-sns-group').style.display = h.alert_enabled ? '' : 'none';
+  document.getElementById('m-public-link-group').style.display = h.public_link_enabled ? '' : 'none';
   renderTargetRegions(h.target_regions || []);
   document.getElementById('host-modal').classList.add('open');
 }}
 
 function toggleSNS() {{
   document.getElementById('m-sns-group').style.display = document.getElementById('m-alert').checked ? '' : 'none';
+}}
+
+function togglePublicLink() {{
+  document.getElementById('m-public-link-group').style.display = document.getElementById('m-public-link-enabled').checked ? '' : 'none';
 }}
 
 function updateHostImpact() {{
@@ -4505,6 +4907,8 @@ async function saveHost() {{
     timeout_seconds: +document.getElementById('m-timeout').value,
     expected_status_code: +document.getElementById('m-code').value,
     show_on_status_page: document.getElementById('m-page').checked,
+    public_link_enabled: document.getElementById('m-public-link-enabled').checked,
+    public_link_url: document.getElementById('m-public-link-url').value,
     alert_enabled: document.getElementById('m-alert').checked,
     alert_sns_arn: document.getElementById('m-sns').value,
     enabled: document.getElementById('m-enabled').checked,
@@ -5042,6 +5446,138 @@ function renderLogs(data) {{
     </details>
   `).join('') : '<div class="hint">No log entries matched the current filter.</div>';
   window.LAST_LOGS_DATA = data;
+}}
+
+async function loadDiagnostics() {{
+  await Promise.all([loadLogs(), loadDynamoData()]);
+}}
+
+function populateDynamoHostFilter(hosts, selectedHostId='') {{
+  const select = document.getElementById('ddb-host-filter');
+  if (!select) return;
+  const current = selectedHostId || select.value || '';
+  const options = ['<option value="">Auto-select first host</option>'].concat(
+    (hosts || []).map(host => `<option value="${{host.host_id}}" ${{host.host_id === current ? 'selected' : ''}}>${{host.name || host.host_id}}</option>`)
+  );
+  select.innerHTML = options.join('');
+}}
+
+function populateDynamoRegionFilter(regions, selectedRegion='all') {{
+  const select = document.getElementById('ddb-region-filter');
+  if (!select) return;
+  const values = ['<option value="all">All regions</option>'].concat(
+    (regions || []).map(region => `<option value="${{region.region}}" ${{region.region === selectedRegion ? 'selected' : ''}}>${{region.region}}</option>`)
+  );
+  select.innerHTML = values.join('');
+}}
+
+function renderDynamoData(data) {{
+  const summaryEl = document.getElementById('ddb-summary');
+  const hostsEl = document.getElementById('ddb-hosts');
+  const checksEl = document.getElementById('ddb-checks');
+  if (!data || data.error) {{
+    const text = (data && data.error) || 'Unable to load DynamoDB data.';
+    summaryEl.innerHTML = `<div style="color:#ef4444">${{escapeHtml(text)}}</div>`;
+    hostsEl.innerHTML = '';
+    checksEl.innerHTML = '';
+    return;
+  }}
+  const hostsTable = data.hosts_table || {{}};
+  const checksTable = data.checks_table || {{}};
+  const hosts = Array.isArray(hostsTable.hosts) ? hostsTable.hosts : [];
+  const regions = Array.isArray(hostsTable.regions) ? hostsTable.regions : [];
+  const checks = Array.isArray(checksTable.rows) ? checksTable.rows : [];
+  const auditRows = Array.isArray(data.audit?.rows) ? data.audit.rows : [];
+  const view = data.view || 'overview';
+  populateDynamoHostFilter(hosts, checksTable.selected_host_id || '');
+  populateDynamoRegionFilter(regions, document.getElementById('ddb-region-filter')?.value || 'all');
+  summaryEl.innerHTML = `
+    <div class="diag-kv">
+      <div class="diag-kv-card"><div class="label">Hosts Table</div><div class="value">${{escapeHtml(hostsTable.name || '—')}}</div></div>
+      <div class="diag-kv-card"><div class="label">Host Rows</div><div class="value">${{hosts.length}}</div></div>
+      <div class="diag-kv-card"><div class="label">Region Records</div><div class="value">${{regions.length}}</div></div>
+      <div class="diag-kv-card"><div class="label">Checks Table</div><div class="value">${{escapeHtml(checksTable.name || '—')}}</div></div>
+    </div>
+  `;
+  const overviewHtml = `
+    <div class="diag-stack">
+      <div class="diag-row">
+        <div class="diag-row-title">Settings row</div>
+        <div class="diag-row-meta">Brand: ${{escapeHtml(hostsTable.settings?.brand_name || '—')}} · Title: ${{escapeHtml(hostsTable.settings?.status_page_title || '—')}} · Default interval: ${{hostsTable.settings?.default_check_interval ?? '—'}}s · Retention: ${{hostsTable.settings?.retention_days ?? '—'}} days</div>
+      </div>
+      <div class="diag-row">
+        <div class="diag-row-title">Worker regions</div>
+        <div class="coverage-pills" style="margin-top:10px">${{regions.length ? regions.map(region => `<span class="coverage-pill ok">${{region.region}} · ${{(region.supported_tiers || []).map(t => formatTierLabel(t)).join(', ') || 'No tiers'}}</span>`).join('') : '<span class="coverage-pill warn">No deployed worker regions</span>'}}</div>
+      </div>
+      <div class="diag-row">
+        <div class="diag-row-title">Hosts table view</div>
+        <div class="diag-table">
+          <table>
+            <thead><tr><th>Name</th><th>Status</th><th>Tier</th><th>Scope</th><th>Last Check</th></tr></thead>
+            <tbody>${{hosts.length ? hosts.map(host => `<tr><td>${{escapeHtml(host.name || host.host_id)}}</td><td><span class="badge ${{host.current_status || 'unknown'}}">${{escapeHtml(host.current_status || 'unknown')}}</span></td><td>${{host.monitor_tier_seconds}}s</td><td>${{host.target_regions && host.target_regions.length ? escapeHtml(host.target_regions.join(', ')) : 'All probes'}}</td><td>${{escapeHtml(formatLogTime(host.last_checked_at))}}</td></tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:18px">No hosts found.</td></tr>'}}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+  const checksHtml = `
+    <div class="diag-row">
+      <div class="diag-row-title">Recent checks for ${{escapeHtml(checksTable.selected_host_name || 'selected host')}}</div>
+      <div class="diag-row-meta">Showing the latest ${{checksTable.limit || checks.length}} rows from ${{escapeHtml(checksTable.name || 'uptime-checks')}}.</div>
+      <div class="diag-table">
+        <table>
+          <thead><tr><th>When</th><th>Region</th><th>Status</th><th>Latency</th><th>HTTP</th><th>Error</th></tr></thead>
+          <tbody>${{checks.length ? checks.map(row => `<tr><td>${{escapeHtml(formatLogTime(row.checked_at))}}</td><td>${{escapeHtml(row.region || '—')}}</td><td><span class="badge ${{row.status || 'unknown'}}">${{escapeHtml(row.status || 'unknown')}}</span></td><td>${{row.latency_ms != null ? row.latency_ms + ' ms' : '—'}}</td><td>${{row.status_code != null ? row.status_code : '—'}}</td><td title="${{escapeHtml(row.error || '')}}">${{escapeHtml((row.error || '').slice(0, 96) || '—')}}</td></tr>`).join('') : '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:18px">No checks found for the selected host.</td></tr>'}}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  const hostsHtml = `
+    <div class="diag-row">
+      <div class="diag-row-title">Hosts table view</div>
+      <div class="diag-row-meta">Current host rows with interval, scope, and last aggregate status.</div>
+      <div class="diag-table">
+        <table>
+          <thead><tr><th>Name</th><th>Status</th><th>Tier</th><th>Scope</th><th>Last Check</th></tr></thead>
+          <tbody>${{hosts.length ? hosts.map(host => `<tr><td>${{escapeHtml(host.name || host.host_id)}}</td><td><span class="badge ${{host.current_status || 'unknown'}}">${{escapeHtml(host.current_status || 'unknown')}}</span></td><td>${{host.monitor_tier_seconds}}s</td><td>${{host.target_regions && host.target_regions.length ? escapeHtml(host.target_regions.join(', ')) : 'All probes'}}</td><td>${{escapeHtml(formatLogTime(host.last_checked_at))}}</td></tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:18px">No hosts found.</td></tr>'}}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  const auditHtml = `
+    <div class="diag-row">
+      <div class="diag-row-title">Management audit log</div>
+      <div class="diag-row-meta">Recent admin and system actions like worker add, update, delete, and force-update.</div>
+      <div class="diag-table">
+        <table>
+          <thead><tr><th>When</th><th>Action</th><th>Status</th><th>Region</th><th>Details</th></tr></thead>
+          <tbody>${{auditRows.length ? auditRows.map(row => `<tr><td>${{escapeHtml(formatLogTime(row.created_at))}}</td><td>${{escapeHtml(row.event_type || '—')}}</td><td><span class="badge ${{row.status === 'error' ? 'error' : 'active'}}">${{escapeHtml(row.status || 'ok')}}</span></td><td>${{escapeHtml(row.region || '—')}}</td><td>${{escapeHtml(row.error || row.monitor_build_version || row.action || '') || '—'}}</td></tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:18px">No audit rows found.</td></tr>'}}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  hostsEl.innerHTML = view === 'hosts' ? hostsHtml : view === 'checks' ? '' : view === 'audit' ? '' : overviewHtml;
+  checksEl.innerHTML = view === 'checks' ? checksHtml : view === 'audit' ? auditHtml : '';
+  if (view === 'hosts') checksEl.innerHTML = '';
+  if (view === 'audit') hostsEl.innerHTML = '';
+}}
+
+async function loadDynamoData() {{
+  await ensureRegionsLoaded();
+  const view = document.getElementById('ddb-view-select')?.value || 'overview';
+  const hostId = document.getElementById('ddb-host-filter')?.value || '';
+  const region = document.getElementById('ddb-region-filter')?.value || 'all';
+  const checksLimit = document.getElementById('ddb-check-limit')?.value || '50';
+  const summaryEl = document.getElementById('ddb-summary');
+  const hostsEl = document.getElementById('ddb-hosts');
+  const checksEl = document.getElementById('ddb-checks');
+  summaryEl.innerHTML = '<span class="spinner"></span> Loading DynamoDB summary…';
+  hostsEl.innerHTML = '<span class="spinner"></span> Loading hosts table…';
+  checksEl.innerHTML = '<span class="spinner"></span> Loading checks table…';
+  const qs = new URLSearchParams({{checks_limit: checksLimit, view, region}});
+  if (hostId) qs.set('host_id', hostId);
+  const data = await api('/api/dynamodb?'+qs.toString());
+  renderDynamoData(data);
 }}
 
 async function ensureLogsRegions() {{

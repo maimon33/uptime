@@ -40,8 +40,8 @@ MAX_WORKERS = 20
 
 def handler(event, context):
     run_id = (event or {}).get("run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    due_tiers = _normalize_monitor_tiers((event or {}).get("due_tiers"), fallback=[60])
     supported_tiers = _normalize_monitor_tiers((event or {}).get("supported_tiers"), fallback=[60, 300])
+    now = datetime.now(timezone.utc)
 
     db = _get_dynamodb()
     hosts_table = db.Table(HOSTS_TABLE)
@@ -49,13 +49,22 @@ def handler(event, context):
         FilterExpression="enabled = :t AND host_id <> :s AND NOT begins_with(host_id, :r)",
         ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__"},
     )
-    hosts = [
-        host for host in resp.get("Items", [])
-        if _host_runs_in_region(host, MONITOR_REGION) and _host_due_for_tier(host, supported_tiers, due_tiers)
-    ]
+    enabled_hosts = resp.get("Items", [])
+    region_hosts = [host for host in enabled_hosts if _host_runs_in_region(host, MONITOR_REGION)]
+    supported_hosts = [host for host in region_hosts if _host_tier_supported(host, supported_tiers)]
+    due_hosts = [host for host in supported_hosts if _host_due_now(host, MONITOR_REGION, now)]
+    hosts = due_hosts
 
     if not hosts:
-        print(f"[{MONITOR_REGION}] no enabled hosts")
+        print(
+            f"[{MONITOR_REGION}] no runnable hosts "
+            f"(enabled={len(enabled_hosts)}, "
+            f"region_matched={len(region_hosts)}, "
+            f"tier_supported={len(supported_hosts)}, "
+            f"due_now={len(due_hosts)}, "
+            f"supported_tiers={supported_tiers}, "
+            f"run_time={now.isoformat()})"
+        )
         return {"checked": 0, "region": MONITOR_REGION, "run_id": run_id, "results": []}
 
     print(f"[{MONITOR_REGION}] checking {len(hosts)} hosts for run {run_id}")
@@ -128,11 +137,39 @@ def _host_runs_in_region(host: dict, region: str) -> bool:
     return region in targets
 
 
-def _host_due_for_tier(host: dict, supported_tiers: list[int], due_tiers: list[int]) -> bool:
+def _host_tier_supported(host: dict, supported_tiers: list[int]) -> bool:
     tier = _host_monitor_tier_seconds(host)
-    if tier not in supported_tiers:
-        return False
-    return tier in due_tiers
+    return tier in supported_tiers
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _host_due_now(host: dict, region: str, now: datetime) -> bool:
+    tier = _host_monitor_tier_seconds(host)
+    region_status = ((host.get("region_statuses") or {}).get(region) or {})
+    last_checked = _parse_timestamp(region_status.get("checked_at"))
+    if last_checked is None:
+        last_checked = _parse_timestamp(host.get("last_checked_at"))
+    if last_checked is None:
+        return True
+    elapsed = (now - last_checked).total_seconds()
+    # Small slack avoids minute-boundary jitter from skipping an otherwise-due host.
+    return elapsed >= max(0, tier - 5)
 
 
 def _check_and_record(host: dict, run_id: str) -> dict:

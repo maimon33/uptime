@@ -23,7 +23,7 @@ Arguments:
 Notes:
   - Publishes the latest artifacts to the template bucket and all supported regional artifact buckets.
   - Updates the management Lambda code in the chosen home region.
-  - Can optionally force-update all deployed probes to the same worker build.
+  - Always force-updates all deployed probes to the same worker build.
   - Optionally sends an SNS notification after a successful deploy.
 
 Examples:
@@ -76,24 +76,6 @@ render_progress() {
   else
     echo "→ ${label}"
   fi
-}
-
-prompt_force_update_probes() {
-  if [[ "${FORCE_UPDATE_PROBES:-}" == "1" || "${FORCE_UPDATE_PROBES:-}" == "true" || "${FORCE_UPDATE_PROBES:-}" == "yes" ]]; then
-    return 0
-  fi
-  if [[ "${FORCE_UPDATE_PROBES:-}" == "0" || "${FORCE_UPDATE_PROBES:-}" == "false" || "${FORCE_UPDATE_PROBES:-}" == "no" ]]; then
-    return 1
-  fi
-  if [[ "$INTERACTIVE" -ne 1 ]]; then
-    return 1
-  fi
-  echo ""
-  read -r -p "Force update all deployed probes to worker build ${VERSION}? [y/N] " reply
-  case "${reply}" in
-    y|Y|yes|YES) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 finish_progress_line() {
@@ -177,16 +159,8 @@ replicate_bucket() {
   }
 }
 
-TOTAL_STEPS=3
-WILL_FORCE_UPDATE_PROBES=0
-if prompt_force_update_probes; then
-  WILL_FORCE_UPDATE_PROBES=1
-  TOTAL_STEPS=$((TOTAL_STEPS + 1))
-fi
-[[ -n "$NOTIFY_TOPIC_ARN" ]] && TOTAL_STEPS=4
-if [[ -n "$NOTIFY_TOPIC_ARN" && "$WILL_FORCE_UPDATE_PROBES" -eq 1 ]]; then
-  TOTAL_STEPS=5
-fi
+TOTAL_STEPS=4
+[[ -n "$NOTIFY_TOPIC_ARN" ]] && TOTAL_STEPS=5
 CURRENT_STEP=1
 
 run_step "$CURRENT_STEP" "$TOTAL_STEPS" "Publishing source artifacts to ${TEMPLATE_BUCKET}" "$LOG_DIR/publish-source.log" \
@@ -267,21 +241,20 @@ FUNCTION_URL="$(
     --output text 2>/dev/null || true
 )"
 
-if [[ "$WILL_FORCE_UPDATE_PROBES" -eq 1 ]]; then
-  CURRENT_STEP=$((CURRENT_STEP + 1))
-  render_progress "$CURRENT_STEP" "$TOTAL_STEPS" "Force updating all deployed probes"
-  if ! aws lambda invoke \
-    --region "$HOME_REGION" \
-    --function-name "$FUNCTION_NAME" \
-    --cli-binary-format raw-in-base64-out \
-    --payload '{"action":"force_update_probes"}' \
-    "$LOG_DIR/force-update-probes.json" >"$LOG_DIR/force-update-probes.log" 2>&1; then
-    finish_progress_line
-    echo "error: Force updating all deployed probes"
-    show_log_excerpt "$LOG_DIR/force-update-probes.log"
-    exit 1
-  fi
-  if ! python3 - <<'PY' "$LOG_DIR/force-update-probes.json"
+CURRENT_STEP=$((CURRENT_STEP + 1))
+render_progress "$CURRENT_STEP" "$TOTAL_STEPS" "Force updating all deployed probes"
+if ! aws lambda invoke \
+  --region "$HOME_REGION" \
+  --function-name "$FUNCTION_NAME" \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"action":"force_update_probes"}' \
+  "$LOG_DIR/force-update-probes.json" >"$LOG_DIR/force-update-probes.log" 2>&1; then
+  finish_progress_line
+  echo "error: Force updating all deployed probes"
+  show_log_excerpt "$LOG_DIR/force-update-probes.log"
+  exit 1
+fi
+if ! python3 - <<'PY' "$LOG_DIR/force-update-probes.json"
 import json, sys
 path = sys.argv[1]
 with open(path) as f:
@@ -292,12 +265,11 @@ ok = data.get("ok", False)
 if not ok:
     raise SystemExit(1)
 PY
-  then
-    finish_progress_line
-    echo "error: Force updating all deployed probes"
-    show_log_excerpt "$LOG_DIR/force-update-probes.json"
-    exit 1
-  fi
+then
+  finish_progress_line
+  echo "error: Force updating all deployed probes"
+  show_log_excerpt "$LOG_DIR/force-update-probes.json"
+  exit 1
 fi
 
 cat > "$REPO_ROOT/dist/deploy-last.json" <<EOF
@@ -310,7 +282,7 @@ cat > "$REPO_ROOT/dist/deploy-last.json" <<EOF
   "published_regional_buckets": ["${REGIONAL_BUCKETS[0]}", "${REGIONAL_BUCKETS[1]}", "${REGIONAL_BUCKETS[2]}", "${REGIONAL_BUCKETS[3]}"],
   "artifact_bucket": "$ARTIFACT_BUCKET",
   "artifact_key": "$ARTIFACT_KEY",
-  "force_updated_probes": $([[ "$WILL_FORCE_UPDATE_PROBES" -eq 1 ]] && echo true || echo false),
+  "force_updated_probes": true,
   "function_url": "$FUNCTION_URL",
   "deployed_at": "$DEPLOYED_AT"
 }
@@ -344,7 +316,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo "- Built at: \`${BUILT_AT}\`"
     echo "- Home region: \`${HOME_REGION}\`"
     echo "- Function: \`${FUNCTION_NAME}\`"
-    echo "- Force-updated probes: \`$([[ "$WILL_FORCE_UPDATE_PROBES" -eq 1 ]] && echo yes || echo no)\`"
+    echo "- Force-updated probes: \`yes\`"
     echo "- Template bucket: \`s3://${TEMPLATE_BUCKET}/${PREFIX%/}/cloudformation/uptime-bootstrap.yaml\`"
     echo "- Regional buckets:"
     for bucket in "${REGIONAL_BUCKETS[@]}"; do
@@ -366,7 +338,7 @@ echo "  Version: ${VERSION}"
 echo "  Built at: ${BUILT_AT}"
 echo "  Region: ${HOME_REGION}"
 echo "  Function: ${FUNCTION_NAME}"
-echo "  Force-updated probes: $([[ "$WILL_FORCE_UPDATE_PROBES" -eq 1 ]] && echo yes || echo no)"
+echo "  Force-updated probes: yes"
 echo "  Expected worker build: ${VERSION}"
 echo "  Pinned artifact path: ${SOURCE_VERSIONED_URI}management.zip"
 echo "  Template bucket: s3://${TEMPLATE_BUCKET}/${PREFIX%/}/cloudformation/uptime-bootstrap.yaml"

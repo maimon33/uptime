@@ -44,10 +44,21 @@ Parameters:
     Description: MFA mode for the Cognito user pool when AdminAuthMode is cognito. TOTP is enabled in the pool.
 
 Conditions:
-  HasProvidedAdminApiKey: !Not [!Equals [!Ref AdminApiKey, '']]
-  UseCognitoAuth: !Equals [!Ref AdminAuthMode, cognito]
-  CognitoMfaEnabled: !Not [!Equals [!Ref CognitoMfaMode, OFF]]
-  HasCognitoManagedDomainPrefix: !Not [!Equals [!Ref CognitoManagedDomainPrefix, '']]
+  HasProvidedAdminApiKey: !Not
+    - !Equals
+      - !Ref AdminApiKey
+      - ''
+  UseCognitoAuth: !Equals
+    - !Ref AdminAuthMode
+    - cognito
+  CognitoMfaEnabled: !Not
+    - !Equals
+      - !Ref CognitoMfaMode
+      - OFF
+  HasCognitoManagedDomainPrefix: !Not
+    - !Equals
+      - !Ref CognitoManagedDomainPrefix
+      - ''
   CreateCognitoManagedDomain: !And
     - !Condition UseCognitoAuth
     - !Condition HasCognitoManagedDomainPrefix
@@ -118,7 +129,10 @@ Resources:
     Properties:
       Name: uptime/admin-key
       Description: Admin API key for uptime management Lambda
-      SecretString: !If [HasProvidedAdminApiKey, !Ref AdminApiKey, !Ref AWS::NoValue]
+      SecretString: !If
+        - HasProvidedAdminApiKey
+        - !Ref AdminApiKey
+        - !Ref AWS::NoValue
       GenerateSecretString: !If
         - HasProvidedAdminApiKey
         - !Ref AWS::NoValue
@@ -339,7 +353,10 @@ Resources:
       MemorySize: 256
       Code:
         # Region-matched artifact bucket selected from the mapping above.
-        S3Bucket: !FindInMap [ArtifactBuckets, !Ref AWS::Region, Name]
+        S3Bucket: !FindInMap
+          - ArtifactBuckets
+          - !Ref AWS::Region
+          - Name
         S3Key: uptime/releases/management.zip
       Environment:
         Variables:
@@ -348,14 +365,23 @@ Resources:
           ADMIN_KEY_SECRET: !Ref AdminKeySecret
           ADMIN_AUTH_MODE: !Ref AdminAuthMode
           ADMIN_ALLOWED_IP_CIDRS: !Ref AdminAllowedIpCidrs
-          COGNITO_USER_POOL_ID: !If [UseCognitoAuth, !Ref AdminUserPool, '']
-          COGNITO_USER_POOL_CLIENT_ID: !If [UseCognitoAuth, !Ref AdminUserPoolClient, '']
+          COGNITO_USER_POOL_ID: !If
+            - UseCognitoAuth
+            - !Ref AdminUserPool
+            - ''
+          COGNITO_USER_POOL_CLIENT_ID: !If
+            - UseCognitoAuth
+            - !Ref AdminUserPoolClient
+            - ''
           COGNITO_USER_POOL_DOMAIN: !If
             - CreateCognitoManagedDomain
             - !Sub 'https://${CognitoManagedDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
             - ''
           COGNITO_ALLOWED_EMAIL_DOMAIN: !Ref CognitoAllowedEmailDomain
-          COGNITO_MFA_MODE: !If [UseCognitoAuth, !Ref CognitoMfaMode, '']
+          COGNITO_MFA_MODE: !If
+            - UseCognitoAuth
+            - !Ref CognitoMfaMode
+            - ''
           HOME_REGION: !Ref AWS::Region
           PROJECT: uptime
           RETENTION_DAYS: '90'
