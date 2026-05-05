@@ -19,6 +19,7 @@ API (admin key required):
   GET              /api/hosts/:id/checks
   GET/PUT          /api/settings
   GET              /api/cost
+  GET              /api/logs
   GET              /api/regions
   POST             /api/regions            body: {region, memory_mb?}
   POST             /api/regions/:r/update  re-deploy worker code to an existing region
@@ -27,6 +28,7 @@ API (admin key required):
 """
 
 import base64
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -56,6 +58,7 @@ _cloudfront = None
 _route53 = None
 _dynamodb_client = None
 _cloudwatch = {}
+_logs = {}
 _cognito_idp = None
 
 def _db():
@@ -129,6 +132,14 @@ def _cloudwatch_client(region_name: str):
     return client
 
 
+def _logs_client(region_name: str):
+    client = _logs.get(region_name)
+    if client is None:
+        client = boto3.client("logs", region_name=region_name)
+        _logs[region_name] = client
+    return client
+
+
 def _cognito_idp_client():
     global _cognito_idp
     if _cognito_idp is None:
@@ -166,6 +177,8 @@ _SETTINGS_DEFAULTS = {
     "maintenance_message":     "",
     "maintenance_window":      "",
     "maintenance_scope":       "",
+    "maintenance_starts_at":   "",
+    "maintenance_ends_at":     "",
     "notifications_default_topic_arn": "",
     "notifications_sender_label": "",
     "notifications_initial_delay_seconds": 0,
@@ -205,6 +218,10 @@ def handler(event, context):
         if _is_scheduled_event(event):
             _log("info", "scheduled_event_received", source=event.get("source"), resources=event.get("resources", []))
             return _run_orchestration()
+
+        if isinstance(event, dict) and event.get("action"):
+            _log("info", "direct_management_action_received", action=event.get("action"))
+            return _run_management_action(event)
 
         method = event.get("requestContext", {}).get("http", {}).get("method", "GET").upper()
         path   = (event.get("rawPath", "/") or "/").rstrip("/") or "/"
@@ -297,6 +314,22 @@ def _build_info() -> dict:
             _log("warn", "build_info_load_failed", error=str(exc))
         _build_info_cache = info
     return _build_info_cache
+
+
+def _build_stamp(info: dict | None = None) -> str:
+    data = info or _build_info()
+    version = (data.get("version") or "unknown").strip() or "unknown"
+    built_at = (data.get("built_at") or "").strip()
+    region = (data.get("region") or HOME_REGION).strip() or HOME_REGION
+    parts = [f"Version {version}", f"Region {region}"]
+    if built_at:
+        parts.append(f"Built {built_at}")
+    return " · ".join(parts)
+
+
+def _embedded_monitor_source_sha() -> str:
+    path = Path(__file__).with_name("_monitor_handler.py")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _log(level: str, message: str, **fields) -> None:
@@ -924,6 +957,10 @@ def _route_api(method: str, path: str, event: dict) -> dict:
         if method == "POST":
             return _run_management_action(body)
 
+    if resource == "logs":
+        if method == "GET":
+            return _get_logs(qs)
+
     # ── /api/cost ─────────────────────────────────────────────────────────────
     if resource == "cost":
         return _cost_estimate(qs)
@@ -1071,7 +1108,7 @@ def _update_settings(body: dict) -> dict:
         "status_page_subscribe_intro", "status_page_subscribe_email_url",
         "status_page_subscribe_sms_url", "status_page_subscribe_webhook_url",
         "maintenance_enabled", "maintenance_message", "maintenance_window",
-        "maintenance_scope",
+        "maintenance_scope", "maintenance_starts_at", "maintenance_ends_at",
         "notifications_default_topic_arn", "notifications_sender_label",
         "notifications_initial_delay_seconds", "notifications_reminder_interval_minutes",
         "notifications_ttl_seconds", "notifications_quiet_hours_enabled",
@@ -1478,6 +1515,7 @@ def _get_management_summary() -> dict:
             })
     summary = {
         "home_region": HOME_REGION,
+        "build": _build_info(),
         "tables": {
             "hosts": _table_summary(hosts_desc),
             "checks": _table_summary(checks_desc),
@@ -1513,7 +1551,43 @@ def _run_management_action(body: dict) -> dict:
         _save_settings_item(settings)
         _log("info", "management_retention_updated", retention_days=retention_days)
         return _json(200, {"ok": True, "retention_days": retention_days})
+    if action == "force_update_probes":
+        return _force_update_probes()
     return _json(400, {"error": "Unknown management action"})
+
+
+def _force_update_probes() -> dict:
+    region_records = reg.list_regions(_db())
+    if not region_records:
+        return _json(200, {"ok": True, "updated": 0, "regions": []})
+
+    updated = []
+    failed = []
+    for region_info in region_records:
+        region_name = region_info.get("region", "")
+        memory_mb = int(region_info.get("memory_mb", 256) or 256)
+        supported_tiers = _normalize_monitor_tiers(region_info.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
+        try:
+            info = reg.deploy_region(region_name, memory_mb, supported_tiers)
+            reg.save_region_record(_db(), info)
+            updated.append({
+                "region": region_name,
+                "monitor_build_version": info.get("monitor_build_version", ""),
+                "monitor_source_sha": info.get("monitor_source_sha", ""),
+                "deployed_at": info.get("deployed_at", ""),
+            })
+        except Exception as exc:
+            failed.append({"region": region_name, "error": str(exc)})
+
+    status = 200 if not failed else 500
+    return _json(status, {
+        "ok": not failed,
+        "updated": len(updated),
+        "failed": failed,
+        "regions": updated,
+        "expected_worker_build": _build_info().get("version", "unknown"),
+        "expected_worker_source_sha": _embedded_monitor_source_sha(),
+    })
 
 
 def _table_summary(table_desc: dict) -> dict:
@@ -1643,23 +1717,225 @@ def _management_lambda_summary() -> dict:
             "region": HOME_REGION,
             "error": str(exc),
         }
-    return _lambda_metrics_snapshot(
+    summary = _lambda_metrics_snapshot(
         function_name=function_name,
         region_name=HOME_REGION,
         deployed_at=config.get("LastModified"),
         memory_mb=int(config.get("MemorySize", 0) or 0),
         runtime=config.get("Runtime"),
     )
+    summary["version"] = _build_info().get("version", "unknown")
+    summary["expected_monitor_source_sha"] = _embedded_monitor_source_sha()
+    return summary
 
 
 def _worker_lambda_summary(region_info: dict) -> dict:
-    return _lambda_metrics_snapshot(
-        function_name=region_info.get("function_name", f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region_info.get('region')}"),
-        region_name=region_info.get("region", HOME_REGION),
-        deployed_at=region_info.get("deployed_at"),
-        memory_mb=int(region_info.get("memory_mb", 0) or 0),
-        runtime="python3.12",
+    function_name = region_info.get("function_name", f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region_info.get('region')}")
+    region_name = region_info.get("region", HOME_REGION)
+    deployed_at = region_info.get("deployed_at")
+    memory_mb = int(region_info.get("memory_mb", 0) or 0)
+    runtime = "python3.12"
+    summary = _lambda_metrics_snapshot(
+        function_name=function_name,
+        region_name=region_name,
+        deployed_at=deployed_at,
+        memory_mb=memory_mb,
+        runtime=runtime,
     )
+    expected_sha = _embedded_monitor_source_sha()
+    expected_version = _build_info().get("version", "unknown")
+    summary["expected_monitor_source_sha"] = expected_sha
+    summary["expected_monitor_build_version"] = expected_version
+    summary["recorded_monitor_source_sha"] = region_info.get("monitor_source_sha", "")
+    summary["recorded_monitor_build_version"] = region_info.get("monitor_build_version", "")
+    summary["recorded_lambda_last_modified"] = region_info.get("lambda_last_modified", "")
+    try:
+        config = _lambda_client(region_name).get_function_configuration(FunctionName=function_name)
+        env = (config.get("Environment") or {}).get("Variables", {})
+        running_sha = env.get("MONITOR_SOURCE_SHA", "")
+        running_version = env.get("MONITOR_BUILD_VERSION", "")
+        summary["running_monitor_source_sha"] = running_sha
+        summary["running_monitor_build_version"] = running_version
+        summary["lambda_last_modified"] = config.get("LastModified")
+        summary["lambda_revision_id"] = config.get("RevisionId")
+        summary["runtime"] = config.get("Runtime") or runtime
+        summary["memory_mb"] = int(config.get("MemorySize", memory_mb) or 0)
+        summary["version_status"] = "match" if running_sha == expected_sha and running_version == expected_version else "mismatch"
+    except Exception as exc:
+        summary["error"] = str(exc)
+        summary["version_status"] = "unknown"
+    return summary
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _iso_from_epoch_ms(value: int | None) -> str:
+    if value in (None, ""):
+        return ""
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+
+
+def _infer_log_level(message: str, parsed: dict | None = None) -> str:
+    if parsed and parsed.get("level"):
+        return str(parsed.get("level")).strip().lower()
+    text = (message or "").lower()
+    if any(token in text for token in ["exception", "traceback", "error", "failed"]):
+        return "error"
+    if any(token in text for token in ["warn", "forbidden", "unauthorized", "throttle"]):
+        return "warn"
+    return "info"
+
+
+def _classify_log_issue(level: str, event_name: str, raw_message: str, parsed: dict | None = None) -> tuple[str, str]:
+    text = f"{event_name} {raw_message}".lower()
+    if event_name == "handler_exception" or "traceback" in text:
+        return "error", "Unhandled exception"
+    if "worker invoke failed" in text or event_name == "worker_invoke_failed":
+        return "error", "Probe invoke failed"
+    if "unauthorized" in text or "forbidden" in text or event_name in {"api_request_unauthorized", "admin_ip_blocked", "api_ip_blocked"}:
+        return "warn", "Access rejected"
+    if "timeout" in text:
+        return "error", "Timeout"
+    if "route_not_found" in text:
+        return "warn", "Unknown route"
+    if event_name in {"orchestration_started", "orchestration_completed", "scheduled_event_received"}:
+        return "info", "Orchestration event"
+    if event_name in {"purge_checks_started", "purge_checks_completed"}:
+        return "info", "Maintenance action"
+    if level == "error":
+        return "error", "Error event"
+    if level == "warn":
+        return "warn", "Warning"
+    return "info", "Informational"
+
+
+def _normalize_log_entry(event: dict) -> dict:
+    raw_message = (event.get("message") or "").rstrip()
+    parsed = None
+    try:
+        parsed = json.loads(raw_message)
+    except Exception:
+        parsed = None
+    event_name = str((parsed or {}).get("message") or "").strip()
+    level = _infer_log_level(raw_message, parsed)
+    severity, issue = _classify_log_issue(level, event_name, raw_message, parsed)
+    details = {}
+    if isinstance(parsed, dict):
+        details = {k: v for k, v in parsed.items() if k not in {"level", "message", "time"}}
+    summary = event_name or (raw_message.splitlines()[0][:220] if raw_message else "Log event")
+    return {
+        "timestamp": _safe_int(event.get("timestamp"), 0),
+        "time": _iso_from_epoch_ms(event.get("timestamp")),
+        "ingestion_time": _iso_from_epoch_ms(event.get("ingestionTime")),
+        "level": level,
+        "severity": severity,
+        "issue": issue,
+        "summary": summary,
+        "event_name": event_name,
+        "details": details,
+        "raw_message": raw_message,
+    }
+
+
+def _log_group_for_scope(scope: str, region_name: str) -> tuple[str, str]:
+    if scope == "worker":
+        function_name = f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region_name}"
+        return function_name, f"/aws/lambda/{function_name}"
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "uptime-management")
+    return function_name, f"/aws/lambda/{function_name}"
+
+
+def _get_logs(qs: dict) -> dict:
+    scope = (qs.get("scope", ["management"])[0] or "management").strip().lower()
+    requested_region = (qs.get("region", [""])[0] or "").strip()
+    limit = max(20, min(200, _safe_int(qs.get("limit", ["80"])[0], 80)))
+    lookback_hours = max(1, min(168, _safe_int(qs.get("hours", ["24"])[0], 24)))
+
+    if scope not in {"management", "worker"}:
+        return _json(400, {"error": "scope must be management or worker"})
+
+    regions = reg.list_regions(_db())
+    available_regions = [item.get("region", "") for item in regions if item.get("region")]
+    if scope == "worker":
+        if not available_regions:
+            return _json(200, {
+                "scope": scope,
+                "region": "",
+                "available_regions": [],
+                "entries": [],
+                "issues": [],
+                "summary": {"error": 0, "warn": 0, "info": 0},
+                "message": "No worker regions are deployed yet.",
+            })
+        region_name = requested_region or available_regions[0]
+        if region_name not in available_regions:
+            return _json(400, {"error": "Unknown worker region", "available_regions": available_regions})
+    else:
+        region_name = HOME_REGION
+
+    function_name, log_group_name = _log_group_for_scope(scope, region_name)
+    start_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp() * 1000)
+    try:
+        client = _logs_client(region_name)
+        events = []
+        next_token = None
+        seen_tokens = set()
+        page_count = 0
+        while page_count < 12:
+            kwargs = {
+                "logGroupName": log_group_name,
+                "startTime": start_time_ms,
+                "limit": min(100, limit),
+                "interleaved": True,
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = client.filter_log_events(**kwargs)
+            events.extend(response.get("events", []))
+            if len(events) > limit * 3:
+                events = events[-(limit * 3):]
+            page_count += 1
+            next_token = response.get("nextToken")
+            if not next_token or next_token in seen_tokens:
+                break
+            seen_tokens.add(next_token)
+    except ClientError as exc:
+        error_code = ((exc.response or {}).get("Error") or {}).get("Code", "ClientError")
+        return _json(200, {
+            "scope": scope,
+            "region": region_name,
+            "function_name": function_name,
+            "log_group_name": log_group_name,
+            "available_regions": available_regions,
+            "entries": [],
+            "issues": [],
+            "summary": {"error": 0, "warn": 0, "info": 0},
+            "message": f"Unable to read logs: {error_code}",
+        })
+
+    raw_events = sorted(events, key=lambda item: item.get("timestamp", 0), reverse=True)[:limit]
+    entries = [_normalize_log_entry(item) for item in raw_events]
+    summary = {"error": 0, "warn": 0, "info": 0}
+    for entry in entries:
+        summary[entry["severity"]] = summary.get(entry["severity"], 0) + 1
+    issues = [entry for entry in entries if entry["severity"] in {"error", "warn"}][:12]
+    return _json(200, {
+        "scope": scope,
+        "region": region_name,
+        "function_name": function_name,
+        "log_group_name": log_group_name,
+        "lookback_hours": lookback_hours,
+        "limit": limit,
+        "available_regions": available_regions,
+        "summary": summary,
+        "issues": issues,
+        "entries": entries,
+    })
 
 
 def _purge_checks_older_than(older_than_days: int, max_delete: int) -> dict:
@@ -1984,6 +2260,68 @@ def _default_cost_inputs() -> dict:
     }
 
 
+def _parse_iso_datetime(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _maintenance_state(settings: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    enabled = bool(settings.get("maintenance_enabled"))
+    message = (settings.get("maintenance_message") or "").strip()
+    window = (settings.get("maintenance_window") or "").strip()
+    scope = (settings.get("maintenance_scope") or "").strip()
+    starts_at = _parse_iso_datetime(settings.get("maintenance_starts_at", ""))
+    ends_at = _parse_iso_datetime(settings.get("maintenance_ends_at", ""))
+
+    if ends_at and starts_at and ends_at < starts_at:
+        ends_at = None
+
+    if enabled and message:
+        if ends_at and now > ends_at:
+            state = "expired"
+        elif starts_at and now < starts_at:
+            state = "scheduled"
+        elif starts_at or ends_at:
+            state = "live"
+        else:
+            state = "enabled"
+    elif message or window or scope or starts_at or ends_at:
+        state = "draft"
+    else:
+        state = "off"
+
+    if window:
+        display_window = window
+    elif starts_at and ends_at:
+        display_window = f"{starts_at.strftime('%Y-%m-%d %H:%M UTC')} - {ends_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    elif starts_at:
+        display_window = f"Starts {starts_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    elif ends_at:
+        display_window = f"Ends {ends_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    else:
+        display_window = ""
+
+    return {
+        "state": state,
+        "public_visible": state in {"scheduled", "live", "enabled"},
+        "title": "Maintenance in progress" if state == "live" else "Scheduled maintenance",
+        "message": message,
+        "window": display_window,
+        "scope": scope,
+        "starts_at": starts_at.isoformat() if starts_at else "",
+        "ends_at": ends_at.isoformat() if ends_at else "",
+    }
+
+
 # ── Public status page ────────────────────────────────────────────────────────
 
 def _serve_status_page() -> dict:
@@ -1998,10 +2336,7 @@ def _serve_status_page() -> dict:
     subscribe_email_url = settings.get("status_page_subscribe_email_url", _SETTINGS_DEFAULTS["status_page_subscribe_email_url"])
     subscribe_sms_url = settings.get("status_page_subscribe_sms_url", _SETTINGS_DEFAULTS["status_page_subscribe_sms_url"])
     subscribe_webhook_url = settings.get("status_page_subscribe_webhook_url", _SETTINGS_DEFAULTS["status_page_subscribe_webhook_url"])
-    maintenance_enabled = bool(settings.get("maintenance_enabled", _SETTINGS_DEFAULTS["maintenance_enabled"]))
-    maintenance_message = settings.get("maintenance_message", _SETTINGS_DEFAULTS["maintenance_message"])
-    maintenance_window = settings.get("maintenance_window", _SETTINGS_DEFAULTS["maintenance_window"])
-    maintenance_scope = settings.get("maintenance_scope", _SETTINGS_DEFAULTS["maintenance_scope"])
+    maintenance = _maintenance_state(settings)
 
     host_data = _build_public_host_data(db, _list_public_hosts(), history_limit=300)
     incident_summary = _build_public_incident_summary(host_data)
@@ -2020,10 +2355,7 @@ def _serve_status_page() -> dict:
                 "subscribe_email_url": subscribe_email_url,
                 "subscribe_sms_url": subscribe_sms_url,
                 "subscribe_webhook_url": subscribe_webhook_url,
-                "maintenance_enabled": maintenance_enabled,
-                "maintenance_message": maintenance_message,
-                "maintenance_window": maintenance_window,
-                "maintenance_scope": maintenance_scope,
+                "maintenance": maintenance,
             },
         ),
     )
@@ -2086,6 +2418,15 @@ def _format_relative_age(iso_value: str) -> str:
     return f"{days}d ago"
 
 
+def _format_percent(value) -> str:
+    if value is None:
+        return "—"
+    pct = float(value)
+    if pct.is_integer():
+        return f"{int(pct)}%"
+    return f"{pct:.1f}%"
+
+
 def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> list[dict]:
     from boto3.dynamodb.conditions import Key as DKey
 
@@ -2120,7 +2461,7 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
             uptime_pct = round((up_count / len(run_statuses)) * 100, 1)
             avg_latency = round(sum(float(c.get("latency_ms", 0)) for c in flat_checks) / len(flat_checks))
         else:
-            uptime_pct, avg_latency = 100.0, 0
+            uptime_pct, avg_latency = None, 0
 
         region_summary = []
         for region_name, region_info in sorted((host.get("region_statuses") or {}).items()):
@@ -2132,16 +2473,20 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
         incident_points = [point for point in run_points if point.get("status") in {"down", "degraded"}]
         latest_incident = incident_points[0] if incident_points else None
         last_checked_at = host.get("last_checked_at", "")
+        current_status = host.get("current_status", "unknown")
+        if current_status == "unknown" and run_statuses:
+            current_status = run_statuses[0]
         host_data.append({
             "host": host,
             "uptime_pct": uptime_pct,
             "avg_latency": avg_latency,
             "latest_latency": host.get("last_latency_ms"),
             "region_summary": region_summary,
+            "target_regions": host.get("target_regions") or [],
             "history": list(reversed(run_statuses)),
             "history_points": list(reversed(run_points)),
             "history_available": bool(run_statuses),
-            "current_status": host.get("current_status", "unknown"),
+            "current_status": current_status,
             "last_checked_at": last_checked_at,
             "last_checked_label": _format_relative_age(last_checked_at),
             "incident_count": len(incident_points),
@@ -2183,6 +2528,7 @@ def _serve_history_page(event: dict) -> dict:
     brand_name = settings.get("status_page_brand_name", _SETTINGS_DEFAULTS["status_page_brand_name"])
     logo_url = settings.get("status_page_logo_url", _SETTINGS_DEFAULTS["status_page_logo_url"])
     theme = settings.get("status_page_theme", _SETTINGS_DEFAULTS["status_page_theme"])
+    build = _build_info()
     hosts = _list_public_hosts()
     query = parse_qs(event.get("rawQueryString") or "")
     selected_host = (query.get("host", ["all"])[0] or "all").strip()
@@ -2215,6 +2561,7 @@ def _serve_history_page(event: dict) -> dict:
             selected_region=selected_region,
             selected_status=selected_status,
             rows=filtered_rows[:250],
+            build=build,
         ),
     )
 
@@ -2228,19 +2575,28 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
             overall, ocls = "Some systems are degraded", "degraded"
 
     theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
+    maintenance_data = page_options.get("maintenance") or {}
+    build_stamp = _build_stamp(page_options.get("build") or {})
     maintenance_block = ""
-    if page_options.get("maintenance_enabled") and page_options.get("maintenance_message"):
-        window = page_options.get("maintenance_window", "").strip()
-        scope = page_options.get("maintenance_scope", "").strip()
+    if maintenance_data.get("public_visible") and maintenance_data.get("message"):
+        window = maintenance_data.get("window", "").strip()
+        scope = maintenance_data.get("scope", "").strip()
+        maintenance_state = maintenance_data.get("state", "enabled")
         maintenance_meta = []
         if window:
             maintenance_meta.append(f"<span>Window: {window}</span>")
         if scope:
             maintenance_meta.append(f"<span>Affected: {scope}</span>")
-        maintenance_block = f"""<div class="maintenance">
-  <div class="maintenance-title">Scheduled maintenance</div>
-  <div class="maintenance-copy">{page_options["maintenance_message"]}</div>
-  <div class="maintenance-meta">{' · '.join(maintenance_meta) if maintenance_meta else 'We will post updates here during the maintenance window.'}</div>
+        state_badge = "Scheduled" if maintenance_state == "scheduled" else "Live now" if maintenance_state == "live" else "Notice"
+        state_class = "pending" if maintenance_state == "scheduled" else "live" if maintenance_state == "live" else "generic"
+        fallback_copy = "We will post updates here during the maintenance window." if maintenance_state == "scheduled" else "We are posting updates here while maintenance is in progress."
+        maintenance_block = f"""<div class="maintenance {state_class}">
+  <div class="maintenance-head">
+    <div class="maintenance-title">{maintenance_data.get("title", "Scheduled maintenance")}</div>
+    <span class="maintenance-state {state_class}">{state_badge}</span>
+  </div>
+  <div class="maintenance-copy">{maintenance_data["message"]}</div>
+  <div class="maintenance-meta">{' · '.join(maintenance_meta) if maintenance_meta else fallback_copy}</div>
 </div>"""
     subscribe_links = []
     if page_options.get("subscribe_email_url"):
@@ -2258,16 +2614,16 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   </div>
   <div class="subscribe-actions">{''.join(subscribe_links)}</div>
 </div>"""
-    maintenance_summary = "1 scheduled window" if page_options.get("maintenance_enabled") and page_options.get("maintenance_message") else "None"
+    maintenance_summary = "1 scheduled window" if maintenance_data.get("public_visible") and maintenance_data.get("message") else "None"
     maintenance_items = ""
-    if page_options.get("maintenance_enabled") and page_options.get("maintenance_message"):
+    if maintenance_data.get("public_visible") and maintenance_data.get("message"):
         maintenance_meta = []
-        if page_options.get("maintenance_window"):
-            maintenance_meta.append(page_options["maintenance_window"])
-        if page_options.get("maintenance_scope"):
-            maintenance_meta.append(page_options["maintenance_scope"])
+        if maintenance_data.get("window"):
+            maintenance_meta.append(maintenance_data["window"])
+        if maintenance_data.get("scope"):
+            maintenance_meta.append(maintenance_data["scope"])
         maintenance_items = f"""<div class="maintenance-list-item">
-  <div class="maintenance-list-copy">{page_options["maintenance_message"]}</div>
+  <div class="maintenance-list-copy">{maintenance_data["message"]}</div>
   <div class="maintenance-list-meta">{' · '.join(maintenance_meta) if maintenance_meta else 'Scheduled window details will appear here.'}</div>
 </div>"""
     else:
@@ -2286,16 +2642,22 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
         badge = {"up": "Operational", "down": "Down", "degraded": "Degraded"}.get(s, "Unknown")
         bars  = "".join(f'<span class="b {c}"></span>' for c in h["history"]) \
                 or '<span class="b unknown"></span>' * 10
-        latency_bits = []
+        summary_bits = []
+        if h["uptime_pct"] is not None:
+            summary_bits.append(f"{_format_percent(h['uptime_pct'])} uptime")
         if h["latest_latency"] is not None:
-            latency_bits.append(f"{h['latest_latency']} ms latest")
-        latency_bits.append(f"{h['avg_latency']} ms avg")
-        latency_bits.append(f"checked {h['last_checked_label']}")
+            summary_bits.append(f"{h['latest_latency']} ms")
+        elif h["avg_latency"]:
+            summary_bits.append(f"{h['avg_latency']} ms avg")
+        target_pills = "".join(
+            f'<span class="pill">{region}</span>'
+            for region in h["target_regions"]
+        )
         region_pills = "".join(
             f'<span class="pill {r["status"]}">{r["region"]} · {r["latency_ms"] if r["latency_ms"] is not None else "—"} ms</span>'
             for r in h["region_summary"]
         )
-        history_note = "" if h["history_available"] else '<div class="history-note">History appears after checks have been recorded for this host.</div>'
+        history_note = "" if h["history_available"] else ""
         host_history_href = f'/history?host={quote(h["host"]["host_id"])}'
         host_incident_count = int(h.get("incident_count", 0) or 0)
         latest_incident = h.get("latest_incident") or {}
@@ -2320,7 +2682,7 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   <summary class="svc-summary">
     <div>
       <div class="row" style="margin-bottom:2px"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
-      <div class="meta" style="margin-bottom:0">{h['uptime_pct']}% uptime &nbsp;·&nbsp; {' &nbsp;·&nbsp; '.join(latency_bits)}</div>
+      <div class="meta" style="margin-bottom:0">{' &nbsp;·&nbsp; '.join(summary_bits) if summary_bits else 'No recent measurements yet'}</div>
       {incident_hint}
     </div>
     <span class="summary-hint">Details</span>
@@ -2329,18 +2691,27 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
   {history_note}
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
-  <div class="regions">{region_pills or '<span class="pill unknown">No regional data yet</span>'}</div>
+  <div class="detail-row" style="margin-top:16px">
+    <div class="detail-col">
+      <div class="history-title">Check locations</div>
+      <div class="regions">{target_pills or '<span class="pill unknown">All active check locations</span>'}</div>
+    </div>
+    <div class="detail-col">
+      <div class="history-title">Latest probe results</div>
+      <div class="regions">{region_pills or '<span class="pill unknown">No probe results yet</span>'}</div>
+    </div>
+  </div>
 </details>"""
 
     if not host_data:
         cards = '<p class="empty">No services configured for the status page yet.</p>'
 
     history_href = "/history"
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     brand = ""
     if brand_name or logo_url:
         logo = f'<img src="{logo_url}" alt="{brand_name}" class="brand-logo">' if logo_url else ""
         brand = f'<div class="brand">{logo}<span>{brand_name or title}</span></div>'
+    build_stamp = ""
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2376,10 +2747,17 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .ghost-link{{display:inline-flex;align-items:center;justify-content:center;padding:11px 14px;border-radius:var(--radius-pill);border:1px solid var(--border);background:rgba(255,255,255,.5);color:var(--text);text-decoration:none;font-weight:700;transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease}}
 .ghost-link:hover{{transform:translateY(-1px);border-color:var(--ring);box-shadow:0 12px 24px rgba(15,23,42,.08)}}
 .maintenance,.subscribe{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;padding:22px 24px;border-radius:var(--radius-shell);margin-bottom:18px;background:var(--hero);border:1px solid var(--hero-border);box-shadow:var(--shadow);backdrop-filter:blur(14px)}}
-.maintenance{{background:linear-gradient(135deg, var(--wash), var(--hero));border-color:color-mix(in srgb, var(--ring) 18%, var(--border))}}
+.maintenance{{flex-direction:column;background:linear-gradient(135deg, var(--wash), var(--hero));border-color:color-mix(in srgb, var(--ring) 18%, var(--border))}}
+.maintenance.pending{{background:linear-gradient(135deg, #fffbeb, var(--hero));border-color:#fcd34d}}
+.maintenance.live{{background:linear-gradient(135deg, #fef2f2, var(--hero));border-color:#fca5a5}}
+.maintenance-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;width:100%}}
 .maintenance-title,.subscribe-title{{font-size:.78rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;margin-bottom:8px;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .maintenance-copy,.subscribe-copy{{font-size:.99rem;line-height:1.6}}
 .maintenance-meta{{margin-top:8px;color:var(--muted);font-size:.82rem}}
+.maintenance-state{{display:inline-flex;align-items:center;justify-content:center;padding:6px 10px;border-radius:999px;font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.maintenance-state.pending{{background:#fffbeb;color:#b45309;border:1px solid #fcd34d}}
+.maintenance-state.live{{background:#fef2f2;color:#b91c1c;border:1px solid #fca5a5}}
+.maintenance-state.generic{{background:var(--wash);color:var(--ring);border:1px solid color-mix(in srgb, var(--ring) 20%, var(--border))}}
 .maintenance-list{{background:var(--card);border:1px solid var(--border);border-radius:24px;padding:18px 20px;margin-bottom:18px;box-shadow:var(--shadow)}}
 .section-summary{{display:flex;justify-content:space-between;align-items:center;gap:12px;cursor:pointer;list-style:none}}
 .section-summary::-webkit-details-marker{{display:none}}
@@ -2417,6 +2795,8 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .incident-hint.quiet{{opacity:.88}}
 .history-title{{font-size:.76rem;color:var(--soft);text-transform:uppercase;letter-spacing:.16em;margin-bottom:8px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .history-note{{font-size:.78rem;color:var(--muted);margin-bottom:8px}}
+.detail-row{{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}}
+.detail-col{{min-width:0}}
 .bars{{display:flex;gap:4px;height:28px}}
 .b{{flex:1;border-radius:4px;min-width:3px}}
 .b.up{{background:#22c55e}}.b.down{{background:#ef4444}}.b.degraded{{background:#f59e0b}}.b.unknown{{background:#e2e8f0}}
@@ -2442,6 +2822,7 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
   .subscribe-actions{{width:100%}}
   .subscribe-btn{{width:100%}}
   .incident-hint{{flex-direction:column;align-items:flex-start}}
+  .detail-row{{grid-template-columns:1fr}}
 }}
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
@@ -2455,12 +2836,12 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
   <div class="section-heading">Services</div>
   {cards}
   {subscribe_block}
-  <footer>Updated {now_str}</footer>
 </div></body></html>"""
 
 
-def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], statuses: list[str], selected_host: str, selected_region: str, selected_status: str, rows: list[dict]) -> str:
+def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], statuses: list[str], selected_host: str, selected_region: str, selected_status: str, rows: list[dict], build: dict) -> str:
     theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
+    build_stamp = _build_stamp(build)
     brand = ""
     if brand_name or logo_url:
         logo = f'<img src="{logo_url}" alt="{brand_name}" class="brand-logo">' if logo_url else ""
@@ -2511,6 +2892,7 @@ linear-gradient(180deg, var(--bg) 0%, var(--bg-alt) 100%);color:var(--text);min-
 .wrap{{max-width:1160px;margin:0 auto;padding:56px 20px 72px}}
 .brand{{display:flex;align-items:center;gap:12px;font-size:.88rem;font-weight:600;color:var(--soft);margin-bottom:22px;letter-spacing:.06em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .brand-logo{{height:42px;width:42px;object-fit:contain;border-radius:12px;background:var(--card);border:1px solid var(--border);padding:5px;box-shadow:var(--shadow)}}
+.build-flag{{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid var(--hero-border);background:rgba(255,255,255,.58);box-shadow:var(--shadow);font-size:.74rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace;color:var(--soft);margin-bottom:18px}}
 .hero{{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;margin-bottom:20px}}
 h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2rem,4vw,3rem);line-height:1.02;font-weight:700;letter-spacing:-.04em;margin-bottom:8px}}
 .sub{{color:var(--muted);line-height:1.65;max-width:64ch}}
@@ -2541,10 +2923,11 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
   {brand}
+  <div class="build-flag">Running {build_stamp}</div>
   <div class="hero">
     <div>
       <h1>Check History</h1>
-      <p class="sub">Browse recent public checks across services and worker regions. Use filters to narrow the timeline without crowding the main status page.</p>
+      <p class="sub">Browse recent public checks across services and check locations. Use filters to narrow the timeline without crowding the main status page.</p>
     </div>
     <div class="hero-actions"><a class="ghost-link" href="/status">Back to status</a></div>
   </div>
@@ -2565,7 +2948,7 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
   </form>
   <div class="panel summary">
     <span>Showing <strong>{len(rows)}</strong> recent checks</span>
-    <span>Theme: <strong>{theme_class}</strong></span>
+    <span>Theme: <strong>{theme_class}</strong> · {build_stamp}</span>
   </div>
   <div class="table-wrap">
     <table>
@@ -2746,6 +3129,20 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .region-info .name{{font-weight:600;margin-bottom:4px}}
 .region-info .meta{{font-size:.8rem;color:var(--soft)}}
 .section-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}}
+.log-summary-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}}
+.log-summary-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
+.log-summary-card .label{{font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.log-summary-card .value{{font-size:1.25rem;font-weight:700;margin-top:8px}}
+.log-issue-list{{display:flex;flex-direction:column;gap:10px}}
+.log-issue{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
+.log-issue-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:6px}}
+.log-entry{{background:#0d1624;border:1px solid var(--line-soft);border-radius:18px;padding:14px;margin-bottom:10px}}
+.log-entry-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:8px}}
+.log-entry-meta{{font-size:.76rem;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.log-entry pre{{margin-top:10px;margin-bottom:0;white-space:pre-wrap;word-break:break-word}}
+.badge.error{{background:#7f1d1d;color:#fecaca}}
+.badge.warn{{background:#713f12;color:#fde68a}}
+.badge.info{{background:#16314b;color:#93c5fd}}
 .spinner{{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}}
 .auth-gate{{position:fixed;inset:0;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;z-index:250;padding:20px}}
 .auth-card{{width:100%;max-width:440px;background:linear-gradient(180deg, rgba(23,34,53,.98), rgba(11,18,32,.98));border:1px solid var(--line);border-radius:28px;padding:30px;box-shadow:0 28px 70px rgba(0,0,0,.42)}}
@@ -2775,13 +3172,14 @@ strong{{color:#f8fafc}}
   <span class="tab" data-tab="status-page" onclick="show('status-page')">Status Page</span>
   <span class="tab" data-tab="notifications" onclick="show('notifications')">Notifications</span>
   <span class="tab" data-tab="management" onclick="show('management')">Management</span>
+  <span class="tab" data-tab="logs" onclick="show('logs')">Logs</span>
   <span class="tab" data-tab="cost" onclick="show('cost')">Cost</span>
   <span class="nav-spacer"></span>
   <div class="menu-wrap">
-    <button class="menu-btn" id="more-menu-btn" type="button" onclick="toggleMoreMenu()">More ▾</button>
+    <button class="menu-btn" id="more-menu-btn" type="button" onclick="toggleMoreMenu()">General ▾</button>
     <div class="menu-panel" id="more-menu">
       <button class="menu-item" type="button" onclick="openMenuTab('account')">Account</button>
-      <button class="menu-item" type="button" onclick="openMenuTab('settings')">Global Settings</button>
+      <button class="menu-item" type="button" onclick="openMenuTab('settings')">Settings</button>
       <button class="menu-item" type="button" onclick="openMenuTab('guides')">Docs</button>
       <div class="menu-sep"></div>
       <button class="menu-item danger" type="button" onclick="logoutAdmin()">Sign out</button>
@@ -2791,6 +3189,7 @@ strong{{color:#f8fafc}}
 <div class="auth-gate" id="auth-gate">
   <div class="auth-card">
     <h1>Admin access</h1>
+    <p><strong>Running { _build_stamp(build) }</strong></p>
     <p>{auth_intro}</p>
     {auth_fields}
     <div class="auth-msg" id="auth-msg"></div>
@@ -2799,7 +3198,7 @@ strong{{color:#f8fafc}}
 </div>
 <div class="main">
 {read_only_banner}
-<div class="hint" style="margin-bottom:16px">Build: <strong>{build.get("version", "unknown")}</strong>{' · Built at: ' + build.get('built_at') if build.get('built_at') else ''} · Region: <strong>{build.get("region", HOME_REGION)}</strong></div>
+<div class="hint" style="margin-bottom:16px">Running { _build_stamp(build) } · Function: <strong>{build.get("function_name", "uptime-management")}</strong></div>
 
 <div id="pane-hosts">
   <div class="section-header">
@@ -2819,7 +3218,7 @@ strong{{color:#f8fafc}}
 
 <div id="pane-regions" style="display:none">
   <div class="section-header">
-    <h2>Worker Regions</h2>
+    <h2>Probes</h2>
     <button class="btn btn-primary" onclick="openAddRegion()">+ Add Region</button>
   </div>
   <p class="desc">
@@ -2841,6 +3240,7 @@ strong{{color:#f8fafc}}
     Your public status page shows the hosts you select below. Visitors see current state, recent history, and per-region latency badges.
   </p>
   <div class="panel">
+    <h3 style="margin-top:0">Brand & layout</h3>
     <div class="grid2">
       <div class="form-group">
         <label>Brand Name</label>
@@ -2869,6 +3269,21 @@ strong{{color:#f8fafc}}
       <input id="sp-logo" placeholder="https://example.com/logo.png">
       <div class="hint">Optional. A square PNG or SVG works best.</div>
     </div>
+    <div class="tip">
+      Themes now change the whole atmosphere, not just the colors:
+      <strong>Clean Control</strong> is crisp and editorial, <strong>Midnight Ops</strong> is sharper and denser,
+      <strong>Sunrise Briefing</strong> is warmer and softer, and <strong>Forest Calm</strong> is quieter and more grounded.
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="section-header" style="margin-bottom:12px">
+      <div>
+        <h3 style="margin:0">Maintenance</h3>
+        <div class="hint">Separate, time-bound notice block for scheduled work.</div>
+      </div>
+      <div id="sp-maintenance-state"></div>
+    </div>
     <div class="form-group">
       <label class="toggle"><input type="checkbox" id="sp-maintenance-enabled"> Show maintenance notice</label>
     </div>
@@ -2880,12 +3295,29 @@ strong{{color:#f8fafc}}
       <div class="form-group">
         <label>Maintenance Window</label>
         <input id="sp-maintenance-window" placeholder="Sun 02:00-03:00 UTC">
+        <div class="hint">Optional display label if you want to override the generated UTC range.</div>
       </div>
       <div class="form-group">
         <label>Affected Scope</label>
         <input id="sp-maintenance-scope" placeholder="eu-west-1, us-east-1, Payments API">
       </div>
     </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Start Time</label>
+        <input id="sp-maintenance-start" type="datetime-local">
+        <div class="hint">Before start: Pending. Inside window: Live. After end: auto-hidden on the public page.</div>
+      </div>
+      <div class="form-group">
+        <label>End Time</label>
+        <input id="sp-maintenance-end" type="datetime-local">
+        <div class="hint">If end passes, the public notice turns off automatically without deleting the saved draft.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">Subscribe links</h3>
     <div class="form-group">
       <label>Subscribe Intro</label>
       <input id="sp-subscribe-intro" placeholder="Subscribe for status updates.">
@@ -2904,11 +3336,6 @@ strong{{color:#f8fafc}}
       <label>Webhook / RSS URL</label>
       <input id="sp-subscribe-webhook" placeholder="https://example.com/status/feed.xml">
       <div class="hint">Set any public subscribe or feed links you want shown on the page.</div>
-    </div>
-    <div class="tip">
-      Themes now change the whole atmosphere, not just the colors:
-      <strong>Clean Control</strong> is crisp and editorial, <strong>Midnight Ops</strong> is sharper and denser,
-      <strong>Sunrise Briefing</strong> is warmer and softer, and <strong>Forest Calm</strong> is quieter and more grounded.
     </div>
     <button class="btn btn-primary" onclick="saveStatusPageSettings()">Save</button>
   </div>
@@ -2939,8 +3366,8 @@ strong{{color:#f8fafc}}
       <button class="btn btn-ghost" onclick="refreshCustomDomain()">Refresh Status</button>
       <button class="btn btn-danger" onclick="destroyCustomDomain()">Destroy</button>
     </div>
-    <div id="cd-records" style="margin-top:14px"></div>
     <pre id="cd-status" style="margin-top:14px">No custom domain configured.</pre>
+    <div id="cd-records" style="margin-top:14px"></div>
   </div>
 </div>
 
@@ -3126,6 +3553,67 @@ strong{{color:#f8fafc}}
   </div>
 </div>
 
+<div id="pane-logs" style="display:none">
+  <h2>Logs</h2>
+  <p class="desc">
+    Read recent CloudWatch logs, surface likely issues first, and then inspect the raw event details when you need the full context.
+  </p>
+  <div class="panel">
+    <div class="grid2">
+      <div class="form-group">
+        <label>Source</label>
+        <select id="logs-scope" onchange="handleLogsScopeChange()">
+          <option value="management">Management Lambda</option>
+          <option value="worker">Probe worker</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Worker Region</label>
+        <select id="logs-region" onchange="loadLogs()" disabled>
+          <option value="">Select a deployed region</option>
+        </select>
+        <div class="hint">Only used when the source is set to Probe worker.</div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="form-group">
+        <label>Lookback Window</label>
+        <select id="logs-hours" onchange="loadLogs()">
+          <option value="6">Last 6 hours</option>
+          <option value="24" selected>Last 24 hours</option>
+          <option value="72">Last 3 days</option>
+          <option value="168">Last 7 days</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Entry Limit</label>
+        <select id="logs-limit" onchange="loadLogs()">
+          <option value="40">40 entries</option>
+          <option value="80" selected>80 entries</option>
+          <option value="120">120 entries</option>
+          <option value="200">200 entries</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" onclick="loadLogs()">Refresh Logs</button>
+      <button class="btn btn-ghost" onclick="copyLogsSummary()">Copy Summary</button>
+    </div>
+    <div class="hint" id="logs-source-note" style="margin-top:10px">Reading the management Lambda log group in the home region.</div>
+  </div>
+  <div class="panel">
+    <div id="logs-summary" style="color:#94a3b8">Loading log summary…</div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Likely Issues</h3>
+    <div id="logs-issues" style="color:#94a3b8">No log scan has run yet.</div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Recent Entries</h3>
+    <div id="logs-entries" style="color:#94a3b8">No log scan has run yet.</div>
+  </div>
+</div>
+
 <div id="pane-settings" style="display:none">
   <h2>Settings</h2>
   <div class="panel">
@@ -3149,7 +3637,7 @@ strong{{color:#f8fafc}}
 <div id="pane-cost" style="display:none">
   <h2>Cost Estimator</h2>
   <p class="desc">
-    Defaults are filled from your live deployment: enabled hosts, active worker regions, default interval, and retention.
+    Defaults are filled from your live deployment: enabled hosts, active probes, default interval, and retention.
   </p>
   <div class="panel grid2" style="margin-bottom:16px">
     <div class="form-group"><label>Hosts</label><input id="c-hosts" type="number" value="0" min="0"></div>
@@ -3190,7 +3678,7 @@ strong{{color:#f8fafc}}
       <div class="doc-kicker">Quick Start</div>
       <h3 style="margin-top:0">Recommended first production shape</h3>
       <ul class="doc-list">
-        <li>Keep one home region for the management Lambda and add at least two worker regions for coverage.</li>
+        <li>Keep one home region for the management Lambda and add at least two probe regions for coverage.</li>
         <li>Use a custom domain through CloudFront instead of sending operators to the raw Lambda Function URL.</li>
         <li>Turn on Cognito if you want named users and MFA; keep the emergency admin token only as a break-glass path.</li>
         <li>If you stay on password-only admin, restrict `/admin` and `/api/*` with `AdminAllowedIpCidrs`.</li>
@@ -3261,7 +3749,7 @@ Authorization: Bearer &lt;admin-token-or-cognito-access-token&gt;</pre>
       <h3 style="margin-top:0">What the workers actually do</h3>
       <ul class="doc-list">
         <li>The management Lambda runs on a shared one-minute heartbeat.</li>
-        <li>It invokes every deployed worker region that is due for the selected monitor tiers.</li>
+        <li>It invokes every deployed probe region that is due for the selected monitor tiers.</li>
         <li>Hosts do not create their own Lambda schedules. They choose from shared tiers like 60s or 300s.</li>
         <li>HTTP checks verify status code, latency, and SSL expiry for HTTPS. TCP checks only verify socket reachability.</li>
       </ul>
@@ -3346,15 +3834,19 @@ aws secretsmanager put-secret-value \\
       <div class="form-group"><label>Timeout (sec)</label><input id="m-timeout" type="number" value="10" min="1" max="60"></div>
     </div>
     <div class="tip" id="m-impact">
-      Current scheduler: every 60 seconds. This host will be checked about 1,440 times/day per worker region and does not create one Lambda invocation per check by itself.
+      Current scheduler: every 60 seconds. This host will be checked about 1,440 times/day per probe region and does not create one Lambda invocation per check by itself.
     </div>
     <div class="form-group">
       <label>Expected HTTP Status Code</label>
       <input id="m-code" type="number" value="200">
     </div>
     <div class="form-group">
-      <label>Worker Regions</label>
-      <div class="hint">Leave all unchecked to run this host from every deployed worker region.</div>
+      <label>Probes</label>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">
+        <label class="toggle"><input type="radio" name="m-region-mode" id="m-region-mode-all" value="all" checked onchange="toggleTargetRegionMode()"> Run on all deployed probes</label>
+        <label class="toggle"><input type="radio" name="m-region-mode" id="m-region-mode-selected" value="selected" onchange="toggleTargetRegionMode()"> Run only on selected probes</label>
+      </div>
+      <div class="hint" id="m-target-regions-hint">All deployed probes will run this host unless you switch to selected probes.</div>
       <div id="m-target-regions" class="checklist"></div>
     </div>
     <div class="form-group">
@@ -3382,7 +3874,7 @@ aws secretsmanager put-secret-value \\
 <div class="modal-overlay" id="region-modal">
   <div class="modal">
     <h3>Add Worker Region</h3>
-    <p class="desc" style="margin-bottom:16px">This deploys a new worker Lambda in the selected AWS region.</p>
+    <p class="desc" style="margin-bottom:16px">This deploys a new probe Lambda in the selected AWS region.</p>
     <div class="form-group">
       <label>AWS Region</label>
       <select id="r-region">{region_options}</select>
@@ -3397,8 +3889,9 @@ aws secretsmanager put-secret-value \\
     </div>
     <div class="form-group">
       <label>Monitor Tiers</label>
-      <div class="hint">Each worker can support one or more shared schedules. Hosts will choose from these tiers.</div>
+      <div class="hint">Each probe can support one or more shared schedules. Hosts will choose from these tiers.</div>
       <div id="r-supported-tiers" class="checklist"></div>
+      <div class="hint" id="r-tier-cost-note" style="margin-top:10px"></div>
     </div>
     <div style="display:flex;gap:10px;margin-top:8px">
       <button class="btn btn-primary" id="r-deploy-btn" onclick="deployRegion()">Deploy</button>
@@ -3422,6 +3915,7 @@ const queryKey = new URLSearchParams(location.search).get('key') || '';
 let REGIONS_CACHE = [];
 let HOSTS_CACHE = [];
 const RECOMMENDED_MONITOR_TIERS = {json.dumps(RECOMMENDED_MONITOR_TIERS)};
+const CLOUDFRONT_PLAN_COSTS = {json.dumps(_CLOUDFRONT_PLAN_COSTS)};
 if (queryKey) {{
   KEY = queryKey;
   sessionStorage.setItem('uptime_admin_key', KEY);
@@ -3749,7 +4243,7 @@ async function disableTotp() {{
   toast('Authenticator MFA disabled');
 }}
 
-const PANES = ['hosts','regions','status-page','notifications','account','management','settings','cost','guides'];
+const PANES = ['hosts','regions','status-page','notifications','account','management','logs','settings','cost','guides'];
 function show(tab) {{
   PANES.forEach((t,i) => {{
     document.getElementById('pane-'+t).style.display = t===tab ? '' : 'none';
@@ -3762,6 +4256,7 @@ function show(tab) {{
   if (tab === 'notifications') loadNotificationSettings();
   if (tab === 'account') loadAccount();
   if (tab === 'management') loadManagement();
+  if (tab === 'logs') loadLogs();
   if (tab === 'settings') loadSettings();
   if (tab === 'cost') loadCostDefaults();
 }}
@@ -3802,14 +4297,25 @@ function renderRegionTierOptions(selectedTiers=[60, 300]) {{
   const wrap = document.getElementById('r-supported-tiers');
   wrap.innerHTML = availableMonitorTiers(selectedTiers).map(tier => `
     <label class="check-item">
-      <input type="checkbox" value="${{tier}}" ${{selectedTiers.includes(tier) ? 'checked' : ''}}>
+      <input type="checkbox" value="${{tier}}" ${{selectedTiers.includes(tier) ? 'checked' : ''}} onchange="renderRegionTierCostNote()">
       <span>${{formatTierLabel(tier)}}</span>
     </label>
   `).join('');
+  renderRegionTierCostNote();
 }}
 
 function selectedRegionTiers() {{
   return Array.from(document.querySelectorAll('#r-supported-tiers input[type=checkbox]:checked')).map(el => +el.value).sort((a, b) => a - b);
+}}
+
+function renderRegionTierCostNote() {{
+  const note = document.getElementById('r-tier-cost-note');
+  if (!note) return;
+  const tiers = selectedRegionTiers();
+  const tierBits = tiers.length
+    ? tiers.map(tier => `${{formatTierLabel(tier)}} = ${{Math.round(86400 / Math.max(60, tier)).toLocaleString()}} host-region checks/day`).join(' · ')
+    : 'Select at least one tier.';
+  note.innerHTML = `Cost note: each deployed worker is still invoked every <strong>1 minute</strong> today, which is about <strong>1,440 runs/day</strong> or <strong>43,200 runs/month</strong> per worker. That is roughly <strong>$0.01/month in Lambda request charges after the free tier</strong>, and usually still $0 while free-tier headroom remains. Slower host tiers reduce checks, DynamoDB rows, and logs for hosts assigned to them, but they do not change the worker's base wake-up cadence.<br><span style="display:block;margin-top:6px">${{tierBits}}</span>`;
 }}
 
 function renderTargetRegions(selected=[]) {{
@@ -3824,10 +4330,31 @@ function renderTargetRegions(selected=[]) {{
       <span>${{r.region}}</span>
     </label>
   `).join('');
+  toggleTargetRegionMode();
 }}
 
 function selectedTargetRegions() {{
   return Array.from(document.querySelectorAll('#m-target-regions input[type=checkbox]:checked')).map(el => el.value);
+}}
+
+function targetRegionMode() {{
+  return document.getElementById('m-region-mode-selected').checked ? 'selected' : 'all';
+}}
+
+function toggleTargetRegionMode() {{
+  const selectedMode = targetRegionMode() === 'selected';
+  const hint = document.getElementById('m-target-regions-hint');
+  const checkboxes = Array.from(document.querySelectorAll('#m-target-regions input[type=checkbox]'));
+  checkboxes.forEach(el => {{
+    el.disabled = !selectedMode;
+    if (!selectedMode) el.checked = false;
+  }});
+  if (hint) {{
+    hint.textContent = selectedMode
+      ? 'Only the checked probes will run this host.'
+      : 'All deployed probes will run this host.';
+  }}
+  updateHostImpact();
 }}
 
 async function loadHosts() {{
@@ -3895,9 +4422,10 @@ async function openAddHost() {{
   document.getElementById('m-page').checked = true;
   document.getElementById('m-alert').checked = false;
   document.getElementById('m-enabled').checked = true;
+  document.getElementById('m-region-mode-all').checked = true;
+  document.getElementById('m-region-mode-selected').checked = false;
   document.getElementById('m-sns-group').style.display = 'none';
   renderTargetRegions([]);
-  updateHostImpact();
   document.getElementById('host-modal').classList.add('open');
 }}
 
@@ -3915,9 +4443,11 @@ async function openEditHost(h) {{
   document.getElementById('m-alert').checked = !!h.alert_enabled;
   document.getElementById('m-sns').value = h.alert_sns_arn || '';
   document.getElementById('m-enabled').checked = h.enabled !== false;
+  const hasScopedRegions = Array.isArray(h.target_regions) && h.target_regions.length > 0;
+  document.getElementById('m-region-mode-all').checked = !hasScopedRegions;
+  document.getElementById('m-region-mode-selected').checked = hasScopedRegions;
   document.getElementById('m-sns-group').style.display = h.alert_enabled ? '' : 'none';
   renderTargetRegions(h.target_regions || []);
-  updateHostImpact();
   document.getElementById('host-modal').classList.add('open');
 }}
 
@@ -3928,14 +4458,14 @@ function toggleSNS() {{
 function updateHostImpact() {{
   const requestedInterval = Math.max(60, +(document.getElementById('m-tier').value || 60));
   const effectiveInterval = 60;
-  const selectedRegions = selectedTargetRegions();
+  const selectedRegions = targetRegionMode() === 'selected' ? selectedTargetRegions() : [];
   const eligibleRegions = (selectedRegions.length ? REGIONS_CACHE.filter(region => selectedRegions.includes(region.region)) : REGIONS_CACHE)
     .filter(region => (region.supported_tiers || [60,300]).includes(requestedInterval));
   const regionCount = eligibleRegions.length;
   const requestedChecksPerDayPerRegion = Math.round(86400 / requestedInterval);
   const effectiveChecksPerDayPerRegion = Math.round(86400 / effectiveInterval);
   const effectiveChecksPerDayTotal = effectiveChecksPerDayPerRegion * regionCount;
-  const targetLabel = regionCount ? (regionCount + ' worker region(s) currently support this tier') : 'no worker regions currently support this tier';
+  const targetLabel = regionCount ? (regionCount + ' probe region(s) currently support this tier') : 'no probe regions currently support this tier';
   document.getElementById('m-impact').innerHTML =
     `Chosen tier: <strong>${{formatTierLabel(requestedInterval)}}</strong>, which is about <strong>${{requestedChecksPerDayPerRegion.toLocaleString()}}</strong> checks/day per supporting region.<br>` +
     `Current scheduler heartbeat: every <strong>${{effectiveInterval}}s</strong>. This host is currently eligible for about <strong>${{effectiveChecksPerDayTotal.toLocaleString()}}</strong> checks/day across ${{targetLabel}}.<br>` +
@@ -3947,19 +4477,24 @@ function closeHostModal() {{ document.getElementById('host-modal').classList.rem
 async function saveHost() {{
   const id = document.getElementById('m-id').value;
   const chosenTier = +document.getElementById('m-tier').value;
-  const targets = selectedTargetRegions();
+  const mode = targetRegionMode();
+  const targets = mode === 'selected' ? selectedTargetRegions() : [];
   const scopedRegions = targets.length ? REGIONS_CACHE.filter(region => targets.includes(region.region)) : REGIONS_CACHE;
   const unsupportedRegions = scopedRegions.filter(region => !(region.supported_tiers || [60,300]).includes(chosenTier)).map(region => region.region);
   if (!scopedRegions.length) {{
-    toast('Deploy at least one worker region before saving a host.', true);
+    toast('Deploy at least one probe region before saving a host.', true);
+    return;
+  }}
+  if (mode === 'selected' && !targets.length) {{
+    toast('Choose at least one probe, or switch this host to all deployed probes.', true);
     return;
   }}
   if (!targets.length && !scopedRegions.some(region => (region.supported_tiers || [60,300]).includes(chosenTier))) {{
-    toast('No deployed worker region currently supports that monitor tier.', true);
+    toast('No deployed probe region currently supports that monitor tier.', true);
     return;
   }}
   if (targets.length && unsupportedRegions.length) {{
-    toast('These selected worker regions do not support that tier: ' + unsupportedRegions.join(', '), true);
+    toast('These selected probes do not support that tier: ' + unsupportedRegions.join(', '), true);
     return;
   }}
   const body = {{
@@ -3992,20 +4527,24 @@ async function deleteHost(id, name) {{
 async function loadRegions() {{
   const list = await api('/api/regions');
   if (list.unauthorized) {{
-    showAuthGate('Enter the admin token to load worker regions.');
+    showAuthGate('Enter the admin token to load probes.');
     return;
   }}
   REGIONS_CACHE = Array.isArray(list) ? list : [];
   const el = document.getElementById('regions-list');
   if (!REGIONS_CACHE.length) {{
-    el.innerHTML = '<div style="color:#64748b;padding:20px 0">No worker regions deployed yet.</div>';
+    el.innerHTML = '<div style="color:#64748b;padding:20px 0">No probes deployed yet.</div>';
     return;
   }}
+  const expectedProbeVersion = {json.dumps(build.get("version", "unknown"))};
+  const expectedProbeSha = {json.dumps(_embedded_monitor_source_sha())};
   el.innerHTML = REGIONS_CACHE.map(r => `
     <div class="region-card">
       <div class="region-info">
         <div class="name">${{r.region}} <span class="badge active" style="margin-left:6px">${{r.status||'active'}}</span></div>
         <div class="meta">Memory: ${{r.memory_mb||256}}MB · Tiers: ${{(r.supported_tiers || [60,300]).map(formatTierLabel).join(', ')}} · Deployed: ${{r.deployed_at ? new Date(r.deployed_at).toLocaleDateString() : '—'}}</div>
+        <div class="meta">Worker build: <strong>${{r.monitor_build_version || 'unknown'}}</strong>${{r.monitor_source_sha ? ' · ' + r.monitor_source_sha.slice(0, 8) : ''}}</div>
+        <div class="meta">Expected now: <strong>${{expectedProbeVersion}}</strong>${{expectedProbeSha ? ' · ' + expectedProbeSha.slice(0, 8) : ''}} · ${{r.monitor_build_version === expectedProbeVersion && r.monitor_source_sha === expectedProbeSha ? 'matches current bundle' : 'update recommended'}}</div>
       </div>
       <div class="actions">
         <button class="btn btn-warn btn-sm" onclick="updateRegion('${{r.region}}')">Update Code</button>
@@ -4069,6 +4608,62 @@ async function removeRegion(region) {{
   loadRegions();
 }}
 
+function isoToLocalInput(value) {{
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const offset = date.getTimezoneOffset();
+  const local = new Date(date.getTime() - offset * 60000);
+  return local.toISOString().slice(0, 16);
+}}
+
+function localInputToIso(value) {{
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString();
+}}
+
+function refreshMaintenanceEditorState() {{
+  const enabled = document.getElementById('sp-maintenance-enabled').checked;
+  const message = document.getElementById('sp-maintenance-message').value.trim();
+  const startRaw = document.getElementById('sp-maintenance-start').value;
+  const endRaw = document.getElementById('sp-maintenance-end').value;
+  const start = startRaw ? new Date(startRaw) : null;
+  const end = endRaw ? new Date(endRaw) : null;
+  const now = new Date();
+  let label = 'Off';
+  let badge = 'unknown';
+  let hint = 'No maintenance notice will be shown.';
+
+  if (enabled && message) {{
+    if (end && now > end) {{
+      label = 'Expired';
+      badge = 'inactive';
+      hint = 'The public notice is auto-hidden because the window already passed.';
+    }} else if (start && now < start) {{
+      label = 'Pending';
+      badge = 'active';
+      hint = 'The notice is queued and will become active when the start time arrives.';
+    }} else if (start || end) {{
+      label = 'Live';
+      badge = 'degraded';
+      hint = 'The maintenance notice is currently visible on the public status page.';
+    }} else {{
+      label = 'Enabled';
+      badge = 'active';
+      hint = 'The notice is visible until you turn it off.';
+    }}
+  }} else if (message || startRaw || endRaw || document.getElementById('sp-maintenance-window').value.trim() || document.getElementById('sp-maintenance-scope').value.trim()) {{
+    label = 'Draft';
+    badge = 'http';
+    hint = 'Details are saved in the editor, but the public notice is still off.';
+  }}
+
+  document.getElementById('sp-maintenance-state').innerHTML = `<span class="badge ${{badge}}">${{label}}</span>`;
+  document.getElementById('sp-maintenance-state').title = hint;
+}}
+
 async function loadStatusPage() {{
   const [settings, hosts] = await Promise.all([api('/api/settings'), api('/api/hosts')]);
   if (settings.unauthorized || hosts.unauthorized) {{
@@ -4084,11 +4679,14 @@ async function loadStatusPage() {{
   document.getElementById('sp-maintenance-message').value = settings.maintenance_message || '';
   document.getElementById('sp-maintenance-window').value = settings.maintenance_window || '';
   document.getElementById('sp-maintenance-scope').value = settings.maintenance_scope || '';
+  document.getElementById('sp-maintenance-start').value = isoToLocalInput(settings.maintenance_starts_at || '');
+  document.getElementById('sp-maintenance-end').value = isoToLocalInput(settings.maintenance_ends_at || '');
   document.getElementById('sp-subscribe-intro').value = settings.status_page_subscribe_intro || 'Subscribe for status updates.';
   document.getElementById('sp-subscribe-email').value = settings.status_page_subscribe_email_url || '';
   document.getElementById('sp-subscribe-sms').value = settings.status_page_subscribe_sms_url || '';
   document.getElementById('sp-subscribe-webhook').value = settings.status_page_subscribe_webhook_url || '';
   document.getElementById('cd-domain').value = settings.custom_domain_name || '';
+  refreshMaintenanceEditorState();
   refreshCustomDomain();
   const tbody = document.getElementById('status-page-hosts');
   if (!Array.isArray(hosts) || !hosts.length) {{
@@ -4120,6 +4718,8 @@ async function saveStatusPageSettings() {{
     maintenance_message: document.getElementById('sp-maintenance-message').value,
     maintenance_window: document.getElementById('sp-maintenance-window').value,
     maintenance_scope: document.getElementById('sp-maintenance-scope').value,
+    maintenance_starts_at: localInputToIso(document.getElementById('sp-maintenance-start').value),
+    maintenance_ends_at: localInputToIso(document.getElementById('sp-maintenance-end').value),
     status_page_subscribe_intro: document.getElementById('sp-subscribe-intro').value,
     status_page_subscribe_email_url: document.getElementById('sp-subscribe-email').value,
     status_page_subscribe_sms_url: document.getElementById('sp-subscribe-sms').value,
@@ -4150,7 +4750,7 @@ function renderCustomDomainStatus(data) {{
   const removeRecords = Array.isArray(data.dns_records_to_remove) ? data.dns_records_to_remove : [];
   if (createRecords.length) {{
     lines.push('');
-    lines.push('DNS records to create are listed below in copy boxes.');
+    lines.push('Use the DNS record copy boxes below for the next setup step.');
   }}
   if (Array.isArray(data.dns_records_to_remove) && data.dns_records_to_remove.length && data.status === 'not_configured') {{
     lines.push('');
@@ -4286,16 +4886,19 @@ function renderManagementSummary(data) {{
   }}
   const managementLambda = data.lambdas?.management || {{}};
   const workers = Array.isArray(data.lambdas?.workers) ? data.lambdas.workers : [];
+  const build = data.build || {{}};
   const workerRows = workers.map(worker => `
     <tr>
       <td>${{worker.region || '—'}}</td>
       <td>${{worker.function_name || '—'}}</td>
+      <td><span class="badge ${{worker.version_status === 'match' ? 'active' : worker.version_status === 'mismatch' ? 'warn' : 'unknown'}}">${{worker.version_status || 'unknown'}}</span></td>
+      <td title="${{worker.running_monitor_source_sha || ''}}">${{worker.running_monitor_build_version || '—'}}${{worker.running_monitor_source_sha ? ' · ' + worker.running_monitor_source_sha.slice(0, 8) : ''}}</td>
       <td>${{worker.memory_mb || '—'}} MB</td>
       <td>${{worker.age_human || '—'}}</td>
       <td>${{worker.last_24h?.invocations ?? '—'}}</td>
       <td>${{worker.last_24h?.avg_duration_ms != null ? worker.last_24h.avg_duration_ms + ' ms' : '—'}}</td>
       <td>${{worker.last_24h?.errors ?? '—'}}</td>
-    </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:#64748b;padding:16px">No worker regions deployed yet.</td></tr>`;
+    </tr>`).join('') || `<tr><td colspan="9" style="text-align:center;color:#64748b;padding:16px">No probe regions deployed yet.</td></tr>`;
   const workerInvocations24h = workers.reduce((sum, worker) => sum + (worker.last_24h?.invocations || 0), 0);
   const workerErrors24h = workers.reduce((sum, worker) => sum + (worker.last_24h?.errors || 0), 0);
   document.getElementById('mgmt-retention-days').value = data.retention_days || 90;
@@ -4318,6 +4921,13 @@ function renderManagementSummary(data) {{
     </div>
     <div class="grid2" style="margin-top:16px">
       <div>
+        <h3 style="margin-top:0">Running Build</h3>
+        <div class="hint">Version: ${{build.version || '—'}}</div>
+        <div class="hint">Built at: ${{build.built_at || '—'}}</div>
+        <div class="hint">Home region: ${{build.region || data.home_region || '—'}}</div>
+        <div class="hint">Function: ${{build.function_name || managementLambda.function_name || 'uptime-management'}}</div>
+      </div>
+      <div>
         <h3 style="margin-top:0">Management Lambda</h3>
         <div class="hint">Function: ${{managementLambda.function_name || 'uptime-management'}}</div>
         <div class="hint">Memory: ${{managementLambda.memory_mb || '—'}} MB</div>
@@ -4325,23 +4935,27 @@ function renderManagementSummary(data) {{
         <div class="hint">Invocations (24h): ${{managementLambda.last_24h?.invocations ?? '—'}}</div>
         <div class="hint">Avg runtime (24h): ${{managementLambda.last_24h?.avg_duration_ms != null ? managementLambda.last_24h.avg_duration_ms + ' ms' : '—'}}</div>
       </div>
+    </div>
+    <div class="grid2" style="margin-top:16px">
       <div>
-        <h3 style="margin-top:0">Worker Fleet</h3>
-        <div class="hint">Deployed regions: ${{data.worker_regions}}</div>
+        <h3 style="margin-top:0">Probe Fleet</h3>
+        <div class="hint">Deployed probe regions: ${{data.worker_regions}}</div>
         <div class="hint">Home region: ${{data.home_region}}</div>
-        <div class="hint">Worker invocations (24h): ${{workerInvocations24h}}</div>
-        <div class="hint">Worker errors (24h): ${{workerErrors24h}}</div>
+        <div class="hint">Probe invocations (24h): ${{workerInvocations24h}}</div>
+        <div class="hint">Probe errors (24h): ${{workerErrors24h}}</div>
+        <div class="hint">Expected embedded build: ${{managementLambda.version || '—'}}${{managementLambda.expected_monitor_source_sha ? ' · ' + managementLambda.expected_monitor_source_sha.slice(0, 8) : ''}}</div>
       </div>
     </div>
     <div style="margin-top:16px">
+      <div class="hint" style="margin-bottom:10px">Version state compares the running probe against the current embedded probe source in the management Lambda. Use Update Code when a probe shows mismatch.</div>
       <table>
-        <thead><tr><th>Region</th><th>Function</th><th>Memory</th><th>Age</th><th>Invocations (24h)</th><th>Avg runtime</th><th>Errors</th></tr></thead>
+        <thead><tr><th>Region</th><th>Function</th><th>Version</th><th>Running Build</th><th>Memory</th><th>Age</th><th>Invocations (24h)</th><th>Avg runtime</th><th>Errors</th></tr></thead>
         <tbody>${{workerRows}}</tbody>
       </table>
     </div>
     <div style="margin-top:16px" class="hint">
       Hosts: ${{data.hosts.total}} total, ${{data.hosts.enabled}} enabled, ${{data.hosts.on_status_page}} on status page, ${{data.hosts.alerts_enabled}} with alerts.
-      Worker regions: ${{data.worker_regions}}. Home region: ${{data.home_region}}.
+      Probe regions: ${{data.worker_regions}}. Home region: ${{data.home_region}}.
     </div>
   `;
 }}
@@ -4353,6 +4967,148 @@ async function loadManagement() {{
     return;
   }}
   renderManagementSummary(data);
+}}
+
+function formatLogTime(value) {{
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}}
+
+function escapeHtml(value) {{
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}}
+
+function renderLogs(data) {{
+  const summaryEl = document.getElementById('logs-summary');
+  const issuesEl = document.getElementById('logs-issues');
+  const entriesEl = document.getElementById('logs-entries');
+  const noteEl = document.getElementById('logs-source-note');
+  if (!data || data.error) {{
+    const text = (data && data.error) || 'Unable to load logs.';
+    summaryEl.innerHTML = `<div style="color:#ef4444">${{escapeHtml(text)}}</div>`;
+    issuesEl.innerHTML = `<div style="color:#ef4444">${{escapeHtml(text)}}</div>`;
+    entriesEl.innerHTML = `<div style="color:#ef4444">${{escapeHtml(text)}}</div>`;
+    return;
+  }}
+  const scopeName = data.scope === 'worker' ? 'probe worker' : 'management Lambda';
+  noteEl.textContent = `Reading the ${{scopeName}} log group in ${{data.region || '—'}}: ${{data.log_group_name || '—'}}`;
+  summaryEl.innerHTML = `
+    <div class="log-summary-grid">
+      <div class="log-summary-card"><div class="label">Source</div><div class="value" style="font-size:1rem">${{escapeHtml(data.function_name || '—')}}</div></div>
+      <div class="log-summary-card"><div class="label">Errors</div><div class="value" style="color:#fca5a5">${{data.summary?.error ?? 0}}</div></div>
+      <div class="log-summary-card"><div class="label">Warnings</div><div class="value" style="color:#fde68a">${{data.summary?.warn ?? 0}}</div></div>
+      <div class="log-summary-card"><div class="label">Info</div><div class="value" style="color:#93c5fd">${{data.summary?.info ?? 0}}</div></div>
+      <div class="log-summary-card"><div class="label">Window</div><div class="value" style="font-size:1rem">Last ${{data.lookback_hours || 24}}h</div></div>
+    </div>
+  `;
+  const issues = Array.isArray(data.issues) ? data.issues : [];
+  issuesEl.innerHTML = issues.length ? `<div class="log-issue-list">${{issues.map(item => `
+    <div class="log-issue">
+      <div class="log-issue-head">
+        <div>
+          <div style="font-weight:700">${{escapeHtml(item.issue || item.summary || 'Issue')}}</div>
+          <div class="hint">${{escapeHtml(item.summary || '')}}</div>
+        </div>
+        <div style="text-align:right">
+          <span class="badge ${{item.severity || 'info'}}">${{escapeHtml(item.severity || 'info')}}</span>
+          <div class="log-entry-meta" style="margin-top:6px">${{escapeHtml(formatLogTime(item.time))}}</div>
+        </div>
+      </div>
+      <pre>${{escapeHtml(item.raw_message || '')}}</pre>
+    </div>`).join('')}}</div>` : '<div class="hint">No warnings or errors were found in the selected window.</div>';
+
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  entriesEl.innerHTML = entries.length ? entries.map(item => `
+    <details class="log-entry">
+      <summary class="log-entry-head" style="list-style:none;cursor:pointer">
+        <div>
+          <div style="font-weight:700">${{escapeHtml(item.summary || 'Log event')}}</div>
+          <div class="hint">${{escapeHtml(item.issue || '')}}</div>
+        </div>
+        <div style="text-align:right">
+          <span class="badge ${{item.severity || 'info'}}">${{escapeHtml(item.level || 'info')}}</span>
+          <div class="log-entry-meta" style="margin-top:6px">${{escapeHtml(formatLogTime(item.time))}}</div>
+        </div>
+      </summary>
+      ${{item.details && Object.keys(item.details).length ? `<pre>${{escapeHtml(JSON.stringify(item.details, null, 2))}}</pre>` : ''}}
+      <pre>${{escapeHtml(item.raw_message || '')}}</pre>
+    </details>
+  `).join('') : '<div class="hint">No log entries matched the current filter.</div>';
+  window.LAST_LOGS_DATA = data;
+}}
+
+async function ensureLogsRegions() {{
+  if (!REGIONS_CACHE.length) {{
+    await ensureRegionsLoaded();
+  }}
+  const select = document.getElementById('logs-region');
+  if (!select) return;
+  const current = select.value;
+  const regions = REGIONS_CACHE.map(item => item.region).filter(Boolean);
+  select.innerHTML = regions.length
+    ? regions.map(region => `<option value="${{region}}" ${{region === current ? 'selected' : ''}}>${{region}}</option>`).join('')
+    : '<option value="">No deployed probe regions</option>';
+  if (!select.value && regions.length) select.value = regions[0];
+}}
+
+async function handleLogsScopeChange() {{
+  const worker = document.getElementById('logs-scope').value === 'worker';
+  document.getElementById('logs-region').disabled = !worker;
+  if (worker) await ensureLogsRegions();
+  loadLogs();
+}}
+
+async function loadLogs() {{
+  const scope = document.getElementById('logs-scope').value;
+  const limit = document.getElementById('logs-limit').value;
+  const hours = document.getElementById('logs-hours').value;
+  if (scope === 'worker') {{
+    await ensureLogsRegions();
+  }}
+  const region = scope === 'worker' ? document.getElementById('logs-region').value : '';
+  const summaryEl = document.getElementById('logs-summary');
+  const issuesEl = document.getElementById('logs-issues');
+  const entriesEl = document.getElementById('logs-entries');
+  summaryEl.innerHTML = '<span class="spinner"></span> Loading log summary…';
+  issuesEl.innerHTML = '<span class="spinner"></span> Looking for likely issues…';
+  entriesEl.innerHTML = '<span class="spinner"></span> Loading entries…';
+  const qs = new URLSearchParams({{scope, limit, hours}});
+  if (scope === 'worker' && region) qs.set('region', region);
+  const data = await api('/api/logs?'+qs.toString());
+  renderLogs(data);
+}}
+
+async function copyLogsSummary() {{
+  const data = window.LAST_LOGS_DATA;
+  if (!data) {{
+    toast('Load logs first', true);
+    return;
+  }}
+  const lines = [
+    `Source: ${{data.function_name || '—'}}`,
+    `Region: ${{data.region || '—'}}`,
+    `Log group: ${{data.log_group_name || '—'}}`,
+    `Window: last ${{data.lookback_hours || 24}} hours`,
+    `Errors: ${{data.summary?.error ?? 0}}`,
+    `Warnings: ${{data.summary?.warn ?? 0}}`,
+    `Info: ${{data.summary?.info ?? 0}}`,
+  ];
+  (data.issues || []).slice(0, 5).forEach((item, index) => {{
+    lines.push(`${{index + 1}}. [${{item.severity}}] ${{item.issue}} — ${{item.summary}} @ ${{formatLogTime(item.time)}}`);
+  }});
+  try {{
+    await navigator.clipboard.writeText(lines.join('\\n'));
+    toast('Summary copied');
+  }} catch (err) {{
+    toast('Copy failed', true);
+  }}
 }}
 
 async function saveManagementRetention() {{
@@ -4407,42 +5163,176 @@ async function loadCostDefaults() {{
     showAuthGate('Enter the admin token to load cost estimates.');
     return;
   }}
+  if (data.error) {{
+    const fallbackDefaults = {{
+      hosts: HOSTS_CACHE.filter(h => h.enabled !== false).length,
+      regions: REGIONS_CACHE.length,
+      interval_sec: 60,
+      retention_days: 90,
+      cloudfront_plan: 'payg',
+      cognito_admin_mau: 0,
+    }};
+    fillCostInputs(fallbackDefaults);
+    renderCostEstimate(estimateCostLocal(fallbackDefaults), 'Calculated locally because /api/cost failed.');
+    toast(data.error, true);
+    return;
+  }}
   const defaults = data.defaults || data.inputs || {{}};
+  fillCostInputs(defaults);
+  await calcCost();
+}}
+
+function costNumber(value) {{
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}}
+
+function fillCostInputs(defaults={{}}) {{
   document.getElementById('c-hosts').value = defaults.hosts ?? 0;
   document.getElementById('c-regions').value = defaults.regions ?? 0;
   document.getElementById('c-interval').value = defaults.interval_sec ?? 300;
   document.getElementById('c-days').value = defaults.retention_days ?? 90;
   document.getElementById('c-cloudfront-plan').value = defaults.cloudfront_plan ?? 'payg';
   document.getElementById('c-cognito-mau').value = defaults.cognito_admin_mau ?? 0;
-  await calcCost();
+}}
+
+function getCostInputs() {{
+  const customDomainInput = document.getElementById('cd-domain');
+  const customDomainEnabled = !!(customDomainInput && customDomainInput.value);
+  const cognitoMau = costNumber(document.getElementById('c-cognito-mau').value);
+  return {{
+    hosts: costNumber(document.getElementById('c-hosts').value),
+    regions: costNumber(document.getElementById('c-regions').value),
+    interval_sec: Math.max(60, costNumber(document.getElementById('c-interval').value) || 60),
+    retention_days: Math.max(1, costNumber(document.getElementById('c-days').value) || 90),
+    cloudfront_plan: document.getElementById('c-cloudfront-plan').value || 'payg',
+    custom_domain: customDomainEnabled,
+    cognito_enabled: cognitoMau > 0,
+    cognito_admin_mau: cognitoMau,
+  }};
+}}
+
+function estimateCostLocal(inputs) {{
+  const hosts = Math.max(0, costNumber(inputs.hosts));
+  const regions = Math.max(0, costNumber(inputs.regions));
+  const requestedInterval = Math.max(60, costNumber(inputs.interval_sec) || 60);
+  const effectiveInterval = 60;
+  const days = Math.max(1, costNumber(inputs.retention_days) || 90);
+  const customDomainEnabled = !!inputs.custom_domain;
+  const cloudfrontPlan = (inputs.cloudfront_plan || 'payg').toLowerCase();
+  const cognitoEnabled = !!inputs.cognito_enabled;
+  const cognitoAdminMau = Math.max(0, costNumber(inputs.cognito_admin_mau));
+  const runsPerMonth = Math.round((30 * 24 * 3600) / effectiveInterval);
+  const checksPerDayPerRegion = Math.round(86400 / effectiveInterval);
+  const requestedChecksPerDayPerRegion = Math.round(86400 / requestedInterval);
+  const checksPerMonth = runsPerMonth * hosts * regions;
+  const managementInvocations = runsPerMonth;
+  const workerInvocations = runsPerMonth * regions;
+  const invocations = managementInvocations + workerInvocations;
+  const gbSec = workerInvocations * 2.0 * (256 / 1024);
+  const lambdaCost = Math.max(0, (invocations - 1000000) / 1000000 * 0.20) + Math.max(0, (gbSec - 400000) * 0.00001667);
+  const ddbWrites = checksPerMonth * 2;
+  const ddbReads = checksPerMonth * 0.1;
+  const ddbWritesCost = Math.max(0, (ddbWrites - 1000000) / 1000000 * 1.25);
+  const ddbReadsCost = Math.max(0, (ddbReads - 1000000) / 1000000 * 0.25);
+  const items = checksPerMonth * (days / 30);
+  const storageGb = (items * 500) / (1024 ** 3);
+  const storageCost = Math.max(0, (storageGb - 25) * 0.25);
+  const logGb = (checksPerMonth * 100) / (1024 ** 3);
+  const logCost = Math.max(0, (logGb - 5) * 0.50);
+  const cloudfrontCost = customDomainEnabled ? (CLOUDFRONT_PLAN_COSTS[cloudfrontPlan] ?? 0) : 0;
+  const cognitoBillableMau = Math.max(0, cognitoAdminMau - 10000);
+  const cognitoCost = cognitoEnabled ? cognitoBillableMau * 0.015 : 0;
+  const total = lambdaCost + ddbWritesCost + ddbReadsCost + storageCost + logCost + cloudfrontCost + cognitoCost;
+  return {{
+    inputs: {{
+      hosts,
+      regions,
+      interval_sec: requestedInterval,
+      retention_days: days,
+      cloudfront_plan: cloudfrontPlan,
+      cognito_admin_mau: cognitoAdminMau,
+    }},
+    scheduler: {{
+      requested_interval_sec: requestedInterval,
+      effective_interval_sec: effectiveInterval,
+    }},
+    checks_per_day_per_region: checksPerDayPerRegion,
+    requested_checks_per_day_per_region: requestedChecksPerDayPerRegion,
+    monthly_invocations: {{
+      management: managementInvocations,
+      workers: workerInvocations,
+      total: invocations,
+    }},
+    breakdown: {{
+      lambda_usd: +lambdaCost.toFixed(4),
+      dynamodb_writes_usd: +ddbWritesCost.toFixed(4),
+      dynamodb_reads_usd: +ddbReadsCost.toFixed(4),
+      dynamodb_storage_usd: +storageCost.toFixed(4),
+      cloudfront_custom_domain_usd: +cloudfrontCost.toFixed(4),
+      cognito_auth_usd: +cognitoCost.toFixed(4),
+      cloudwatch_logs_usd: +logCost.toFixed(4),
+    }},
+    total_usd_per_month: +total.toFixed(4),
+    note: 'Local estimate using the same pricing assumptions as the backend. The current scheduler runs once per minute, so worker-region count drives Lambda wake-ups; slower host tiers mainly reduce checks, DynamoDB growth, and logs.',
+  }};
+}}
+
+function renderCostEstimate(data, prefixNote='') {{
+  const b = data.breakdown || {{}};
+  const el = document.getElementById('cost-result');
+  el.style.display = '';
+  const month = costNumber(data.total_usd_per_month);
+  const day = month / 30;
+  document.getElementById('cost-summary').innerHTML =
+    `Current scheduler: every <strong>${{costNumber(data.scheduler?.effective_interval_sec || 60).toLocaleString()}}s</strong>. ` +
+    `Requested interval: every <strong>${{costNumber(data.scheduler?.requested_interval_sec || 60).toLocaleString()}}s</strong>. ` +
+    `Checks/day per region at current scheduler: <strong>${{costNumber(data.checks_per_day_per_region).toLocaleString()}}</strong>. ` +
+    `If hosts actually run every ${{costNumber(data.scheduler?.requested_interval_sec || 60).toLocaleString()}}s, that is about <strong>${{costNumber(data.requested_checks_per_day_per_region).toLocaleString()}}</strong> checks/day per host-region. ` +
+    `Estimated total: <strong>$${{day.toFixed(4)}}/day</strong> · <strong>$${{month.toFixed(4)}}/month</strong>. ` +
+    `Monthly Lambda invocations: <strong>${{costNumber(data.monthly_invocations?.total).toLocaleString()}}</strong> ` +
+    `(management ${{costNumber(data.monthly_invocations?.management).toLocaleString()}}, workers ${{costNumber(data.monthly_invocations?.workers).toLocaleString()}}). ` +
+    `Cognito admin MAUs: <strong>${{costNumber(data.inputs?.cognito_admin_mau).toLocaleString()}}</strong>.`;
+  document.getElementById('cost-rows').innerHTML =
+    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['Cognito auth', b.cognito_auth_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
+    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{costNumber(v).toFixed(4)}}</span></div>`)
+    .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{prefixNote ? prefixNote + ' ' : ''}}${{data.note||''}}</div>`;
 }}
 
 async function calcCost() {{
-  const customDomainInput = document.getElementById('cd-domain');
-  const customDomainEnabled = !!(customDomainInput && customDomainInput.value);
-  const cognitoEnabled = !!(document.getElementById('c-cognito-mau').value && +document.getElementById('c-cognito-mau').value > 0);
-  const data = await api('/api/cost?hosts='+document.getElementById('c-hosts').value+'&regions='+document.getElementById('c-regions').value+'&interval='+document.getElementById('c-interval').value+'&days='+document.getElementById('c-days').value+'&custom_domain='+(customDomainEnabled ? '1' : '0')+'&cloudfront_plan='+encodeURIComponent(document.getElementById('c-cloudfront-plan').value)+'&cognito_enabled='+(cognitoEnabled ? '1' : '0')+'&cognito_admin_mau='+document.getElementById('c-cognito-mau').value);
+  const inputs = getCostInputs();
+  const data = await api('/api/cost?hosts='+inputs.hosts+'&regions='+inputs.regions+'&interval='+inputs.interval_sec+'&days='+inputs.retention_days+'&custom_domain='+(inputs.custom_domain ? '1' : '0')+'&cloudfront_plan='+encodeURIComponent(inputs.cloudfront_plan)+'&cognito_enabled='+(inputs.cognito_enabled ? '1' : '0')+'&cognito_admin_mau='+inputs.cognito_admin_mau);
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to calculate costs.');
     return;
   }}
-  const b = data.breakdown || {{}};
-  const el = document.getElementById('cost-result');
-  el.style.display = '';
-  document.getElementById('cost-summary').innerHTML =
-    `Current scheduler: every <strong>${{data.scheduler?.effective_interval_sec || 60}}s</strong>. ` +
-    `Requested interval: every <strong>${{data.scheduler?.requested_interval_sec || 60}}s</strong>. ` +
-    `Checks/day per region: <strong>${{(data.checks_per_day_per_region || 0).toLocaleString()}}</strong>. ` +
-    `Monthly Lambda invocations: <strong>${{(data.monthly_invocations?.total || 0).toLocaleString()}}</strong> ` +
-    `(management ${{(data.monthly_invocations?.management || 0).toLocaleString()}}, workers ${{(data.monthly_invocations?.workers || 0).toLocaleString()}}). ` +
-    `Cognito admin MAUs: <strong>${{(data.inputs?.cognito_admin_mau || 0).toLocaleString()}}</strong>.`;
-  document.getElementById('cost-rows').innerHTML =
-    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['Cognito auth', b.cognito_auth_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
-    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{(v||0).toFixed(4)}}</span></div>`)
-    .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{data.note||''}}</div>`;
+  if (data.error) {{
+    toast(data.error, true);
+    renderCostEstimate(estimateCostLocal(inputs), 'Calculated locally because /api/cost failed.');
+    return;
+  }}
+  renderCostEstimate(data);
 }}
 
 async function boot() {{
+  ['c-hosts','c-regions','c-interval','c-days','c-cloudfront-plan','c-cognito-mau'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (!el || el.dataset.costBound === '1') return;
+    el.addEventListener('input', () => {{
+      if (document.getElementById('pane-cost').style.display !== 'none') calcCost();
+    }});
+    el.addEventListener('change', () => {{
+      if (document.getElementById('pane-cost').style.display !== 'none') calcCost();
+    }});
+    el.dataset.costBound = '1';
+  }});
+  ['sp-maintenance-enabled','sp-maintenance-message','sp-maintenance-window','sp-maintenance-scope','sp-maintenance-start','sp-maintenance-end'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (!el || el.dataset.maintenanceBound === '1') return;
+    el.addEventListener('input', refreshMaintenanceEditorState);
+    el.addEventListener('change', refreshMaintenanceEditorState);
+    el.dataset.maintenanceBound = '1';
+  }});
   if (!await ensureAuthed()) return;
   document.getElementById('m-tier').addEventListener('change', updateHostImpact);
   await Promise.all([ensureRegionsLoaded(), loadHosts()]);

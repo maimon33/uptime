@@ -13,6 +13,7 @@ Strategy:
 import io
 import json
 import os
+import hashlib
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -50,6 +51,10 @@ def _monitor_zip() -> bytes:
         zf.writestr("handler.py", code)
     return buf.getvalue()
 
+def _monitor_source_sha() -> str:
+    src = os.path.join(os.path.dirname(__file__), "_monitor_handler.py")
+    return hashlib.sha256(open(src, "rb").read()).hexdigest()
+
 def _monitor_env(region: str) -> dict:
     return {
         "HOSTS_TABLE":    HOSTS_TABLE,
@@ -57,6 +62,8 @@ def _monitor_env(region: str) -> dict:
         "HOME_REGION":    HOME_REGION,
         "MONITOR_REGION": region,
         "RETENTION_DAYS": RETENTION_DAYS,
+        "MONITOR_SOURCE_SHA": _monitor_source_sha(),
+        "MONITOR_BUILD_VERSION": os.environ.get("APP_VERSION", "unknown"),
     }
 
 
@@ -138,6 +145,8 @@ def deploy_region(region: str, memory_mb: int = 256, supported_tiers: list[int] 
     fname    = f"{FUNCTION_PREFIX}-{region}"
     role_arn = _ensure_monitor_role()
     zip_data = _monitor_zip()
+    source_sha = _monitor_source_sha()
+    build_version = os.environ.get("APP_VERSION", "unknown")
     lam  = boto3.client("lambda", region_name=region)
     logs = boto3.client("logs",   region_name=region)
 
@@ -187,7 +196,8 @@ def deploy_region(region: str, memory_mb: int = 256, supported_tiers: list[int] 
             MemorySize=memory_mb,
         )
 
-    func_arn = lam.get_function_configuration(FunctionName=fname)["FunctionArn"]
+    current = lam.get_function_configuration(FunctionName=fname)
+    func_arn = current["FunctionArn"]
 
     print(f"Worker deployed in {region}")
     return {
@@ -198,6 +208,10 @@ def deploy_region(region: str, memory_mb: int = 256, supported_tiers: list[int] 
         "supported_tiers": sorted(supported_tiers or [60, 300]),
         "status": "active",
         "deployed_at": datetime.now(timezone.utc).isoformat(),
+        "monitor_source_sha": source_sha,
+        "monitor_build_version": build_version,
+        "lambda_last_modified": current.get("LastModified"),
+        "lambda_revision_id": current.get("RevisionId"),
     }
 
 

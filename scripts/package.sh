@@ -63,6 +63,9 @@ cat > "$TMPDIR/_build_info.json" <<EOF
 {"version":"$VERSION","built_at":"$BUILT_AT"}
 EOF
 
+echo "  Version: $VERSION"
+echo "  Built at: $BUILT_AT"
+
 echo "→ Packaging management Lambda..."
 OUT="$DIST/management.zip"
 rm -f "$OUT"
@@ -72,6 +75,10 @@ zip -qr "$OUT" handler.py regions.py _monitor_handler.py _build_info.json
 
 SIZE=$(du -sh "$OUT" | cut -f1)
 echo "  ✓ $OUT ($SIZE)"
+echo ""
+echo "Build:"
+echo "  Version: $VERSION"
+echo "  Built at: $BUILT_AT"
 echo ""
 echo "Contents:"
 unzip -l "$OUT" | awk '$2 ~ /^[0-9-]+$/ && $3 ~ /^[0-9:]+$/ {print "  " $NF " (" $1 " bytes)"}'

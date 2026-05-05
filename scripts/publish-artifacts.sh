@@ -65,6 +65,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Version: git short hash if available, else UTC timestamp
 VERSION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)"
+BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 STAGE="s3://${BUCKET}/${PREFIX}staging/${VERSION}"
 
@@ -86,10 +87,14 @@ trap _cleanup ERR
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 if [[ "${SKIP_PACKAGE:-0}" != "1" ]]; then
-  echo "→ Packaging (version: ${VERSION})..."
+  echo "→ Packaging"
+  echo "  Version: ${VERSION}"
+  echo "  Built at: ${BUILT_AT}"
   bash "$REPO_ROOT/scripts/package.sh"
 else
-  echo "→ Reusing existing package (version: ${VERSION})..."
+  echo "→ Reusing existing package"
+  echo "  Version: ${VERSION}"
+  echo "  Built at: ${BUILT_AT}"
 fi
 
 # ── 2. Stage all three files ──────────────────────────────────────────────────
@@ -117,12 +122,15 @@ TEMPLATE_URL="https://${BUCKET}.s3.amazonaws.com/${LIVE_BOOTSTRAP}"
 
 echo ""
 echo "✓ Published version: ${VERSION}"
+echo "  Built at: ${BUILT_AT}"
 echo ""
 echo "Live (CFN template defaults):"
 echo "  s3://${BUCKET}/${LIVE_ZIP}"
 echo "  s3://${BUCKET}/${LIVE_BOOTSTRAP}"
 echo ""
-echo "Versioned archive (pin with LambdaCodeS3Key=${VERSIONED}/management.zip):"
+echo "Versioned archive:"
+echo "  Version: ${VERSION}"
+echo "  Pin with LambdaCodeS3Key=${VERSIONED}/management.zip"
 echo "  s3://${BUCKET}/${VERSIONED}/"
 echo ""
 echo "One-click deploy:"

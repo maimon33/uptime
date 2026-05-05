@@ -128,6 +128,27 @@ resource "aws_iam_role_policy" "management" {
         Resource = "${aws_cloudwatch_log_group.management.arn}:*"
       },
       {
+        Sid    = "ReadLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:FilterLogEvents",
+          "logs:GetLogEvents",
+          "logs:DescribeLogStreams",
+        ]
+        Resource = [
+          aws_cloudwatch_log_group.management.arn,
+          "${aws_cloudwatch_log_group.management.arn}:*",
+          "arn:aws:logs:*:${local.account_id}:log-group:/aws/lambda/${var.project}-monitor-*",
+          "arn:aws:logs:*:${local.account_id}:log-group:/aws/lambda/${var.project}-monitor-*:*",
+        ]
+      },
+      {
+        Sid      = "ReadLogsCatalog"
+        Effect   = "Allow"
+        Action   = ["logs:DescribeLogGroups"]
+        Resource = "*"
+      },
+      {
         Sid    = "Data"
         Effect = "Allow"
         Action = [
