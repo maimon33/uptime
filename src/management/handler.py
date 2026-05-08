@@ -43,6 +43,7 @@ from decimal import Decimal
 from urllib.parse import parse_qs, quote, urlparse
 
 import boto3
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 import regions as reg
@@ -339,6 +340,23 @@ def _log(level: str, message: str, **fields) -> None:
     payload.update(fields)
     print(json.dumps(payload, default=_serial))
 
+def _log_dynamodb_write(operation: str, table_name: str, *, key: dict | None = None, item: dict | None = None, updates: dict | None = None, context: str = "") -> None:
+    fields = {
+        "operation": operation,
+        "table": table_name,
+    }
+    if context:
+        fields["context"] = context
+    if key is not None:
+        fields["key"] = key
+    if item is not None:
+        fields["item"] = item
+        fields["item_keys"] = sorted(str(k) for k in item.keys())
+    if updates is not None:
+        fields["updates"] = updates
+        fields["updated_keys"] = sorted(str(k) for k in updates.keys())
+    _log("info", "dynamodb_write", **fields)
+
 
 def _log_request(event: dict, method: str, path: str) -> None:
     headers = event.get("headers") or {}
@@ -438,7 +456,7 @@ def _due_monitor_tiers(now: datetime, all_tiers: list[int]) -> list[int]:
     return due or [60]
 
 
-def _run_orchestration() -> dict:
+def _run_orchestration(force_check: bool = False, host_id: str | None = None) -> dict:
     if _is_read_only():
         _log("info", "orchestration_skipped_read_only")
         return {"skipped": True, "reason": "read_only_mode"}
@@ -450,13 +468,15 @@ def _run_orchestration() -> dict:
     for region in regions:
         all_tiers.extend(_normalize_monitor_tiers(region.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS))
     due_tiers = _due_monitor_tiers(run_time, all_tiers or DEFAULT_MONITOR_TIERS)
-    _log("info", "orchestration_started", run_id=run_id, configured_regions=len(regions), due_tiers=due_tiers)
+    _log("info", "orchestration_started", run_id=run_id, configured_regions=len(regions), due_tiers=due_tiers, force_check=force_check, host_id=host_id or "")
 
     if not regions:
         print("No worker regions configured; skipping orchestration run.")
         return {"run_id": run_id, "regions": 0, "hosts": 0, "results": 0}
 
     hosts = _list_host_items()
+    if host_id:
+        hosts = [host for host in hosts if host.get("host_id") == host_id]
     if not hosts:
         print("No enabled hosts configured; skipping orchestration run.")
         return {"run_id": run_id, "regions": len(regions), "hosts": 0, "results": 0}
@@ -464,7 +484,7 @@ def _run_orchestration() -> dict:
     worker_results = []
     with ThreadPoolExecutor(max_workers=min(len(regions), 8)) as pool:
         futures = {
-            pool.submit(_invoke_region_worker, region, run_id, due_tiers): region["region"]
+            pool.submit(_invoke_region_worker, region, run_id, due_tiers, force_check, host_id): region["region"]
             for region in regions
         }
         for fut in as_completed(futures):
@@ -479,13 +499,15 @@ def _run_orchestration() -> dict:
         result_rows.extend(worker.get("results", []))
 
     _apply_aggregate_updates(db, hosts, result_rows, run_id)
-    _log("info", "orchestration_completed", run_id=run_id, regions=len(regions), hosts=len(hosts), results=len(result_rows), due_tiers=due_tiers)
+    _log("info", "orchestration_completed", run_id=run_id, regions=len(regions), hosts=len(hosts), results=len(result_rows), due_tiers=due_tiers, force_check=force_check, host_id=host_id or "")
     return {
         "run_id": run_id,
         "regions": len(regions),
         "hosts": len(hosts),
         "results": len(result_rows),
         "due_tiers": due_tiers,
+        "force_check": force_check,
+        "host_id": host_id or "",
     }
 
 
@@ -1010,31 +1032,41 @@ def _is_mutating_api_request(method: str, resource: str, rid: str, sub: str) -> 
 # ── Hosts CRUD ────────────────────────────────────────────────────────────────
 
 def _list_hosts() -> dict:
-    hosts = sorted(_list_host_items(), key=lambda h: h.get("name", ""))
+    hosts = sorted(_list_host_items(), key=lambda h: str(h.get("name") or h.get("host_id") or ""))
     return _json(200, hosts)
 
 
 def _list_host_items() -> list[dict]:
     result = _db().Table(HOSTS_TABLE).scan(
-        FilterExpression="host_id <> :s AND NOT begins_with(host_id, :r)",
-        ExpressionAttributeValues={":s": "__settings__", ":r": "__region__"},
+        FilterExpression="host_id <> :s AND NOT begins_with(host_id, :r) AND NOT begins_with(host_id, :a)",
+        ExpressionAttributeValues={":s": "__settings__", ":r": "__region__", ":a": "__audit__"},
     )
     return result.get("Items", [])
 
 
 def _list_public_hosts() -> list[dict]:
     result = _db().Table(HOSTS_TABLE).scan(
-        FilterExpression="show_on_status_page = :t AND host_id <> :s AND NOT begins_with(host_id, :r)",
-        ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__"},
+        FilterExpression="show_on_status_page = :t AND host_id <> :s AND NOT begins_with(host_id, :r) AND NOT begins_with(host_id, :a)",
+        ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__", ":a": "__audit__"},
     )
-    return sorted(result.get("Items", []), key=lambda h: h.get("name", ""))
+    return sorted(result.get("Items", []), key=lambda h: str(h.get("name") or h.get("host_id") or ""))
 
 def _get_host(host_id: str) -> dict:
     item = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": host_id}).get("Item")
     return _json(404, {"error": "Host not found"}) if not item else _json(200, item)
 
+def _clean_host_name(value) -> str:
+    name = str(value or "").strip()
+    return "" if name.lower() == "undefined" else name
+
+def _clean_host_url(value) -> str:
+    url = str(value or "").strip()
+    return "" if url.lower() == "undefined" else url
+
 def _create_host(body: dict) -> dict:
-    if not body.get("name") or not body.get("url"):
+    name = _clean_host_name(body.get("name"))
+    url = _clean_host_url(body.get("url"))
+    if not name or not url:
         return _json(400, {"error": "'name' and 'url' are required"})
     now  = datetime.now(timezone.utc).isoformat()
     monitor_tier_seconds = int(body.get("monitor_tier_seconds", body.get("check_interval_seconds", 60)))
@@ -1044,8 +1076,8 @@ def _create_host(body: dict) -> dict:
         return _json(400, {"error": tier_error})
     item = {k: v for k, v in {
         "host_id":                str(uuid.uuid4()),
-        "name":                   body["name"],
-        "url":                    body["url"],
+        "name":                   name,
+        "url":                    url,
         "check_type":             body.get("check_type", "http"),
         "check_interval_seconds": monitor_tier_seconds,
         "monitor_tier_seconds":   monitor_tier_seconds,
@@ -1063,7 +1095,20 @@ def _create_host(body: dict) -> dict:
         "updated_at":             now,
         "current_status":         "unknown",
     }.items() if v is not None}
-    _db().Table(HOSTS_TABLE).put_item(Item=item)
+    _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": item["host_id"]}, item=item, context="host_create")
+    _db().Table(HOSTS_TABLE).put_item(Item=item, ConditionExpression="attribute_not_exists(host_id)")
+    _audit_event(
+        "host_create",
+        actor="admin",
+        host_id=item["host_id"],
+        host_name=item.get("name"),
+        url=item.get("url"),
+        enabled=item.get("enabled", True),
+        monitor_tier_seconds=item.get("monitor_tier_seconds"),
+        target_regions=item.get("target_regions", []),
+        check_type=item.get("check_type"),
+        show_on_status_page=item.get("show_on_status_page", True),
+    )
     return _json(201, item)
 
 def _update_host(host_id: str, body: dict) -> dict:
@@ -1089,6 +1134,14 @@ def _update_host(host_id: str, body: dict) -> dict:
         updates["monitor_tier_seconds"] = tier
     if "target_regions" in updates:
         updates["target_regions"] = _normalize_target_regions(updates.get("target_regions"))
+    if "name" in updates:
+        updates["name"] = _clean_host_name(updates.get("name"))
+        if not updates["name"]:
+            return _json(400, {"error": "'name' is required"})
+    if "url" in updates:
+        updates["url"] = _clean_host_url(updates.get("url"))
+        if not updates["url"]:
+            return _json(400, {"error": "'url' is required"})
     tier_error = _validate_host_monitor_tier(
         int(updates.get("monitor_tier_seconds", existing.get("monitor_tier_seconds", existing.get("check_interval_seconds", 60)))),
         updates.get("target_regions", existing.get("target_regions", [])),
@@ -1097,16 +1150,68 @@ def _update_host(host_id: str, body: dict) -> dict:
         return _json(400, {"error": tier_error})
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     expr   = "SET " + ", ".join(f"#{k} = :{k}" for k in updates)
+    _log_dynamodb_write("update_item", HOSTS_TABLE, key={"host_id": host_id}, updates=updates, context="host_update")
     table.update_item(
         Key={"host_id": host_id},
         UpdateExpression=expr,
         ExpressionAttributeNames={f"#{k}": k for k in updates},
         ExpressionAttributeValues={f":{k}": v for k, v in updates.items()},
     )
-    return _json(200, table.get_item(Key={"host_id": host_id})["Item"])
+    updated_item = table.get_item(Key={"host_id": host_id})["Item"]
+    _audit_event(
+        "host_update",
+        actor="admin",
+        host_id=host_id,
+        host_name=updated_item.get("name", existing.get("name", host_id)),
+        updated_fields=sorted(updates.keys()),
+        monitor_tier_seconds=updated_item.get("monitor_tier_seconds"),
+        target_regions=updated_item.get("target_regions", []),
+        enabled=updated_item.get("enabled", True),
+        show_on_status_page=updated_item.get("show_on_status_page", True),
+    )
+    return _json(200, updated_item)
 
 def _delete_host(host_id: str) -> dict:
-    _db().Table(HOSTS_TABLE).delete_item(Key={"host_id": host_id})
+    db = _db()
+    host = db.Table(HOSTS_TABLE).get_item(Key={"host_id": host_id}).get("Item")
+    if not host:
+        return _json(404, {"error": "Host not found"})
+    if host_id.startswith("__"):
+        return _json(400, {"error": "Pseudo records cannot be deleted from the Hosts view."})
+
+    checks_table = db.Table(CHECKS_TABLE)
+    hosts_table = db.Table(HOSTS_TABLE)
+    deleted_checks = 0
+    last_key = None
+    while True:
+        query_kwargs = {
+            "KeyConditionExpression": Key("host_id").eq(host_id),
+            "ProjectionExpression": "host_id, checked_at",
+            "Limit": 200,
+        }
+        if last_key:
+            query_kwargs["ExclusiveStartKey"] = last_key
+        result = checks_table.query(**query_kwargs)
+        items = result.get("Items", [])
+        if items:
+            with checks_table.batch_writer() as batch:
+                for item in items:
+                    _log_dynamodb_write("batch_delete_item", CHECKS_TABLE, key={"host_id": item["host_id"], "checked_at": item["checked_at"]}, context="host_delete_checks")
+                    batch.delete_item(Key={"host_id": item["host_id"], "checked_at": item["checked_at"]})
+                    deleted_checks += 1
+        last_key = result.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+    _log_dynamodb_write("delete_item", HOSTS_TABLE, key={"host_id": host_id}, context="host_delete")
+    hosts_table.delete_item(Key={"host_id": host_id})
+    _audit_event(
+        "host_delete",
+        actor="admin",
+        host_id=host_id,
+        host_name=host.get("name", host_id),
+        deleted_checks=deleted_checks,
+    )
     return {"statusCode": 204, "headers": {}, "body": ""}
 
 def _get_checks(host_id: str, limit: int = 200) -> dict:
@@ -1164,6 +1269,7 @@ def _load_settings_item() -> dict:
 
 def _save_settings_item(item: dict) -> None:
     payload = {"host_id": "__settings__", **{k: v for k, v in item.items() if k != "host_id"}}
+    _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": "__settings__"}, item=payload, context="settings_save")
     _db().Table(HOSTS_TABLE).put_item(Item=payload)
 
 
@@ -1177,9 +1283,17 @@ def _audit_event(event_type: str, *, status: str = "ok", actor: str = "system", 
         "created_at": now.isoformat(),
         "ttl": int((now + timedelta(days=AUDIT_RETENTION_DAYS)).timestamp()),
     }
-    item.update({k: v for k, v in fields.items() if v not in (None, "")})
+    clean_fields = {}
+    for key, value in fields.items():
+        if value in (None, ""):
+            continue
+        # host_id is the DynamoDB PK for both real hosts and audit pseudo-records.
+        # Never let audit metadata replace the audit row's own primary key.
+        clean_fields["subject_host_id" if key == "host_id" else key] = value
+    item.update(clean_fields)
     try:
-        _db().Table(HOSTS_TABLE).put_item(Item=item)
+        _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": item["host_id"]}, item=item, context="audit_event")
+        _db().Table(HOSTS_TABLE).put_item(Item=item, ConditionExpression="attribute_not_exists(host_id)")
     except Exception as exc:
         _log("warn", "audit_event_write_failed", event_type=event_type, error=str(exc))
 
@@ -1196,7 +1310,7 @@ def _list_audit_events(limit: int = 50) -> list[dict]:
     return rows[:limit]
 
 
-def _invoke_region_worker(region_info: dict, run_id: str, due_tiers: list[int]) -> dict:
+def _invoke_region_worker(region_info: dict, run_id: str, due_tiers: list[int], force_check: bool = False, host_id: str | None = None) -> dict:
     region = region_info["region"]
     function_name = f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region}"
     supported_tiers = _normalize_monitor_tiers(region_info.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
@@ -1207,6 +1321,8 @@ def _invoke_region_worker(region_info: dict, run_id: str, due_tiers: list[int]) 
             "run_id": run_id,
             "due_tiers": due_tiers,
             "supported_tiers": supported_tiers,
+            "force_check": force_check,
+            "host_id": host_id or "",
         }).encode(),
     )
     payload = response["Payload"].read().decode() or "{}"
@@ -1275,6 +1391,7 @@ def _apply_aggregate_updates(db, hosts: list[dict], result_rows: list[dict], run
         expr_values = {f":v{i}": value for i, value in enumerate(update_item.values())}
         set_parts = [f"{name} = {value}" for name, value in zip(expr_names, expr_values)]
 
+        _log_dynamodb_write("update_item", HOSTS_TABLE, key={"host_id": host["host_id"]}, updates=update_item, context="orchestration_aggregate")
         table.update_item(
             Key={"host_id": host["host_id"]},
             UpdateExpression="SET " + ", ".join(set_parts),
@@ -1369,7 +1486,11 @@ def _add_region(body: dict) -> dict:
             region=region,
             memory_mb=memory_mb,
             supported_tiers=supported_tiers,
+            function_name=info.get("function_name", ""),
             monitor_build_version=info.get("monitor_build_version", ""),
+            monitor_source_sha=info.get("monitor_source_sha", ""),
+            lambda_last_modified=info.get("lambda_last_modified", ""),
+            lambda_revision_id=info.get("lambda_revision_id", ""),
         )
         return _json(200, info)
     except Exception as e:
@@ -1392,7 +1513,11 @@ def _update_region(region: str) -> dict:
             region=region,
             memory_mb=memory_mb,
             supported_tiers=supported_tiers,
+            function_name=info.get("function_name", ""),
             monitor_build_version=info.get("monitor_build_version", ""),
+            monitor_source_sha=info.get("monitor_source_sha", ""),
+            lambda_last_modified=info.get("lambda_last_modified", ""),
+            lambda_revision_id=info.get("lambda_revision_id", ""),
         )
         return _json(200, info)
     except Exception as e:
@@ -1400,6 +1525,7 @@ def _update_region(region: str) -> dict:
         return _json(500, {"error": str(e)})
 
 def _remove_region(region: str) -> dict:
+    existing = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": f"__region__{region}"}).get("Item", {})
     try:
         reg.teardown_region(region)
         reg.delete_region_record(_db(), region)
@@ -1407,7 +1533,15 @@ def _remove_region(region: str) -> dict:
         remaining = reg.list_regions(_db())
         if not remaining:
             reg.delete_monitor_role()
-        _audit_event("worker_delete", actor="admin", region=region, remaining_regions=len(remaining))
+        _audit_event(
+            "worker_delete",
+            actor="admin",
+            region=region,
+            function_name=existing.get("function_name", ""),
+            supported_tiers=existing.get("supported_tiers", []),
+            memory_mb=existing.get("memory_mb"),
+            remaining_regions=len(remaining),
+        )
         return _json(200, {"removed": region})
     except Exception as e:
         _audit_event("worker_delete", status="error", actor="admin", region=region, error=str(e))
@@ -1615,18 +1749,50 @@ def _get_management_summary() -> dict:
 def _run_management_action(body: dict) -> dict:
     action = str(body.get("action") or "").strip()
     _log("info", "management_action_requested", action=action, body=body)
-    _audit_event("management_action_requested", actor="admin", action=action)
+    audit_payload = {k: v for k, v in body.items() if k not in {"action"}}
+    _audit_event("management_action_requested", actor="admin", action=action, action_args=audit_payload)
     if action == "purge_checks":
         older_than_days = int(body.get("older_than_days", 30))
         max_delete = int(body.get("max_delete", 500))
-        return _purge_checks_older_than(older_than_days, max_delete)
+        result = _purge_checks_older_than(older_than_days, max_delete)
+        try:
+            payload = json.loads(result.get("body") or "{}")
+        except Exception:
+            payload = {}
+        _audit_event(
+            "management_action_completed",
+            actor="admin",
+            action=action,
+            status="ok" if result.get("statusCode", 500) < 400 else "error",
+            older_than_days=older_than_days,
+            max_delete=max_delete,
+            deleted=payload.get("deleted"),
+            scanned=payload.get("scanned"),
+            stopped_reason=payload.get("stopped_reason"),
+        )
+        return result
     if action == "set_retention_days":
         retention_days = int(body.get("retention_days", _SETTINGS_DEFAULTS["retention_days"]))
         settings = _load_settings_item()
         settings["retention_days"] = retention_days
         _save_settings_item(settings)
         _log("info", "management_retention_updated", retention_days=retention_days)
+        _audit_event("management_action_completed", actor="admin", action=action, retention_days=retention_days)
         return _json(200, {"ok": True, "retention_days": retention_days})
+    if action == "check_now":
+        host_id = str(body.get("host_id") or "").strip() or None
+        result = _run_orchestration(force_check=True, host_id=host_id)
+        _audit_event(
+            "management_action_completed",
+            actor="admin",
+            action=action,
+            host_id=host_id or "",
+            run_id=result.get("run_id"),
+            regions=result.get("regions"),
+            hosts=result.get("hosts"),
+            results=result.get("results"),
+        )
+        return _json(200, result)
     if action == "force_update_probes":
         return _force_update_probes()
     return _json(400, {"error": "Unknown management action"})
@@ -1652,7 +1818,11 @@ def _force_update_probes() -> dict:
                 region=region_name,
                 memory_mb=memory_mb,
                 supported_tiers=supported_tiers,
+                function_name=info.get("function_name", ""),
                 monitor_build_version=info.get("monitor_build_version", ""),
+                monitor_source_sha=info.get("monitor_source_sha", ""),
+                lambda_last_modified=info.get("lambda_last_modified", ""),
+                lambda_revision_id=info.get("lambda_revision_id", ""),
             )
             updated.append({
                 "region": region_name,
@@ -2144,6 +2314,7 @@ def _purge_checks_older_than(older_than_days: int, max_delete: int) -> dict:
             if items:
                 _log("info", "purge_checks_host_matches", host_id=host["host_id"], host_name=host.get("name"), match_count=len(items))
             for item in items:
+                _log_dynamodb_write("batch_delete_item", CHECKS_TABLE, key={"host_id": item["host_id"], "checked_at": item["checked_at"]}, context="purge_checks")
                 batch.delete_item(Key={"host_id": item["host_id"], "checked_at": item["checked_at"]})
                 deleted += 1
                 if deleted >= max_delete:
@@ -2603,19 +2774,42 @@ def _format_percent(value) -> str:
     return f"{pct:.1f}%"
 
 
+def _coerce_latency_ms(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return round(float(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+
+
+def _as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> list[dict]:
     from boto3.dynamodb.conditions import Key as DKey
 
     host_data = []
     for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        host_id = str(host.get("host_id") or host.get("name") or "")
+        if not host_id:
+            continue
         checks = db.Table(CHECKS_TABLE).query(
-            KeyConditionExpression=DKey("host_id").eq(host["host_id"]),
+            KeyConditionExpression=DKey("host_id").eq(host_id),
             ScanIndexForward=False,
             Limit=history_limit,
         ).get("Items", [])
         grouped = {}
         for check in checks:
+            if not isinstance(check, dict):
+                continue
             run_id = check.get("run_id") or check.get("checked_at")
+            if not run_id:
+                continue
+            run_id = str(run_id)
             grouped.setdefault(run_id, []).append(check)
 
         latest_runs = sorted(grouped.keys(), reverse=True)[:90]
@@ -2635,16 +2829,24 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
         if run_statuses:
             up_count = sum(1 for status in run_statuses if status == "up")
             uptime_pct = round((up_count / len(run_statuses)) * 100, 1)
-            avg_latency = round(sum(float(c.get("latency_ms", 0)) for c in flat_checks) / len(flat_checks))
+            latencies = [
+                latency
+                for latency in (_coerce_latency_ms(c.get("latency_ms")) for c in flat_checks)
+                if latency is not None
+            ]
+            avg_latency = round(sum(latencies) / len(latencies)) if latencies else 0
         else:
             uptime_pct, avg_latency = None, 0
 
         region_summary = []
-        for region_name, region_info in sorted((host.get("region_statuses") or {}).items()):
+        region_statuses = _as_dict(host.get("region_statuses"))
+        for region_name, region_info in sorted(region_statuses.items(), key=lambda item: str(item[0])):
+            if not isinstance(region_info, dict):
+                region_info = {"status": "unknown", "latency_ms": None}
             region_summary.append({
-                "region": region_name,
+                "region": str(region_name),
                 "status": region_info.get("status", "unknown"),
-                "latency_ms": region_info.get("latency_ms"),
+                "latency_ms": _coerce_latency_ms(region_info.get("latency_ms")),
             })
         incident_points = [point for point in run_points if point.get("status") in {"down", "degraded"}]
         latest_incident = incident_points[0] if incident_points else None
@@ -2652,13 +2854,16 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
         current_status = host.get("current_status", "unknown")
         if current_status == "unknown" and run_statuses:
             current_status = run_statuses[0]
+        host_meta = dict(host)
+        host_meta["host_id"] = host_id
+        host_meta["name"] = str(host_meta.get("name") or host_id)
         host_data.append({
-            "host": host,
+            "host": host_meta,
             "uptime_pct": uptime_pct,
             "avg_latency": avg_latency,
-            "latest_latency": host.get("last_latency_ms"),
+            "latest_latency": _coerce_latency_ms(host.get("last_latency_ms")),
             "region_summary": region_summary,
-            "target_regions": host.get("target_regions") or [],
+            "target_regions": [str(region) for region in (host.get("target_regions") or [])] if isinstance(host.get("target_regions") or [], list) else [],
             "history": list(reversed(run_statuses)),
             "history_points": list(reversed(run_points)),
             "history_available": bool(run_statuses),
@@ -2814,30 +3019,34 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
 
     cards = ""
     for h in host_data:
-        s     = h["current_status"]
+        host_meta = _as_dict(h.get("host"))
+        host_id = str(host_meta.get("host_id") or host_meta.get("name") or "host")
+        host_name = str(host_meta.get("name") or host_id)
+        s     = h.get("current_status", "unknown")
         badge = {"up": "Operational", "down": "Down", "degraded": "Degraded"}.get(s, "Unknown")
-        bars  = "".join(f'<span class="b {c}"></span>' for c in h["history"]) \
+        bars  = "".join(f'<span class="b {c}"></span>' for c in h.get("history", [])) \
                 or '<span class="b unknown"></span>' * 10
         summary_bits = []
-        if h["uptime_pct"] is not None:
+        if h.get("uptime_pct") is not None:
             summary_bits.append(f"{_format_percent(h['uptime_pct'])} uptime")
-        if h["avg_latency"]:
+        if h.get("avg_latency"):
             summary_bits.append(f"{h['avg_latency']} ms avg")
-        elif h["latest_latency"] is not None:
+        elif h.get("latest_latency") is not None:
             summary_bits.append(f"{h['latest_latency']} ms latest")
         target_pills = "".join(
             f'<span class="pill">{region}</span>'
-            for region in h["target_regions"]
+            for region in h.get("target_regions", [])
         )
         region_pills = "".join(
-            f'<span class="pill {r["status"]}">{r["region"]} · {r["latency_ms"] if r["latency_ms"] is not None else "—"} ms</span>'
-            for r in h["region_summary"]
+            f'<span class="pill {r.get("status", "unknown")}">{r.get("region", "unknown")} · {r.get("latency_ms") if r.get("latency_ms") is not None else "—"} ms</span>'
+            for r in h.get("region_summary", [])
+            if isinstance(r, dict)
         )
         public_link = ""
-        if h["host"].get("public_link_enabled") and h["host"].get("public_link_url"):
-            public_link = f'<div class="svc-actions"><a class="ghost-link svc-history-link" href="{h["host"]["public_link_url"]}" target="_blank" rel="noopener noreferrer">Open service</a></div>'
-        history_note = "" if h["history_available"] else ""
-        host_history_href = f'/history?host={quote(h["host"]["host_id"])}'
+        if host_meta.get("public_link_enabled") and host_meta.get("public_link_url"):
+            public_link = f'<div class="svc-actions"><a class="ghost-link svc-history-link" href="{host_meta["public_link_url"]}" target="_blank" rel="noopener noreferrer">Open service</a></div>'
+        history_note = "" if h.get("history_available") else ""
+        host_history_href = f'/history?host={quote(host_id)}'
         host_incident_count = int(h.get("incident_count", 0) or 0)
         latest_incident = h.get("latest_incident") or {}
         if host_incident_count:
@@ -2853,36 +3062,32 @@ def _render_status_page(title: str, desc: str, brand_name: str, logo_url: str, t
         else:
             incident_hint = (
                 f'<div class="incident-hint quiet">'
-                f'<span>No past incidents recorded</span>'
+                f'<span>No incidents</span>'
                 f'<a class="ghost-link incident-link" href="{host_history_href}">Full history</a>'
                 f'</div>'
             )
         cards += f"""<details class="card svc-card">
   <summary class="svc-summary">
     <div>
-      <div class="row" style="margin-bottom:2px"><span class="svc">{h['host']['name']}</span><span class="badge {s}">{badge}</span></div>
+      <div class="row" style="margin-bottom:2px"><span class="svc">{host_name}</span><span class="badge {s}">{badge}</span></div>
       <div class="meta" style="margin-bottom:0">{' &nbsp;·&nbsp; '.join(summary_bits) if summary_bits else 'No recent measurements yet'}</div>
       {incident_hint}
     </div>
     <span class="summary-hint">Details</span>
   </summary>
-  <div class="history-title">Recent history</div>
+  <div class="history-title">History</div>
   {history_note}
   <div class="bars">{bars}</div>
   <div class="bar-lbl"><span>90 checks ago</span><span>Latest</span></div>
   <div class="detail-row" style="margin-top:16px">
     <div class="detail-col">
-      <div class="history-title">Check locations</div>
+      <div class="history-title">Locations</div>
       <div class="regions">{target_pills or '<span class="pill unknown">All active check locations</span>'}</div>
     </div>
     <div class="detail-col">
-      <div class="history-title">Latest probe results</div>
+      <div class="history-title">Latest</div>
       <div class="regions">{region_pills or '<span class="pill unknown">No probe results yet</span>'}</div>
     </div>
-  </div>
-  <div class="meta" style="margin-top:14px">
-    Latest latency: {f"{h['latest_latency']} ms" if h["latest_latency"] is not None else "—"} &nbsp;·&nbsp;
-    Average latency: {f"{h['avg_latency']} ms" if h["avg_latency"] else "—"}
   </div>
   {public_link}
 </details>"""
@@ -2982,7 +3187,7 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .detail-row{{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}}
 .detail-col{{min-width:0}}
 .bars{{display:flex;gap:4px;height:28px}}
-.b{{flex:1;border-radius:4px;min-width:3px}}
+.b{{flex:1 1 0;border-radius:4px;min-width:0}}
 .b.up{{background:#22c55e}}.b.down{{background:#ef4444}}.b.degraded{{background:#f59e0b}}.b.unknown{{background:#e2e8f0}}
 .bar-lbl{{display:flex;justify-content:space-between;font-size:.72rem;color:var(--soft);margin-top:6px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .regions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
@@ -2997,16 +3202,48 @@ h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2.2re
 .empty{{text-align:center;color:var(--soft);padding:40px 0}}
 footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 @media (max-width: 700px) {{
-  .wrap{{padding-top:40px}}
-  .hero{{flex-direction:column}}
-  .hero-copy{{width:100%}}
-  .maintenance,.subscribe{{flex-direction:column}}
+  .wrap{{padding:40px 14px 56px}}
+  .brand{{gap:10px;font-size:.8rem;flex-wrap:wrap}}
+  .brand-logo{{height:36px;width:36px;border-radius:10px}}
+  h1{{font-size:clamp(1.9rem,9vw,2.5rem);max-width:none}}
+  .sub{{font-size:.96rem}}
+  .hero{{flex-direction:column;gap:16px;margin-bottom:24px}}
+  .hero-copy{{width:100%;gap:14px}}
   .hero-actions{{width:100%}}
+  .overall{{width:100%;justify-content:flex-start;white-space:normal;line-height:1.45;padding:13px 15px}}
+  .maintenance,.subscribe{{flex-direction:column;padding:18px 16px}}
+  .maintenance-head{{flex-direction:column;align-items:flex-start}}
+  .maintenance-meta{{line-height:1.6}}
+  .maintenance-list{{padding:16px}}
+  .section-summary{{align-items:flex-start;flex-direction:column}}
   .ghost-link{{width:100%}}
-  .subscribe-actions{{width:100%}}
+  .subscribe-actions{{width:100%;flex-direction:column}}
   .subscribe-btn{{width:100%}}
+  .card{{padding:16px 14px}}
+  .svc-summary{{flex-direction:column;align-items:flex-start;gap:10px}}
+  .row{{gap:10px;align-items:flex-start;flex-wrap:wrap}}
+  .svc{{font-size:1rem}}
+  .summary-hint{{display:none}}
   .incident-hint{{flex-direction:column;align-items:flex-start}}
-  .detail-row{{grid-template-columns:1fr}}
+  .detail-row{{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}}
+  .regions{{gap:6px}}
+  .pill{{max-width:100%;white-space:normal;line-height:1.45}}
+  .bars{{height:22px;gap:2px}}
+  .bar-lbl{{font-size:.68rem}}
+  footer{{margin-top:36px}}
+}}
+@media (max-width: 420px) {{
+  .wrap{{padding:32px 12px 48px}}
+  .brand{{font-size:.76rem}}
+  .hero-actions .ghost-link{{padding:10px 12px}}
+  .overall{{font-size:.95rem}}
+  .maintenance-title,.subscribe-title,.section-heading,.history-title{{letter-spacing:.12em}}
+  .badge{{font-size:.7rem;padding:5px 9px}}
+  .detail-row{{gap:8px}}
+  .bars{{height:20px;gap:1px}}
+  .pill{{font-size:.66rem;padding:6px 7px}}
+  .meta{{font-size:.8rem}}
+  .incident-link,.svc-history-link{{font-size:.72rem}}
 }}
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
@@ -3028,7 +3265,6 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
 
 def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], statuses: list[str], selected_host: str, selected_region: str, selected_status: str, rows: list[dict], build: dict) -> str:
     theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
-    build_stamp = _build_stamp(build)
     brand = ""
     if brand_name or logo_url:
         logo = f'<img src="{logo_url}" alt="{brand_name}" class="brand-logo">' if logo_url else ""
@@ -3037,10 +3273,6 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
     host_options = ['<option value="all">All hosts</option>'] + [
         f'<option value="{host["host_id"]}"{" selected" if selected_host == host["host_id"] else ""}>{host.get("name", host["host_id"])}</option>'
         for host in hosts
-    ]
-    region_options = ['<option value="all">All regions</option>'] + [
-        f'<option value="{region}"{" selected" if selected_region == region else ""}>{region}</option>'
-        for region in regions
     ]
     status_options = ['<option value="all">All statuses</option>'] + [
         f'<option value="{status}"{" selected" if selected_status == status else ""}>{status.title()}</option>'
@@ -3078,7 +3310,6 @@ linear-gradient(180deg, var(--bg) 0%, var(--bg-alt) 100%);color:var(--text);min-
 .wrap{{max-width:1160px;margin:0 auto;padding:56px 20px 72px}}
 .brand{{display:flex;align-items:center;gap:12px;font-size:.88rem;font-weight:600;color:var(--soft);margin-bottom:22px;letter-spacing:.06em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .brand-logo{{height:42px;width:42px;object-fit:contain;border-radius:12px;background:var(--card);border:1px solid var(--border);padding:5px;box-shadow:var(--shadow)}}
-.build-flag{{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid var(--hero-border);background:rgba(255,255,255,.58);box-shadow:var(--shadow);font-size:.74rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace;color:var(--soft);margin-bottom:18px}}
 .hero{{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;margin-bottom:20px}}
 h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2rem,4vw,3rem);line-height:1.02;font-weight:700;letter-spacing:-.04em;margin-bottom:8px}}
 .sub{{color:var(--muted);line-height:1.65;max-width:64ch}}
@@ -3109,7 +3340,6 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
   {brand}
-  <div class="build-flag">Running {build_stamp}</div>
   <div class="hero">
     <div>
       <h1>Check History</h1>
@@ -3130,7 +3360,6 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
   </form>
   <div class="panel summary">
     <span>Showing <strong>{len(rows)}</strong> recent checks</span>
-    <span>Theme: <strong>{theme_class}</strong> · {build_stamp}</span>
   </div>
   <div class="table-wrap">
     <table>
@@ -3339,16 +3568,20 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .probe-region-pill input{{width:auto;accent-color:var(--sky)}}
 .probe-region-pill-name{{font-size:.86rem;font-weight:700;color:#e5eef8}}
 .probe-region-pill-meta{{font-size:.74rem;color:var(--soft);margin-top:2px}}
-.coverage-grid{{display:flex;flex-direction:column;gap:12px}}
-.coverage-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px 16px}}
-.coverage-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px}}
-.coverage-title{{font-size:.94rem;font-weight:700;color:#f8fafc}}
-.coverage-subtitle{{font-size:.78rem;color:var(--soft);margin-top:4px}}
-.coverage-pills{{display:flex;flex-wrap:wrap;gap:8px}}
-.coverage-pill{{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:999px;border:1px solid var(--line);background:#111c2d;font-size:.76rem;color:#dbe7f3}}
+.coverage-grid{{display:flex;flex-direction:column;gap:10px}}
+.coverage-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:12px 14px}}
+.coverage-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}}
+.coverage-title{{font-size:.92rem;font-weight:700;color:#f8fafc}}
+.coverage-subtitle{{font-size:.77rem;color:var(--soft);margin-top:4px}}
+.coverage-lines{{display:flex;flex-direction:column;gap:8px;margin-top:10px}}
+.coverage-line{{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:flex-start}}
+.coverage-label{{font-size:.72rem;color:var(--soft);letter-spacing:.12em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace;padding-top:4px}}
+.coverage-pills{{display:flex;flex-wrap:wrap;gap:8px;min-height:28px}}
+.coverage-pill{{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:#111c2d;font-size:.75rem;color:#dbe7f3}}
 .coverage-pill.ok{{border-color:rgba(34,197,94,.35);background:rgba(22,101,52,.18);color:#bbf7d0}}
 .coverage-pill.warn{{border-color:rgba(245,158,11,.3);background:rgba(120,53,15,.18);color:#fde68a}}
 .coverage-pill.off{{opacity:.68}}
+.coverage-pill.meta{{border-style:dashed;color:var(--soft)}}
 .diag-kv{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
 .diag-kv-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
 .diag-kv-card .label{{font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
@@ -3387,7 +3620,7 @@ strong{{color:#f8fafc}}
 <nav>
   <span class="logo"><span class="logo-mark">UP</span><span>Uptime Control</span><span class="logo-version">v{build.get("version", "unknown")}</span></span>
   <span class="tab active" data-tab="hosts" onclick="show('hosts')">Hosts</span>
-  <span class="tab" data-tab="regions" onclick="show('regions')">Regions</span>
+  <span class="tab" data-tab="regions" onclick="show('regions')">Probes</span>
   <span class="tab" data-tab="status-page" onclick="show('status-page')">Status Page</span>
   <span class="tab" data-tab="notifications" onclick="show('notifications')">Notifications</span>
   <span class="tab" data-tab="management" onclick="show('management')">Management</span>
@@ -3422,7 +3655,10 @@ strong{{color:#f8fafc}}
 <div id="pane-hosts">
   <div class="section-header">
     <h2>Hosts</h2>
-    <button class="btn btn-primary" onclick="openAddHost()">+ Add Host</button>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-ghost" id="check-now-btn" onclick="checkNow()">Check Now</button>
+      <button class="btn btn-primary" onclick="openAddHost()">+ Add Host</button>
+    </div>
   </div>
   <table>
     <thead><tr>
@@ -3749,6 +3985,11 @@ strong{{color:#f8fafc}}
     <div id="mgmt-summary" style="color:#94a3b8">Loading…</div>
   </div>
   <div class="panel">
+    <h3 style="margin-top:0">Manual Check</h3>
+    <p class="desc" style="margin-bottom:14px">Invoke the manager now and force all eligible probes to check their assigned hosts immediately.</p>
+    <button class="btn btn-primary" id="mgmt-check-now-btn" onclick="checkNow()">Check Now</button>
+  </div>
+  <div class="panel">
     <h3 style="margin-top:0">Retention</h3>
     <div class="grid2">
       <div class="form-group">
@@ -3786,10 +4027,10 @@ strong{{color:#f8fafc}}
   <p class="desc">
     Inspect recent runtime signals in two ways: CloudWatch logs for behavior and DynamoDB views for what the system is storing.
   </p>
-  <details class="panel" open>
+  <details class="panel" id="diag-logs">
     <summary class="section-summary">
       <span class="section-summary-title">CloudWatch Logs</span>
-      <span class="section-summary-meta">Management and worker runtime output</span>
+      <span class="section-summary-meta" id="diag-logs-meta">Expand to load recent runtime output</span>
     </summary>
     <h3 style="margin-top:0">CloudWatch Logs</h3>
     <div class="hint" style="margin-bottom:14px">Times are shown in your browser timezone for easier debugging.</div>
@@ -3801,6 +4042,12 @@ strong{{color:#f8fafc}}
           <option value="worker">Probe worker</option>
         </select>
       </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-ghost" type="button" onclick="toggleLogsFilters()">Search Options</button>
+      </div>
+    </div>
+    <div class="grid2" id="logs-advanced-filters" style="display:none">
       <div class="form-group">
         <label>Worker Region</label>
         <select id="logs-region" onchange="loadLogs()" disabled>
@@ -3833,10 +4080,9 @@ strong{{color:#f8fafc}}
       <button class="btn btn-primary" onclick="loadLogs()">Refresh Logs</button>
       <button class="btn btn-ghost" onclick="copyLogsSummary()">Copy Summary</button>
     </div>
-    <div class="hint" id="logs-source-note" style="margin-top:10px">Reading the management Lambda log group in the home region.</div>
-  </div>
+    <div class="hint" id="logs-source-note" style="margin-top:10px">Expand this section to load logs on demand.</div>
   <div class="panel">
-    <div id="logs-summary" style="color:#94a3b8">Loading log summary…</div>
+    <div id="logs-summary" style="color:#94a3b8">Logs are idle until you expand this section.</div>
   </div>
   <div class="panel">
     <h3 style="margin-top:0">Likely Issues</h3>
@@ -3847,36 +4093,39 @@ strong{{color:#f8fafc}}
     <div id="logs-entries" style="color:#94a3b8">No log scan has run yet.</div>
   </div>
   </details>
-  <details class="panel" open>
+  <details class="panel" id="diag-ddb">
     <summary class="section-summary">
       <span class="section-summary-title">DynamoDB</span>
-      <span class="section-summary-meta">Hosts, checks, region records, and audit history</span>
+      <span class="section-summary-meta" id="diag-ddb-meta">Expand to inspect stored rows on demand</span>
     </summary>
     <div class="section-header" style="margin-bottom:12px">
       <div>
         <h3 style="margin:0">DynamoDB</h3>
         <div class="hint">Formatted snapshots of hosts, settings, region records, and recent checks.</div>
       </div>
-      <button class="btn btn-ghost" onclick="loadDynamoData()">Refresh Data</button>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-ghost" type="button" onclick="toggleDynamoFilters()">Search Options</button>
+        <button class="btn btn-ghost" onclick="loadDynamoData()">Refresh Data</button>
+      </div>
     </div>
     <div class="grid2">
       <div class="form-group">
         <label>Table View</label>
-        <select id="ddb-view-select" onchange="loadDynamoData()">
+        <select id="ddb-view-select" onchange="loadDynamoViewChanged()">
           <option value="overview">Overview</option>
           <option value="hosts">Hosts</option>
           <option value="checks">Checks</option>
           <option value="audit">Audit</option>
         </select>
       </div>
-      <div class="form-group">
+      <div class="form-group" id="ddb-host-filter-wrap" style="display:none">
         <label>Checks Host</label>
         <select id="ddb-host-filter" onchange="loadDynamoData()">
           <option value="">Auto-select first host</option>
         </select>
       </div>
     </div>
-    <div class="grid2">
+    <div class="grid2" id="ddb-advanced-filters" style="display:none">
       <div class="form-group">
         <label>Region Filter</label>
         <select id="ddb-region-filter" onchange="loadDynamoData()">
@@ -3892,7 +4141,7 @@ strong{{color:#f8fafc}}
         </select>
       </div>
     </div>
-    <div id="ddb-summary" style="color:#94a3b8">Loading DynamoDB data…</div>
+    <div id="ddb-summary" style="color:#94a3b8">DynamoDB data is idle until you expand this section.</div>
     <div id="ddb-hosts" style="margin-top:16px;color:#94a3b8"></div>
     <div id="ddb-checks" style="margin-top:16px;color:#94a3b8"></div>
   </details>
@@ -4235,8 +4484,14 @@ if (queryKey) {{
 function api(path, opts={{}}) {{
   const authToken = COGNITO_TOKEN || KEY;
   return fetch(path, {{
+    cache: 'no-store',
     ...opts,
-    headers: {{ ...(authToken ? {{ Authorization: 'Bearer ' + authToken }} : {{}}), 'Content-Type': 'application/json', ...(opts.headers||{{}}) }}
+    headers: {{
+      ...(authToken ? {{ Authorization: 'Bearer ' + authToken }} : {{}}),
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+      ...(opts.headers||{{}})
+    }}
   }}).then(async r => {{
     const data = await r.json().catch(() => ({{}}));
     if (r.status === 401) return {{...data, error: data.error || 'Unauthorized', unauthorized: true}};
@@ -4244,6 +4499,25 @@ function api(path, opts={{}}) {{
     return data;
   }}).catch(e => ({{error: e.message}}));
 }}
+
+document.addEventListener('click', event => {{
+  const editBtn = event.target.closest('.host-edit-btn');
+  if (editBtn) {{
+    openEditHostById(editBtn.dataset.hostId || '');
+    return;
+  }}
+  const checkBtn = event.target.closest('.host-check-btn');
+  if (checkBtn) {{
+    checkNow(checkBtn.dataset.hostId || '');
+    return;
+  }}
+  const deleteBtn = event.target.closest('.host-delete-btn');
+  if (deleteBtn) {{
+    const hostId = deleteBtn.dataset.hostId || '';
+    const host = HOSTS_CACHE.find(item => item.host_id === hostId);
+    deleteHost(hostId, hostDisplayName(host || {{host_id: hostId}}));
+  }}
+}});
 
 function toast(msg, err=false) {{
   const t = document.getElementById('toast');
@@ -4710,6 +4984,24 @@ function computeHostProbeCoverage(host) {{
   }};
 }}
 
+function hostDisplayName(host) {{
+  const name = (host?.name || '').trim();
+  return name && name.toLowerCase() !== 'undefined' ? name : (host?.host_id || 'Unnamed host');
+}}
+
+function normalizeHostForUi(host) {{
+  const normalized = {{ ...(host || {{}}) }};
+  normalized.host_id = normalized.host_id || '';
+  normalized.name = (normalized.name || '').trim();
+  if (normalized.name.toLowerCase() === 'undefined') normalized.name = '';
+  normalized.url = normalized.url || '';
+  normalized.check_type = normalized.check_type || 'http';
+  normalized.current_status = normalized.current_status || 'unknown';
+  normalized.target_regions = Array.isArray(normalized.target_regions) ? normalized.target_regions : [];
+  normalized.region_statuses = normalized.region_statuses && typeof normalized.region_statuses === 'object' ? normalized.region_statuses : {{}};
+  return normalized;
+}}
+
 function renderHostCoverage() {{
   const wrap = document.getElementById('host-coverage');
   if (!wrap) return;
@@ -4725,23 +5017,43 @@ function renderHostCoverage() {{
     const coverage = computeHostProbeCoverage(host);
     const eligibleHtml = coverage.eligible.length
       ? coverage.eligible.map(region => `<span class="coverage-pill ok">${{region.region}}</span>`).join('')
-      : '<span class="coverage-pill warn">No eligible probes</span>';
+      : '<span class="coverage-pill warn">No active route</span>';
     const blockedHtml = coverage.blocked.length
       ? coverage.blocked.map(region => `<span class="coverage-pill off" title="${{region.reason}}">${{region.region}} · ${{region.reason}}</span>`).join('')
-      : '<span class="coverage-pill ok">No exclusions</span>';
+      : '';
+    const scopeBits = [];
+    if (host.enabled === false) scopeBits.push('Disabled');
+    scopeBits.push(formatTierLabel(coverage.tier));
+    if (host.target_regions && host.target_regions.length) {{
+      scopeBits.push(`${{host.target_regions.length}} selected probe${{host.target_regions.length === 1 ? '' : 's'}}`);
+    }} else {{
+      scopeBits.push('All probes');
+    }}
+    const routeBadge = host.enabled === false
+      ? 'disabled'
+      : coverage.eligible.length
+        ? `${{coverage.eligible.length}} route${{coverage.eligible.length === 1 ? '' : 's'}}`
+        : 'blocked';
+    const badgeTone = host.enabled === false ? 'inactive' : coverage.eligible.length ? 'active' : 'warn';
+    const blockedSection = blockedHtml
+      ? `<div class="coverage-line"><div class="coverage-label">Skipped</div><div class="coverage-pills">${{blockedHtml}}</div></div>`
+      : '';
     return `
       <div class="coverage-card">
         <div class="coverage-head">
           <div>
-            <div class="coverage-title">${{host.name}}</div>
-            <div class="coverage-subtitle">${{describeHostScope(host)}} · Interval: ${{formatTierLabel(coverage.tier)}} · ${{host.enabled === false ? 'Disabled host' : 'Enabled host'}}</div>
+            <div class="coverage-title">${{escapeHtml(hostDisplayName(host))}}</div>
+            <div class="coverage-subtitle">${{scopeBits.join(' · ')}}</div>
           </div>
-          <span class="badge ${{host.enabled === false ? 'inactive' : coverage.eligible.length ? 'active' : 'warn'}}">${{host.enabled === false ? 'disabled' : coverage.eligible.length ? coverage.eligible.length + ' routes' : 'blocked'}}</span>
+          <span class="badge ${{badgeTone}}">${{routeBadge}}</span>
         </div>
-        <div class="hint" style="margin-bottom:8px">Will run from</div>
-        <div class="coverage-pills" style="margin-bottom:10px">${{eligibleHtml}}</div>
-        <div class="hint" style="margin-bottom:8px">Skipped by</div>
-        <div class="coverage-pills">${{blockedHtml}}</div>
+        <div class="coverage-lines">
+          <div class="coverage-line">
+            <div class="coverage-label">Runs From</div>
+            <div class="coverage-pills">${{eligibleHtml}}</div>
+          </div>
+          ${{blockedSection}}
+        </div>
       </div>
     `;
   }}).join('')}}</div>`;
@@ -4754,29 +5066,35 @@ async function loadHosts() {{
     showAuthGate('Enter the admin token to load hosts.');
     return;
   }}
-  HOSTS_CACHE = Array.isArray(hosts) ? hosts : [];
+  HOSTS_CACHE = Array.isArray(hosts) ? hosts.map(normalizeHostForUi) : [];
   const tbody = document.getElementById('hosts-body');
   if (!HOSTS_CACHE.length) {{
     tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
     renderHostCoverage();
     return;
   }}
-  tbody.innerHTML = HOSTS_CACHE.map(h => `
+  tbody.innerHTML = HOSTS_CACHE.map(h => {{
+    const displayName = hostDisplayName(h);
+    const safeName = escapeHtml(displayName);
+    const hostId = escapeHtml(h.host_id || '');
+    return `
     <tr>
-      <td style="font-weight:600">${{h.name}}</td>
-      <td style="color:#64748b;font-size:.8rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{h.url}}">${{h.url}}</td>
-      <td><span class="badge ${{h.check_type||'http'}}">${{h.check_type||'http'}}</span></td>
-      <td><span class="badge ${{h.current_status||'unknown'}}">${{h.current_status||'unknown'}}</span></td>
+      <td style="font-weight:600">${{safeName}}</td>
+      <td style="color:#64748b;font-size:.8rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{escapeHtml(h.url)}}">${{escapeHtml(h.url || '—')}}</td>
+      <td><span class="badge ${{escapeHtml(h.check_type||'http')}}">${{escapeHtml(h.check_type||'http')}}</span></td>
+      <td><span class="badge ${{escapeHtml(h.current_status||'unknown')}}">${{escapeHtml(h.current_status||'unknown')}}</span></td>
       <td>${{h.uptime_pct != null ? h.uptime_pct+'%' : '—'}}</td>
       <td>${{h.last_latency_ms != null ? h.last_latency_ms+' ms' : '—'}}</td>
       <td>${{renderSslCell(h)}}</td>
       <td style="text-align:center">${{h.show_on_status_page ? '✓' : '—'}}</td>
       <td style="text-align:center">${{h.alert_enabled ? '✓' : '—'}}</td>
       <td><div class="actions">
-        <button class="btn btn-ghost btn-sm" onclick="openEditHostById('${{h.host_id}}')">Edit</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteHost('${{h.host_id}}','${{h.name}}')">Del</button>
+        <button class="btn btn-ghost btn-sm host-edit-btn" type="button" data-host-id="${{hostId}}">Edit</button>
+        <button class="btn btn-ghost btn-sm host-check-btn" type="button" data-host-id="${{hostId}}">Check</button>
+        <button class="btn btn-danger btn-sm host-delete-btn" type="button" data-host-id="${{hostId}}">Del</button>
       </div></td>
-    </tr>`).join('');
+    </tr>`;
+  }}).join('');
   renderHostCoverage();
 }}
 
@@ -4795,13 +5113,18 @@ function renderSslCell(host) {{
   return '<span title="No recent successful SSL verification was recorded.">×</span>';
 }}
 
-function openEditHostById(hostId) {{
+async function openEditHostById(hostId) {{
   const host = HOSTS_CACHE.find(item => item.host_id === hostId);
   if (!host) {{
     toast('Unable to find that host in the current list.', true);
     return;
   }}
-  openEditHost(host);
+  const fresh = await api('/api/hosts/'+encodeURIComponent(hostId));
+  if (fresh.error) {{
+    toast(fresh.error, true);
+    return;
+  }}
+  openEditHost(normalizeHostForUi(fresh));
 }}
 
 async function openAddHost() {{
@@ -4828,8 +5151,8 @@ async function openEditHost(h) {{
   await ensureRegionsLoaded();
   document.getElementById('host-modal-title').textContent = 'Edit Host';
   document.getElementById('m-id').value = h.host_id;
-  document.getElementById('m-name').value = h.name;
-  document.getElementById('m-url').value = h.url;
+  document.getElementById('m-name').value = h.name || '';
+  document.getElementById('m-url').value = h.url || '';
   document.getElementById('m-type').value = h.check_type || 'http';
   renderHostTierOptions(h.monitor_tier_seconds || h.check_interval_seconds || 60);
   document.getElementById('m-timeout').value = h.timeout_seconds || 10;
@@ -4878,6 +5201,16 @@ function closeHostModal() {{ document.getElementById('host-modal').classList.rem
 
 async function saveHost() {{
   const id = document.getElementById('m-id').value;
+  const hostName = document.getElementById('m-name').value.trim();
+  if (!hostName || hostName.toLowerCase() === 'undefined') {{
+    toast('Host name is required.', true);
+    return;
+  }}
+  const hostUrl = document.getElementById('m-url').value.trim();
+  if (!hostUrl || hostUrl.toLowerCase() === 'undefined') {{
+    toast('Host URL is required.', true);
+    return;
+  }}
   const chosenTier = +document.getElementById('m-tier').value;
   const mode = targetRegionMode();
   const targets = mode === 'selected' ? selectedTargetRegions() : [];
@@ -4900,8 +5233,8 @@ async function saveHost() {{
     return;
   }}
   const body = {{
-    name: document.getElementById('m-name').value,
-    url: document.getElementById('m-url').value,
+    name: hostName,
+    url: hostUrl,
     check_type: document.getElementById('m-type').value,
     monitor_tier_seconds: chosenTier,
     timeout_seconds: +document.getElementById('m-timeout').value,
@@ -4918,12 +5251,23 @@ async function saveHost() {{
   if (res.error) {{ toast(res.error, true); return; }}
   closeHostModal();
   toast(id ? 'Host updated' : 'Host added');
-  loadHosts();
+  const refreshed = await api(id ? '/api/hosts/'+(id || res.host_id) : '/api/hosts/'+(res.host_id || ''));
+  if (!refreshed.error && refreshed.host_id) {{
+    const normalized = normalizeHostForUi(refreshed);
+    const idx = HOSTS_CACHE.findIndex(host => host.host_id === normalized.host_id);
+    if (idx >= 0) HOSTS_CACHE[idx] = normalized;
+    else HOSTS_CACHE.push(normalized);
+  }}
+  await loadHosts();
 }}
 
 async function deleteHost(id, name) {{
   if (!confirm(`Delete "${{name}}"?`)) return;
-  await api('/api/hosts/'+id, {{method:'DELETE'}});
+  const res = await api('/api/hosts/'+encodeURIComponent(id), {{method:'DELETE'}});
+  if (res.error) {{
+    toast(res.error, true);
+    return;
+  }}
   toast('Host deleted');
   loadHosts();
 }}
@@ -5448,8 +5792,55 @@ function renderLogs(data) {{
   window.LAST_LOGS_DATA = data;
 }}
 
+let DIAG_LOGS_LOADED = false;
+let DIAG_DDB_LOADED = false;
+
+function toggleLogsFilters() {{
+  const el = document.getElementById('logs-advanced-filters');
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'grid' : 'none';
+}}
+
+function toggleDynamoFilters() {{
+  const el = document.getElementById('ddb-advanced-filters');
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'grid' : 'none';
+}}
+
+function updateDynamoFilterVisibility() {{
+  const view = document.getElementById('ddb-view-select')?.value || 'overview';
+  const hostWrap = document.getElementById('ddb-host-filter-wrap');
+  const advancedWrap = document.getElementById('ddb-advanced-filters');
+  if (hostWrap) hostWrap.style.display = view === 'checks' ? '' : 'none';
+  if (advancedWrap && view === 'overview') advancedWrap.style.display = 'none';
+}}
+
+function loadDynamoViewChanged() {{
+  updateDynamoFilterVisibility();
+  const diag = document.getElementById('diag-ddb');
+  if (diag?.open) loadDynamoData();
+}}
+
+function initDiagnosticsSections() {{
+  const logsDetails = document.getElementById('diag-logs');
+  const ddbDetails = document.getElementById('diag-ddb');
+  if (logsDetails && !logsDetails.dataset.bound) {{
+    logsDetails.addEventListener('toggle', () => {{
+      if (logsDetails.open && !DIAG_LOGS_LOADED) loadLogs();
+    }});
+    logsDetails.dataset.bound = '1';
+  }}
+  if (ddbDetails && !ddbDetails.dataset.bound) {{
+    ddbDetails.addEventListener('toggle', () => {{
+      if (ddbDetails.open && !DIAG_DDB_LOADED) loadDynamoData();
+    }});
+    ddbDetails.dataset.bound = '1';
+  }}
+  updateDynamoFilterVisibility();
+}}
+
 async function loadDiagnostics() {{
-  await Promise.all([loadLogs(), loadDynamoData()]);
+  initDiagnosticsSections();
 }}
 
 function populateDynamoHostFilter(hosts, selectedHostId='') {{
@@ -5544,14 +5935,44 @@ function renderDynamoData(data) {{
       </div>
     </div>
   `;
+  function renderAuditDetails(row) {{
+    const bits = [];
+    if (row.subject_host_id) bits.push(`Host ID: ${{escapeHtml(row.subject_host_id)}}`);
+    if (row.host_name) bits.push(`Host: ${{escapeHtml(row.host_name)}}`);
+    if (row.url) bits.push(`URL: ${{escapeHtml(row.url)}}`);
+    if (row.function_name) bits.push(`Function: ${{escapeHtml(row.function_name)}}`);
+    if (row.monitor_build_version || row.monitor_source_sha) {{
+      const ver = row.monitor_build_version || 'unknown';
+      const sha = row.monitor_source_sha ? row.monitor_source_sha.slice(0, 8) : '';
+      bits.push(`Build: ${{escapeHtml(ver)}}${{sha ? ' · ' + escapeHtml(sha) : ''}}`);
+    }}
+    if (row.supported_tiers && row.supported_tiers.length) bits.push(`Tiers: ${{row.supported_tiers.map(formatTierLabel).join(', ')}}`);
+    if (row.target_regions && row.target_regions.length) bits.push(`Targets: ${{escapeHtml(row.target_regions.join(', '))}}`);
+    if (row.updated_fields && row.updated_fields.length) bits.push(`Updated: ${{escapeHtml(row.updated_fields.join(', '))}}`);
+    if (row.memory_mb != null) bits.push(`Memory: ${{row.memory_mb}} MB`);
+    if (row.remaining_regions != null) bits.push(`Remaining probes: ${{row.remaining_regions}}`);
+    if (row.deleted_checks != null) bits.push(`Deleted checks: ${{row.deleted_checks}}`);
+    if (row.deleted != null) bits.push(`Deleted rows: ${{row.deleted}}`);
+    if (row.scanned != null) bits.push(`Scanned rows: ${{row.scanned}}`);
+    if (row.older_than_days != null) bits.push(`Older than: ${{row.older_than_days}}d`);
+    if (row.max_delete != null) bits.push(`Delete cap: ${{row.max_delete}}`);
+    if (row.retention_days != null) bits.push(`Retention: ${{row.retention_days}}d`);
+    if (row.stopped_reason) bits.push(`Stop reason: ${{escapeHtml(row.stopped_reason)}}`);
+    if (row.action_args && Object.keys(row.action_args).length) {{
+      bits.push(`Args: ${{escapeHtml(JSON.stringify(row.action_args))}}`);
+    }}
+    if (row.error) bits.push(`<span style="color:#fca5a5">Error: ${{escapeHtml(row.error)}}</span>`);
+    if (!bits.length) return '—';
+    return bits.map(bit => `<div style="margin-bottom:4px">${{bit}}</div>`).join('');
+  }}
   const auditHtml = `
     <div class="diag-row">
       <div class="diag-row-title">Management audit log</div>
       <div class="diag-row-meta">Recent admin and system actions like worker add, update, delete, and force-update.</div>
       <div class="diag-table">
         <table>
-          <thead><tr><th>When</th><th>Action</th><th>Status</th><th>Region</th><th>Details</th></tr></thead>
-          <tbody>${{auditRows.length ? auditRows.map(row => `<tr><td>${{escapeHtml(formatLogTime(row.created_at))}}</td><td>${{escapeHtml(row.event_type || '—')}}</td><td><span class="badge ${{row.status === 'error' ? 'error' : 'active'}}">${{escapeHtml(row.status || 'ok')}}</span></td><td>${{escapeHtml(row.region || '—')}}</td><td>${{escapeHtml(row.error || row.monitor_build_version || row.action || '') || '—'}}</td></tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:18px">No audit rows found.</td></tr>'}}</tbody>
+          <thead><tr><th>When</th><th>Action</th><th>Status</th><th>Scope</th><th>Details</th></tr></thead>
+          <tbody>${{auditRows.length ? auditRows.map(row => `<tr><td>${{escapeHtml(formatLogTime(row.created_at))}}</td><td>${{escapeHtml(row.event_type || row.action || '—')}}</td><td><span class="badge ${{row.status === 'error' ? 'error' : 'active'}}">${{escapeHtml(row.status || 'ok')}}</span></td><td>${{escapeHtml(row.region || row.host_name || row.subject_host_id || row.action || '—')}}</td><td>${{renderAuditDetails(row)}}</td></tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:18px">No audit rows found.</td></tr>'}}</tbody>
         </table>
       </div>
     </div>
@@ -5563,7 +5984,10 @@ function renderDynamoData(data) {{
 }}
 
 async function loadDynamoData() {{
+  const diag = document.getElementById('diag-ddb');
+  if (diag && !diag.open) return;
   await ensureRegionsLoaded();
+  updateDynamoFilterVisibility();
   const view = document.getElementById('ddb-view-select')?.value || 'overview';
   const hostId = document.getElementById('ddb-host-filter')?.value || '';
   const region = document.getElementById('ddb-region-filter')?.value || 'all';
@@ -5577,6 +6001,9 @@ async function loadDynamoData() {{
   const qs = new URLSearchParams({{checks_limit: checksLimit, view, region}});
   if (hostId) qs.set('host_id', hostId);
   const data = await api('/api/dynamodb?'+qs.toString());
+  DIAG_DDB_LOADED = !data?.error;
+  const meta = document.getElementById('diag-ddb-meta');
+  if (meta && DIAG_DDB_LOADED) meta.textContent = 'Loaded on demand. Use Search Options for deeper filters.';
   renderDynamoData(data);
 }}
 
@@ -5598,10 +6025,13 @@ async function handleLogsScopeChange() {{
   const worker = document.getElementById('logs-scope').value === 'worker';
   document.getElementById('logs-region').disabled = !worker;
   if (worker) await ensureLogsRegions();
-  loadLogs();
+  const diag = document.getElementById('diag-logs');
+  if (diag?.open) loadLogs();
 }}
 
 async function loadLogs() {{
+  const diag = document.getElementById('diag-logs');
+  if (diag && !diag.open) return;
   const scope = document.getElementById('logs-scope').value;
   const limit = document.getElementById('logs-limit').value;
   const hours = document.getElementById('logs-hours').value;
@@ -5618,6 +6048,9 @@ async function loadLogs() {{
   const qs = new URLSearchParams({{scope, limit, hours}});
   if (scope === 'worker' && region) qs.set('region', region);
   const data = await api('/api/logs?'+qs.toString());
+  DIAG_LOGS_LOADED = !data?.error;
+  const meta = document.getElementById('diag-logs-meta');
+  if (meta && DIAG_LOGS_LOADED) meta.textContent = 'Loaded on demand. Use Search Options for deeper filters.';
   renderLogs(data);
 }}
 
@@ -5653,6 +6086,28 @@ async function saveManagementRetention() {{
   if (res.error) {{ toast(res.error, true); return; }}
   toast('Retention updated');
   loadManagement();
+}}
+
+async function checkNow(hostId='') {{
+  const buttons = [document.getElementById('check-now-btn'), document.getElementById('mgmt-check-now-btn')].filter(Boolean);
+  buttons.forEach(btn => {{ btn.disabled = true; btn.textContent = 'Checking…'; }});
+  document.querySelectorAll('.host-check-btn').forEach(btn => btn.disabled = true);
+  const body = hostId ? {{action:'check_now', host_id: hostId}} : {{action:'check_now'}};
+  const res = await api('/api/management', {{method:'POST', body:JSON.stringify(body)}});
+  buttons.forEach(btn => {{ btn.disabled = false; btn.textContent = 'Check Now'; }});
+  document.querySelectorAll('.host-check-btn').forEach(btn => btn.disabled = false);
+  if (res.error) {{
+    const result = document.getElementById('mgmt-result');
+    if (result) result.textContent = res.error;
+    toast(res.error, true);
+    return;
+  }}
+  const message = `Run: ${{res.run_id}}\\nRegions: ${{res.regions}}\\nHosts: ${{res.hosts}}\\nResults: ${{res.results}}`;
+  const result = document.getElementById('mgmt-result');
+  if (result) result.textContent = message;
+  toast(`${{hostId ? 'Host check' : 'Check'}} completed: ${{res.results || 0}} result${{res.results === 1 ? '' : 's'}}`);
+  await loadHosts();
+  if (document.getElementById('pane-management').style.display !== 'none') loadManagement();
 }}
 
 async function purgeOldChecks() {{
@@ -5889,12 +6344,25 @@ def _serial(obj):
 def _json(status: int, body) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
         "body": json.dumps(body, default=_serial),
     }
 
 def _html(status: int, body: str) -> dict:
-    return {"statusCode": status, "headers": {"Content-Type": "text/html; charset=utf-8"}, "body": body}
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+        "body": body,
+    }
 
 def _cors_ok() -> dict:
     return {"statusCode": 204, "headers": {

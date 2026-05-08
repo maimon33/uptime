@@ -41,6 +41,8 @@ MAX_WORKERS = 20
 def handler(event, context):
     run_id = (event or {}).get("run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     supported_tiers = _normalize_monitor_tiers((event or {}).get("supported_tiers"), fallback=[60, 300])
+    force_check = bool((event or {}).get("force_check"))
+    target_host_id = str((event or {}).get("host_id") or "").strip()
     now = datetime.now(timezone.utc)
 
     db = _get_dynamodb()
@@ -50,9 +52,11 @@ def handler(event, context):
         ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__"},
     )
     enabled_hosts = resp.get("Items", [])
+    if target_host_id:
+        enabled_hosts = [host for host in enabled_hosts if host.get("host_id") == target_host_id]
     region_hosts = [host for host in enabled_hosts if _host_runs_in_region(host, MONITOR_REGION)]
     supported_hosts = [host for host in region_hosts if _host_tier_supported(host, supported_tiers)]
-    due_hosts = [host for host in supported_hosts if _host_due_now(host, MONITOR_REGION, now)]
+    due_hosts = supported_hosts if force_check else [host for host in supported_hosts if _host_due_now(host, MONITOR_REGION, now)]
     hosts = due_hosts
 
     if not hosts:
@@ -62,6 +66,8 @@ def handler(event, context):
             f"region_matched={len(region_hosts)}, "
             f"tier_supported={len(supported_hosts)}, "
             f"due_now={len(due_hosts)}, "
+            f"force_check={force_check}, "
+            f"target_host_id={target_host_id or 'all'}, "
             f"supported_tiers={supported_tiers}, "
             f"run_time={now.isoformat()})"
         )
@@ -100,6 +106,8 @@ def handler(event, context):
         "down": down,
         "region": MONITOR_REGION,
         "run_id": run_id,
+        "force_check": force_check,
+        "host_id": target_host_id,
         "results": results,
     }
 

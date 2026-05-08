@@ -35,6 +35,24 @@ _account_id: str | None = None
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _log_dynamodb_write(operation: str, table_name: str, *, key: dict | None = None, item: dict | None = None, context: str = "") -> None:
+    fields = {
+        "level": "info",
+        "message": "dynamodb_write",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "operation": operation,
+        "table": table_name,
+    }
+    if context:
+        fields["context"] = context
+    if key is not None:
+        fields["key"] = key
+    if item is not None:
+        fields["item"] = item
+        fields["item_keys"] = sorted(str(k) for k in item.keys())
+    print(json.dumps(fields, default=str))
+
+
 def _account() -> str:
     global _account_id
     if _account_id is None:
@@ -55,6 +73,16 @@ def _monitor_source_sha() -> str:
     src = os.path.join(os.path.dirname(__file__), "_monitor_handler.py")
     return hashlib.sha256(open(src, "rb").read()).hexdigest()
 
+def _monitor_build_version() -> str:
+    info_path = os.path.join(os.path.dirname(__file__), "_build_info.json")
+    try:
+        with open(info_path) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    version = str(data.get("version") or os.environ.get("APP_VERSION") or "unknown").strip()
+    return version or "unknown"
+
 def _monitor_env(region: str) -> dict:
     return {
         "HOSTS_TABLE":    HOSTS_TABLE,
@@ -63,7 +91,7 @@ def _monitor_env(region: str) -> dict:
         "MONITOR_REGION": region,
         "RETENTION_DAYS": RETENTION_DAYS,
         "MONITOR_SOURCE_SHA": _monitor_source_sha(),
-        "MONITOR_BUILD_VERSION": os.environ.get("APP_VERSION", "unknown"),
+        "MONITOR_BUILD_VERSION": _monitor_build_version(),
     }
 
 
@@ -146,7 +174,7 @@ def deploy_region(region: str, memory_mb: int = 256, supported_tiers: list[int] 
     role_arn = _ensure_monitor_role()
     zip_data = _monitor_zip()
     source_sha = _monitor_source_sha()
-    build_version = os.environ.get("APP_VERSION", "unknown")
+    build_version = _monitor_build_version()
     lam  = boto3.client("lambda", region_name=region)
     logs = boto3.client("logs",   region_name=region)
 
@@ -264,11 +292,14 @@ def list_regions(db) -> list[dict]:
 
 
 def save_region_record(db, info: dict) -> None:
-    db.Table(HOSTS_TABLE).put_item(Item={
+    item = {
         "host_id": f"__region__{info['region']}",
         **info,
-    })
+    }
+    _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": item["host_id"]}, item=item, context="region_save")
+    db.Table(HOSTS_TABLE).put_item(Item=item)
 
 
 def delete_region_record(db, region: str) -> None:
+    _log_dynamodb_write("delete_item", HOSTS_TABLE, key={"host_id": f"__region__{region}"}, context="region_delete")
     db.Table(HOSTS_TABLE).delete_item(Key={"host_id": f"__region__{region}"})
