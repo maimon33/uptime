@@ -292,9 +292,16 @@ def list_regions(db) -> list[dict]:
 
 
 def save_region_record(db, info: dict) -> None:
+    key = {"host_id": f"__region__{info['region']}"}
+    existing = db.Table(HOSTS_TABLE).get_item(Key=key).get("Item") or {}
+    now = datetime.now(timezone.utc).isoformat()
+    created_at = existing.get("created_at") or existing.get("first_deployed_at") or info.get("deployed_at") or now
     item = {
-        "host_id": f"__region__{info['region']}",
+        "host_id": key["host_id"],
         **info,
+        "created_at": created_at,
+        "first_deployed_at": created_at,
+        "last_deployed_at": info.get("deployed_at") or now,
     }
     _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": item["host_id"]}, item=item, context="region_save")
     db.Table(HOSTS_TABLE).put_item(Item=item)

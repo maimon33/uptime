@@ -215,6 +215,7 @@ _cached_admin_key = None
 _build_info_cache = None
 _cognito_access_token_cache = {}
 AUDIT_RETENTION_DAYS = 30
+HISTORY_SUMMARY_PARTITION_KEY = "__history_summary__"
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1042,18 +1043,34 @@ def _list_hosts() -> dict:
     return _json(200, hosts)
 
 
+def _host_filter_expression(public_only: bool = False) -> tuple[str, dict]:
+    expression = (
+        "((attribute_not_exists(record_type) AND host_id <> :s "
+        "AND NOT begins_with(host_id, :r) "
+        "AND NOT begins_with(host_id, :a) "
+        "AND NOT begins_with(host_id, :h)) OR record_type = :host)"
+    )
+    values = {":s": "__settings__", ":r": "__region__", ":a": "__audit__", ":h": "__history_day__", ":host": "host"}
+    if public_only:
+        expression += " AND show_on_status_page = :t"
+        values[":t"] = True
+    return expression, values
+
+
 def _list_host_items() -> list[dict]:
+    filter_expression, values = _host_filter_expression()
     result = _db().Table(HOSTS_TABLE).scan(
-        FilterExpression="host_id <> :s AND NOT begins_with(host_id, :r) AND NOT begins_with(host_id, :a)",
-        ExpressionAttributeValues={":s": "__settings__", ":r": "__region__", ":a": "__audit__"},
+        FilterExpression=filter_expression,
+        ExpressionAttributeValues=values,
     )
     return result.get("Items", [])
 
 
 def _list_public_hosts() -> list[dict]:
+    filter_expression, values = _host_filter_expression(public_only=True)
     result = _db().Table(HOSTS_TABLE).scan(
-        FilterExpression="show_on_status_page = :t AND host_id <> :s AND NOT begins_with(host_id, :r) AND NOT begins_with(host_id, :a)",
-        ExpressionAttributeValues={":t": True, ":s": "__settings__", ":r": "__region__", ":a": "__audit__"},
+        FilterExpression=filter_expression,
+        ExpressionAttributeValues=values,
     )
     return sorted(result.get("Items", []), key=lambda h: str(h.get("name") or h.get("host_id") or ""))
 
@@ -1082,6 +1099,7 @@ def _create_host(body: dict) -> dict:
         return _json(400, {"error": tier_error})
     item = {k: v for k, v in {
         "host_id":                str(uuid.uuid4()),
+        "record_type":            "host",
         "name":                   name,
         "url":                    url,
         "check_type":             body.get("check_type", "http"),
@@ -1154,6 +1172,7 @@ def _update_host(host_id: str, body: dict) -> dict:
     )
     if tier_error:
         return _json(400, {"error": tier_error})
+    updates["record_type"] = "host"
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     expr   = "SET " + ", ".join(f"#{k} = :{k}" for k in updates)
     _log_dynamodb_write("update_item", HOSTS_TABLE, key={"host_id": host_id}, updates=updates, context="host_update")
@@ -1470,6 +1489,26 @@ def _history_summary_key(day: str) -> str:
     return f"__history_day__{day}"
 
 
+def _history_summary_check_key(day: str) -> dict:
+    return {"host_id": HISTORY_SUMMARY_PARTITION_KEY, "checked_at": day}
+
+
+def _rebuild_history_summary_totals(summary: dict) -> None:
+    status_counts = _blank_status_counts()
+    regions = {}
+    total_checks = 0
+    for host_entry in _as_dict(summary.get("hosts")).values():
+        host_data = _as_dict(host_entry)
+        total_checks += _coerce_int(host_data.get("total_checks"))
+        for status, count in _as_dict(host_data.get("status_counts")).items():
+            _increment_count(status_counts, status, _coerce_int(count))
+        for region, count in _as_dict(host_data.get("regions")).items():
+            _increment_count(regions, region, _coerce_int(count))
+    summary["total_checks"] = total_checks
+    summary["status_counts"] = status_counts
+    summary["regions"] = regions
+
+
 def _blank_status_counts() -> dict:
     return {"up": 0, "degraded": 0, "down": 0, "unknown": 0}
 
@@ -1493,40 +1532,62 @@ def _write_history_day_summary(db, hosts: list[dict], result_rows: list[dict], r
         display_tz, display_timezone = _display_tz(settings)
         retention_days = max(1, _safe_int(settings.get("retention_days"), RETENTION_DAYS))
         day = run_time.astimezone(display_tz).date().isoformat()
-        key = _history_summary_key(day)
+        summary_key = _history_summary_check_key(day)
         now = datetime.now(timezone.utc)
-        host_names = {str(host.get("host_id")): str(host.get("name") or host.get("host_id")) for host in hosts}
-        table = db.Table(HOSTS_TABLE)
-        existing = table.get_item(Key={"host_id": key}).get("Item") or {}
+        active_hosts = {
+            str(host.get("host_id")): host
+            for host in hosts
+            if host.get("enabled", True) and host.get("show_on_status_page", True)
+        }
+        host_names = {host_id: str(host.get("name") or host_id) for host_id, host in active_hosts.items()}
+        host_created_at = {host_id: str(host.get("created_at") or "") for host_id, host in active_hosts.items()}
+        table = db.Table(CHECKS_TABLE)
+        existing = table.get_item(Key=summary_key).get("Item") or {}
+        existing_hosts = {
+            host_id: value
+            for host_id, value in _as_dict(existing.get("hosts")).items()
+            if host_id in active_hosts
+        }
         summary = {
-            "host_id": key,
+            "host_id": HISTORY_SUMMARY_PARTITION_KEY,
+            "checked_at": day,
             "record_type": "history_day_summary",
             "day": day,
             "display_timezone": display_timezone,
-            "total_checks": _coerce_int(existing.get("total_checks")),
+            "total_checks": 0,
             "run_count": _coerce_int(existing.get("run_count")),
-            "status_counts": {**_blank_status_counts(), **_as_dict(existing.get("status_counts"))},
-            "regions": _as_dict(existing.get("regions")),
-            "hosts": _as_dict(existing.get("hosts")),
+            "status_counts": _blank_status_counts(),
+            "regions": {},
+            "hosts": existing_hosts,
             "first_checked_at": existing.get("first_checked_at") or run_id,
             "last_checked_at": existing.get("last_checked_at") or run_id,
             "last_run_id": run_id,
             "updated_at": now.isoformat(),
             "ttl": int((now + timedelta(days=retention_days + 7)).timestamp()),
         }
-        summary["total_checks"] += len(result_rows)
+        _rebuild_history_summary_totals(summary)
         summary["run_count"] += 1
         summary["last_checked_at"] = max(str(summary.get("last_checked_at") or ""), run_id)
         if not summary.get("first_checked_at") or run_id < str(summary.get("first_checked_at")):
             summary["first_checked_at"] = run_id
 
         by_host: dict[str, list[dict]] = {}
+        valid_result_count = 0
         for row in result_rows:
+            host_id = str(row.get("host_id") or "")
+            if host_id not in active_hosts:
+                continue
+            valid_result_count += 1
             status = str(row.get("status") or "unknown")
             region = str(row.get("region") or "unknown")
+            summary["total_checks"] += 1
             _increment_count(summary["status_counts"], status)
             _increment_count(summary["regions"], region)
-            by_host.setdefault(str(row.get("host_id") or ""), []).append(row)
+            by_host.setdefault(host_id, []).append(row)
+
+        if valid_result_count == 0:
+            _delete_legacy_history_host_summaries(db, max_delete=25)
+            return
 
         for host_id, host_results in by_host.items():
             if not host_id:
@@ -1541,9 +1602,16 @@ def _write_history_day_summary(db, hosts: list[dict], result_rows: list[dict], r
                 "status_codes": _as_dict(host_entry.get("status_codes")),
                 "latency_total_ms": _coerce_int(host_entry.get("latency_total_ms")),
                 "latency_samples": _coerce_int(host_entry.get("latency_samples")),
+                "latency_min_ms": _coerce_int(host_entry.get("latency_min_ms"), 0),
+                "latency_max_ms": _coerce_int(host_entry.get("latency_max_ms"), 0),
+                "fail_count": _coerce_int(host_entry.get("fail_count")),
+                "last_fail_at": host_entry.get("last_fail_at") or "",
+                "last_fail_status": host_entry.get("last_fail_status") or "",
+                "last_fail_error": host_entry.get("last_fail_error") or "",
                 "latest_status": host_entry.get("latest_status") or "unknown",
                 "latest_checked_at": host_entry.get("latest_checked_at") or "",
                 "latest_error": host_entry.get("latest_error") or "",
+                "created_at": host_created_at.get(host_id) or host_entry.get("created_at") or "",
             }
             for row in host_results:
                 status = str(row.get("status") or "unknown")
@@ -1556,18 +1624,49 @@ def _write_history_day_summary(db, hosts: list[dict], result_rows: list[dict], r
                     _increment_count(host_entry["status_codes"], str(row.get("status_code")))
                 latency = row.get("latency_ms")
                 if latency is not None:
-                    host_entry["latency_total_ms"] += _coerce_int(latency)
+                    latency_ms = _coerce_int(latency)
+                    host_entry["latency_total_ms"] += latency_ms
                     host_entry["latency_samples"] += 1
+                    host_entry["latency_min_ms"] = latency_ms if not host_entry["latency_min_ms"] else min(host_entry["latency_min_ms"], latency_ms)
+                    host_entry["latency_max_ms"] = max(host_entry["latency_max_ms"], latency_ms)
+                if status in {"down", "degraded"}:
+                    host_entry["fail_count"] += 1
+                    if not host_entry["last_fail_at"] or checked_at >= host_entry["last_fail_at"]:
+                        host_entry["last_fail_at"] = checked_at
+                        host_entry["last_fail_status"] = status
+                        host_entry["last_fail_error"] = str(row.get("error") or "")[:180]
                 if not host_entry["latest_checked_at"] or checked_at >= host_entry["latest_checked_at"]:
                     host_entry["latest_status"] = status
                     host_entry["latest_checked_at"] = checked_at
                     host_entry["latest_error"] = str(row.get("error") or "")[:180]
             summary["hosts"][host_id] = host_entry
 
-        _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": key}, item=summary, context="history_day_summary")
+        _log_dynamodb_write("put_item", CHECKS_TABLE, key=summary_key, item=summary, context="history_day_summary")
         table.put_item(Item=summary)
+        _delete_legacy_history_host_summaries(db, max_delete=25)
     except Exception as exc:
         _log("warn", "history_day_summary_write_failed", run_id=run_id, error=str(exc))
+
+
+def _delete_legacy_history_host_summaries(db, max_delete: int = 25) -> int:
+    table = db.Table(HOSTS_TABLE)
+    result = table.scan(
+        FilterExpression="begins_with(host_id, :p)",
+        ExpressionAttributeValues={":p": "__history_day__"},
+        ProjectionExpression="host_id",
+        Limit=max(1, min(max_delete, 100)),
+    )
+    deleted = 0
+    for item in result.get("Items", []):
+        key = {"host_id": item.get("host_id")}
+        if not key["host_id"]:
+            continue
+        _log_dynamodb_write("delete_item", HOSTS_TABLE, key=key, context="legacy_history_summary_cleanup")
+        table.delete_item(Key=key)
+        deleted += 1
+    if deleted:
+        _log("info", "legacy_history_summary_cleanup_completed", deleted=deleted)
+    return deleted
 
 
 def _send_alert(host: dict, host_results: list[dict], event_type: str) -> None:
@@ -1873,7 +1972,8 @@ def _get_management_summary() -> dict:
                 "region": region_info.get("region"),
                 "memory_mb": int(region_info.get("memory_mb", 0) or 0),
                 "deployed_at": region_info.get("deployed_at"),
-                "age_human": _age_human(region_info.get("deployed_at")),
+                "created_at": region_info.get("created_at") or region_info.get("first_deployed_at") or region_info.get("deployed_at"),
+                "age_human": _age_human(region_info.get("created_at") or region_info.get("first_deployed_at") or region_info.get("deployed_at")),
                 "error": str(exc),
             })
     summary = {
@@ -2141,16 +2241,19 @@ def _management_lambda_summary() -> dict:
 def _worker_lambda_summary(region_info: dict) -> dict:
     function_name = region_info.get("function_name", f"{os.environ.get('PROJECT', 'uptime')}-monitor-{region_info.get('region')}")
     region_name = region_info.get("region", HOME_REGION)
-    deployed_at = region_info.get("deployed_at")
+    created_at = region_info.get("created_at") or region_info.get("first_deployed_at") or region_info.get("deployed_at")
+    deployed_at = region_info.get("last_deployed_at") or region_info.get("deployed_at")
     memory_mb = int(region_info.get("memory_mb", 0) or 0)
     runtime = "python3.12"
     summary = _lambda_metrics_snapshot(
         function_name=function_name,
         region_name=region_name,
-        deployed_at=deployed_at,
+        deployed_at=created_at,
         memory_mb=memory_mb,
         runtime=runtime,
     )
+    summary["created_at"] = created_at
+    summary["last_deployed_at"] = deployed_at
     expected_sha = _embedded_monitor_source_sha()
     expected_version = _build_info().get("version", "unknown")
     summary["expected_monitor_source_sha"] = expected_sha
@@ -3288,6 +3391,8 @@ def _normalize_history_summary(item: dict) -> dict:
         host_counts = {status: _coerce_int(count) for status, count in host_counts.items()}
         latency_samples = _coerce_int(host_entry.get("latency_samples"))
         latency_total = _coerce_int(host_entry.get("latency_total_ms"))
+        latency_min = _coerce_int(host_entry.get("latency_min_ms"), 0)
+        latency_max = _coerce_int(host_entry.get("latency_max_ms"), 0)
         hosts[str(host_id)] = {
             "host_id": str(host_id),
             "name": str(host_entry.get("name") or host_id),
@@ -3296,13 +3401,21 @@ def _normalize_history_summary(item: dict) -> dict:
             "regions": {str(k): _coerce_int(v) for k, v in _as_dict(host_entry.get("regions")).items()},
             "status_codes": {str(k): _coerce_int(v) for k, v in _as_dict(host_entry.get("status_codes")).items()},
             "avg_latency_ms": round(latency_total / latency_samples) if latency_samples else None,
+            "min_latency_ms": latency_min if latency_min else None,
+            "max_latency_ms": latency_max if latency_max else None,
+            "probe_count": len(_as_dict(host_entry.get("regions"))),
+            "fail_count": _coerce_int(host_entry.get("fail_count")),
+            "last_fail_at": str(host_entry.get("last_fail_at") or ""),
+            "last_fail_status": str(host_entry.get("last_fail_status") or ""),
+            "last_fail_error": str(host_entry.get("last_fail_error") or ""),
             "latest_status": str(host_entry.get("latest_status") or _worst_history_status(host_counts)),
             "latest_checked_at": str(host_entry.get("latest_checked_at") or ""),
             "latest_error": str(host_entry.get("latest_error") or ""),
+            "created_at": str(host_entry.get("created_at") or ""),
         }
     return {
         "host_id": str(item.get("host_id") or ""),
-        "day": str(item.get("day") or "").strip(),
+        "day": str(item.get("day") or item.get("checked_at") or "").strip(),
         "display_timezone": str(item.get("display_timezone") or ""),
         "total_checks": _coerce_int(item.get("total_checks")),
         "run_count": _coerce_int(item.get("run_count")),
@@ -3318,17 +3431,17 @@ def _normalize_history_summary(item: dict) -> dict:
 def _list_history_day_summaries(db, retention_days: int) -> list[dict]:
     cutoff = (datetime.now(timezone.utc).date() - timedelta(days=max(1, retention_days) + 2)).isoformat()
     summaries = []
+    table = db.Table(CHECKS_TABLE)
     last_key = None
-    table = db.Table(HOSTS_TABLE)
     while True:
         kwargs = {
-            "FilterExpression": "begins_with(host_id, :p)",
-            "ExpressionAttributeValues": {":p": "__history_day__"},
+            "KeyConditionExpression": Key("host_id").eq(HISTORY_SUMMARY_PARTITION_KEY) & Key("checked_at").gte(cutoff),
+            "ScanIndexForward": False,
         }
         if last_key:
             kwargs["ExclusiveStartKey"] = last_key
-        result = table.scan(**kwargs)
-        summaries.extend(_normalize_history_summary(item) for item in result.get("Items", []) if str(item.get("day") or "") >= cutoff)
+        result = table.query(**kwargs)
+        summaries.extend(_normalize_history_summary(item) for item in result.get("Items", []))
         last_key = result.get("LastEvaluatedKey")
         if not last_key:
             break
@@ -3344,7 +3457,8 @@ def _summaries_from_history_rows(rows: list[dict], display_tz) -> list[dict]:
             continue
         day = parsed.astimezone(display_tz).date().isoformat()
         summary = daily.setdefault(day, {
-            "host_id": _history_summary_key(day),
+            "host_id": HISTORY_SUMMARY_PARTITION_KEY,
+            "checked_at": day,
             "day": day,
             "total_checks": 0,
             "run_count": 0,
@@ -3374,9 +3488,16 @@ def _summaries_from_history_rows(rows: list[dict], display_tz) -> list[dict]:
             "status_codes": {},
             "latency_total_ms": 0,
             "latency_samples": 0,
+            "latency_min_ms": 0,
+            "latency_max_ms": 0,
+            "fail_count": 0,
+            "last_fail_at": "",
+            "last_fail_status": "",
+            "last_fail_error": "",
             "latest_status": status,
             "latest_checked_at": row.get("checked_at", ""),
             "latest_error": row.get("error", ""),
+            "created_at": "",
         })
         host_entry["total_checks"] += 1
         _increment_count(host_entry["status_counts"], status)
@@ -3384,8 +3505,18 @@ def _summaries_from_history_rows(rows: list[dict], display_tz) -> list[dict]:
         if row.get("status_code") is not None:
             _increment_count(host_entry["status_codes"], str(row.get("status_code")))
         if row.get("latency_ms") is not None:
-            host_entry["latency_total_ms"] += _coerce_int(row.get("latency_ms"))
+            latency_ms = _coerce_int(row.get("latency_ms"))
+            host_entry["latency_total_ms"] += latency_ms
             host_entry["latency_samples"] += 1
+            host_entry["latency_min_ms"] = latency_ms if not host_entry["latency_min_ms"] else min(host_entry["latency_min_ms"], latency_ms)
+            host_entry["latency_max_ms"] = max(host_entry["latency_max_ms"], latency_ms)
+        if status in {"down", "degraded"}:
+            host_entry["fail_count"] += 1
+            checked_at = str(row.get("checked_at", ""))
+            if not host_entry["last_fail_at"] or checked_at >= host_entry["last_fail_at"]:
+                host_entry["last_fail_at"] = checked_at
+                host_entry["last_fail_status"] = status
+                host_entry["last_fail_error"] = str(row.get("error") or "")[:180]
         if str(row.get("checked_at", "")) >= str(host_entry.get("latest_checked_at", "")):
             host_entry["latest_status"] = status
             host_entry["latest_checked_at"] = row.get("checked_at", "")
@@ -3403,6 +3534,29 @@ def _history_summary_matches(summary: dict, selected_host: str, selected_region:
     if selected_status != "all" and _coerce_int(_as_dict(summary.get("status_counts")).get(selected_status)) <= 0:
         return False
     return True
+
+
+def _prune_history_summaries_to_hosts(summaries: list[dict], hosts: list[dict]) -> list[dict]:
+    active_ids = {
+        str(host.get("host_id"))
+        for host in hosts
+        if host.get("enabled", True) and host.get("show_on_status_page", True)
+    }
+    pruned = []
+    for summary in summaries:
+        hosts_map = {
+            host_id: host_entry
+            for host_id, host_entry in _as_dict(summary.get("hosts")).items()
+            if host_id in active_ids
+        }
+        if len(hosts_map) == len(_as_dict(summary.get("hosts"))):
+            pruned.append(summary)
+            continue
+        rebuilt = dict(summary)
+        rebuilt["hosts"] = hosts_map
+        _rebuild_history_summary_totals(rebuilt)
+        pruned.append(rebuilt)
+    return pruned
 
 
 def _serve_history_page(event: dict) -> dict:
@@ -3426,6 +3580,7 @@ def _serve_history_page(event: dict) -> dict:
     if not history_summaries:
         history_rows = _collect_public_history_rows(db, hosts, retention_days=retention_days, max_rows_per_host=1000)
         history_summaries = _summaries_from_history_rows(history_rows, display_tz)
+    history_summaries = _prune_history_summaries_to_hosts(history_summaries, hosts)
     regions = sorted({region for summary in history_summaries for region in _as_dict(summary.get("regions")).keys() if region})
     statuses = sorted({status for summary in history_summaries for status, count in _as_dict(summary.get("status_counts")).items() if _coerce_int(count) > 0})
     filtered_summaries = [
@@ -3797,6 +3952,10 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
     def esc(value) -> str:
         return html.escape(str(value or ""), quote=True)
 
+    def short_time(value) -> str:
+        text = str(value or "")
+        return text.replace("T", " ")[:16] if text else "Never"
+
     end_day = datetime.now(timezone.utc).astimezone(display_tz).date()
     start_window = end_day - timedelta(days=max(1, retention_days) - 1)
     start_day = start_window - timedelta(days=start_window.weekday())
@@ -3869,17 +4028,40 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
                 ) or "No events"
                 codes = _as_dict(host_data.get("status_codes"))
                 code_text = ", ".join(f"{code} x{_coerce_int(count)}" for code, count in sorted(codes.items())) if codes else "No HTTP code"
-                latency = host_data.get("avg_latency_ms")
-                latency_text = f"{latency} ms avg" if latency is not None else "No latency"
+                avg_latency = host_data.get("avg_latency_ms")
+                min_latency = host_data.get("min_latency_ms")
+                max_latency = host_data.get("max_latency_ms")
+                latency_text = (
+                    f"{avg_latency} ms avg · {min_latency} min · {max_latency} max"
+                    if avg_latency is not None else "No latency"
+                )
+                probe_count = _coerce_int(host_data.get("probe_count")) or len(_as_dict(host_data.get("regions")))
+                fail_count = _coerce_int(host_data.get("fail_count"))
+                total_checks = _coerce_int(host_data.get("total_checks"))
+                success_count = max(0, total_checks - fail_count)
+                success_pct = round((success_count / total_checks) * 100, 1) if total_checks else None
+                success_text = f"{success_pct:g}% ok" if success_pct is not None else "No checks"
+                created_text = short_time(host_data.get("created_at"))
+                last_fail = short_time(host_data.get("last_fail_at"))
+                last_fail_status = host_data.get("last_fail_status") or ""
+                last_fail_text = f"{last_fail} ({last_fail_status})" if last_fail_status else last_fail
                 latest_error = host_data.get("latest_error")
-                error_html = f'<div class="day-error">{esc(latest_error)}</div>' if latest_error else ""
+                last_fail_error = host_data.get("last_fail_error") or latest_error
+                error_html = f'<div class="day-error">{esc(last_fail_error)}</div>' if last_fail_error else ""
                 host_rows.append(f"""<div class="day-host">
   <div class="day-host-head">
     <strong>{esc(host_data.get("name") or host_id)}</strong>
     <span class="pill {host_status}">{esc(host_status.title())}</span>
   </div>
-  <div class="day-host-meta">{_coerce_int(host_data.get("total_checks")):,} events · {latency_text} · {esc(regions_text)}</div>
+  <div class="day-host-stats">
+    <span><strong>{total_checks:,}</strong><em>events</em></span>
+    <span><strong>{probe_count:,}</strong><em>probes</em></span>
+    <span><strong>{fail_count:,}</strong><em>fails</em></span>
+    <span><strong>{esc(success_text)}</strong><em>success</em></span>
+  </div>
+  <div class="day-host-meta">{latency_text} · {esc(regions_text)}</div>
   <div class="day-host-meta">{esc(status_bits)} · {esc(code_text)}</div>
+  <div class="day-host-meta">Created {esc(created_text)} · Last fail {esc(last_fail_text)}</div>
   {error_html}
 </div>""")
             detail_markup = f"""<section class="day-detail">
@@ -3976,6 +4158,10 @@ select{{width:100%;background:var(--card);border:1px solid var(--border);border-
 .day-hosts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}}
 .day-host{{border:1px solid var(--border);border-radius:12px;padding:12px;background:color-mix(in srgb, var(--card) 92%, var(--bg))}}
 .day-host-head{{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px}}
+.day-host-stats{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:10px 0}}
+.day-host-stats span{{display:flex;flex-direction:column;gap:2px;border:1px solid var(--border);border-radius:10px;padding:8px 7px;background:var(--hero);min-width:0}}
+.day-host-stats strong{{font-size:.9rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.day-host-stats em{{font-style:normal;color:var(--soft);font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .day-error{{margin-top:8px;color:#b91c1c;font-size:.78rem;line-height:1.45;font-family:"IBM Plex Mono","SFMono-Regular",monospace;word-break:break-word}}
 .day-empty{{color:var(--muted);padding:10px}}
 @media (max-width: 900px) {{
@@ -4880,7 +5066,24 @@ strong{{color:#f8fafc}}
     </div>
     <div class="form-group">
       <label>Display Timezone</label>
-      <input id="s-timezone" placeholder="UTC, Asia/Jerusalem, America/New_York">
+      <select id="s-timezone">
+        <option value="UTC">UTC</option>
+        <option value="Asia/Jerusalem">Asia/Jerusalem</option>
+        <option value="Asia/Dubai">Asia/Dubai</option>
+        <option value="Asia/Tokyo">Asia/Tokyo</option>
+        <option value="Asia/Singapore">Asia/Singapore</option>
+        <option value="Asia/Kolkata">Asia/Kolkata</option>
+        <option value="Europe/London">Europe/London</option>
+        <option value="Europe/Berlin">Europe/Berlin</option>
+        <option value="Europe/Paris">Europe/Paris</option>
+        <option value="Europe/Amsterdam">Europe/Amsterdam</option>
+        <option value="America/New_York">America/New_York</option>
+        <option value="America/Chicago">America/Chicago</option>
+        <option value="America/Denver">America/Denver</option>
+        <option value="America/Los_Angeles">America/Los_Angeles</option>
+        <option value="America/Sao_Paulo">America/Sao_Paulo</option>
+        <option value="Australia/Sydney">Australia/Sydney</option>
+      </select>
       <div class="hint">Used for public history day grouping and operator-facing timestamps that are not browser-local.</div>
     </div>
     <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
@@ -7021,7 +7224,12 @@ async function loadSettings() {{
   document.getElementById('s-retention').value = s.retention_days || 90;
   document.getElementById('s-interval').value = s.default_check_interval || 60;
   document.getElementById('s-timeout').value = s.default_timeout || 10;
-  document.getElementById('s-timezone').value = s.display_timezone || 'UTC';
+  const timezoneSelect = document.getElementById('s-timezone');
+  const timezoneValue = s.display_timezone || 'UTC';
+  if (timezoneSelect && !Array.from(timezoneSelect.options).some(option => option.value === timezoneValue)) {{
+    timezoneSelect.add(new Option(timezoneValue + ' (saved)', timezoneValue));
+  }}
+  if (timezoneSelect) timezoneSelect.value = timezoneValue;
 }}
 
 async function saveSettings() {{
@@ -7029,7 +7237,7 @@ async function saveSettings() {{
     retention_days: +document.getElementById('s-retention').value,
     default_check_interval: +document.getElementById('s-interval').value,
     default_timeout: +document.getElementById('s-timeout').value,
-    display_timezone: document.getElementById('s-timezone').value.trim() || 'UTC',
+    display_timezone: document.getElementById('s-timezone').value || 'UTC',
   }};
   const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
