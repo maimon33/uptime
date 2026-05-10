@@ -30,6 +30,7 @@ API (admin key required):
 import base64
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import os
@@ -38,9 +39,10 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -191,6 +193,7 @@ _SETTINGS_DEFAULTS = {
     "notifications_quiet_hours_end": "",
     "notifications_sleep_until": "",
     "notifications_mute_during_maintenance": True,
+    "display_timezone": os.environ.get("DISPLAY_TIMEZONE", "UTC"),
     "custom_domain_name": "",
     "custom_domain_origin_url": "",
     "custom_domain_hosted_zone_name": "",
@@ -499,6 +502,7 @@ def _run_orchestration(force_check: bool = False, host_id: str | None = None) ->
         result_rows.extend(worker.get("results", []))
 
     _apply_aggregate_updates(db, hosts, result_rows, run_id)
+    _write_history_day_summary(db, hosts, result_rows, run_id, run_time)
     _log("info", "orchestration_completed", run_id=run_id, regions=len(regions), hosts=len(hosts), results=len(result_rows), due_tiers=due_tiers, force_check=force_check, host_id=host_id or "")
     return {
         "run_id": run_id,
@@ -959,6 +963,8 @@ def _route_api(method: str, path: str, event: dict) -> dict:
                 if method == "DELETE": return _delete_host(rid)
             if sub == "checks":
                 return _get_checks(rid, int(qs.get("limit", ["200"])[0]))
+            if sub == "activity":
+                return _get_host_activity(rid, int(qs.get("limit", ["30"])[0]))
 
     # ── /api/settings ─────────────────────────────────────────────────────────
     if resource == "auth":
@@ -1224,6 +1230,26 @@ def _get_checks(host_id: str, limit: int = 200) -> dict:
     return _json(200, result.get("Items", []))
 
 
+def _get_host_activity(host_id: str, limit: int = 30) -> dict:
+    host = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": host_id}).get("Item")
+    if not host:
+        return _json(404, {"error": "Host not found"})
+    checks_result = _db().Table(CHECKS_TABLE).query(
+        KeyConditionExpression=Key("host_id").eq(host_id),
+        ScanIndexForward=False,
+        Limit=max(5, min(limit, 100)),
+    )
+    audits = [
+        row for row in _list_audit_events(limit=200)
+        if row.get("subject_host_id") == host_id or row.get("host_id") == host_id
+    ][:max(5, min(limit, 100))]
+    return _json(200, {
+        "host": host,
+        "checks": checks_result.get("Items", []),
+        "audit": audits,
+    })
+
+
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 def _get_settings() -> dict:
@@ -1250,11 +1276,18 @@ def _update_settings(body: dict) -> dict:
         "custom_domain_certificate_arn", "custom_domain_distribution_id",
         "custom_domain_distribution_domain_name", "custom_domain_distribution_status",
         "custom_domain_status", "custom_domain_last_error", "custom_domain_validation_records",
-        "retention_days", "default_check_interval", "default_timeout",
+        "retention_days", "default_check_interval", "default_timeout", "display_timezone",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return _json(400, {"error": "No updatable settings"})
+    if "display_timezone" in updates:
+        tz_name = str(updates.get("display_timezone") or "UTC").strip() or "UTC"
+        try:
+            ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            return _json(400, {"error": "Unknown display timezone. Use an IANA timezone like UTC, Asia/Jerusalem, or America/New_York."})
+        updates["display_timezone"] = tz_name
     item = _load_settings_item()
     item.update(updates)
     _save_settings_item(item)
@@ -1433,6 +1466,110 @@ def _aggregate_status(host_results: list[dict]) -> str:
     return "unknown"
 
 
+def _history_summary_key(day: str) -> str:
+    return f"__history_day__{day}"
+
+
+def _blank_status_counts() -> dict:
+    return {"up": 0, "degraded": 0, "down": 0, "unknown": 0}
+
+
+def _increment_count(bucket: dict, key: str, amount: int = 1) -> None:
+    bucket[str(key or "unknown")] = int(bucket.get(str(key or "unknown"), 0) or 0) + amount
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _write_history_day_summary(db, hosts: list[dict], result_rows: list[dict], run_id: str, run_time: datetime) -> None:
+    if not result_rows:
+        return
+    try:
+        settings = _load_settings_item()
+        display_tz, display_timezone = _display_tz(settings)
+        retention_days = max(1, _safe_int(settings.get("retention_days"), RETENTION_DAYS))
+        day = run_time.astimezone(display_tz).date().isoformat()
+        key = _history_summary_key(day)
+        now = datetime.now(timezone.utc)
+        host_names = {str(host.get("host_id")): str(host.get("name") or host.get("host_id")) for host in hosts}
+        table = db.Table(HOSTS_TABLE)
+        existing = table.get_item(Key={"host_id": key}).get("Item") or {}
+        summary = {
+            "host_id": key,
+            "record_type": "history_day_summary",
+            "day": day,
+            "display_timezone": display_timezone,
+            "total_checks": _coerce_int(existing.get("total_checks")),
+            "run_count": _coerce_int(existing.get("run_count")),
+            "status_counts": {**_blank_status_counts(), **_as_dict(existing.get("status_counts"))},
+            "regions": _as_dict(existing.get("regions")),
+            "hosts": _as_dict(existing.get("hosts")),
+            "first_checked_at": existing.get("first_checked_at") or run_id,
+            "last_checked_at": existing.get("last_checked_at") or run_id,
+            "last_run_id": run_id,
+            "updated_at": now.isoformat(),
+            "ttl": int((now + timedelta(days=retention_days + 7)).timestamp()),
+        }
+        summary["total_checks"] += len(result_rows)
+        summary["run_count"] += 1
+        summary["last_checked_at"] = max(str(summary.get("last_checked_at") or ""), run_id)
+        if not summary.get("first_checked_at") or run_id < str(summary.get("first_checked_at")):
+            summary["first_checked_at"] = run_id
+
+        by_host: dict[str, list[dict]] = {}
+        for row in result_rows:
+            status = str(row.get("status") or "unknown")
+            region = str(row.get("region") or "unknown")
+            _increment_count(summary["status_counts"], status)
+            _increment_count(summary["regions"], region)
+            by_host.setdefault(str(row.get("host_id") or ""), []).append(row)
+
+        for host_id, host_results in by_host.items():
+            if not host_id:
+                continue
+            host_entry = _as_dict(summary["hosts"].get(host_id))
+            host_entry = {
+                "host_id": host_id,
+                "name": host_names.get(host_id) or host_entry.get("name") or host_id,
+                "total_checks": _coerce_int(host_entry.get("total_checks")),
+                "status_counts": {**_blank_status_counts(), **_as_dict(host_entry.get("status_counts"))},
+                "regions": _as_dict(host_entry.get("regions")),
+                "status_codes": _as_dict(host_entry.get("status_codes")),
+                "latency_total_ms": _coerce_int(host_entry.get("latency_total_ms")),
+                "latency_samples": _coerce_int(host_entry.get("latency_samples")),
+                "latest_status": host_entry.get("latest_status") or "unknown",
+                "latest_checked_at": host_entry.get("latest_checked_at") or "",
+                "latest_error": host_entry.get("latest_error") or "",
+            }
+            for row in host_results:
+                status = str(row.get("status") or "unknown")
+                region = str(row.get("region") or "unknown")
+                checked_at = str(row.get("checked_at") or run_id)
+                host_entry["total_checks"] += 1
+                _increment_count(host_entry["status_counts"], status)
+                _increment_count(host_entry["regions"], region)
+                if row.get("status_code") is not None:
+                    _increment_count(host_entry["status_codes"], str(row.get("status_code")))
+                latency = row.get("latency_ms")
+                if latency is not None:
+                    host_entry["latency_total_ms"] += _coerce_int(latency)
+                    host_entry["latency_samples"] += 1
+                if not host_entry["latest_checked_at"] or checked_at >= host_entry["latest_checked_at"]:
+                    host_entry["latest_status"] = status
+                    host_entry["latest_checked_at"] = checked_at
+                    host_entry["latest_error"] = str(row.get("error") or "")[:180]
+            summary["hosts"][host_id] = host_entry
+
+        _log_dynamodb_write("put_item", HOSTS_TABLE, key={"host_id": key}, item=summary, context="history_day_summary")
+        table.put_item(Item=summary)
+    except Exception as exc:
+        _log("warn", "history_day_summary_write_failed", run_id=run_id, error=str(exc))
+
+
 def _send_alert(host: dict, host_results: list[dict], event_type: str) -> None:
     sns = _sns_client()
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1461,8 +1598,25 @@ def _send_alert(host: dict, host_results: list[dict], event_type: str) -> None:
 
     try:
         sns.publish(TopicArn=host["alert_sns_arn"], Subject=subject, Message=body)
+        _audit_event(
+            "sns_alert_publish",
+            actor="system",
+            host_id=host.get("host_id", ""),
+            host_name=host.get("name", ""),
+            alert_event_type=event_type,
+            topic_arn=host.get("alert_sns_arn", ""),
+        )
         print(f"[alerts] sent {event_type} for {host['name']}")
     except Exception as exc:
+        _audit_event(
+            "sns_alert_publish",
+            status="error",
+            actor="system",
+            host_id=host.get("host_id", ""),
+            host_name=host.get("name", ""),
+            alert_event_type=event_type,
+            error=str(exc),
+        )
         print(f"[alerts] failed for {host['name']}: {exc}")
 
 
@@ -2503,6 +2657,13 @@ _CLOUDFRONT_PLAN_COSTS = {
 }
 _COGNITO_ESSENTIALS_DIRECT_MAU_FREE_TIER = 10_000
 _COGNITO_ESSENTIALS_DIRECT_MAU_PRICE = 0.015
+_LAMBDA_REQUEST_PRICE_PER_MILLION = 0.20
+_LAMBDA_GB_SECOND_PRICE = 0.00001667
+_DDB_WRITE_PRICE_PER_MILLION = 1.25
+_DDB_READ_PRICE_PER_MILLION = 0.25
+_DDB_STORAGE_PRICE_PER_GB_MONTH = 0.25
+_LOGS_INGEST_PRICE_PER_GB = 0.50
+_SNS_PUBLISH_PRICE_PER_MILLION = 0.50
 
 
 def _current_scheduler_interval_seconds() -> int:
@@ -2514,8 +2675,184 @@ def _checks_per_day(interval_seconds: int) -> int:
     return int(86400 / max(1, interval_seconds))
 
 
+def _lambda_monthly_projection(functions: list[dict]) -> dict:
+    projected_invocations = 0
+    projected_gb_seconds = 0.0
+    last_24h_invocations = 0
+    last_24h_errors = 0
+    details = []
+    for fn in functions:
+        last = fn.get("last_24h") or {}
+        invocations_24h = int(last.get("invocations") or 0)
+        errors_24h = int(last.get("errors") or 0)
+        avg_ms = float(last.get("avg_duration_ms") or 0.0)
+        memory_mb = int(fn.get("memory_mb") or 0)
+        gb_seconds_24h = invocations_24h * (avg_ms / 1000.0) * (memory_mb / 1024.0)
+        last_24h_invocations += invocations_24h
+        last_24h_errors += errors_24h
+        projected_invocations += invocations_24h * 30
+        projected_gb_seconds += gb_seconds_24h * 30
+        details.append({
+            "function_name": fn.get("function_name"),
+            "region": fn.get("region"),
+            "memory_mb": memory_mb,
+            "last_24h_invocations": invocations_24h,
+            "last_24h_errors": errors_24h,
+            "avg_duration_ms": avg_ms or None,
+            "projected_monthly_invocations": invocations_24h * 30,
+            "projected_monthly_gb_seconds": round(gb_seconds_24h * 30, 4),
+        })
+    request_cost = (projected_invocations / 1_000_000) * _LAMBDA_REQUEST_PRICE_PER_MILLION
+    compute_cost = projected_gb_seconds * _LAMBDA_GB_SECOND_PRICE
+    return {
+        "last_24h_invocations": last_24h_invocations,
+        "last_24h_errors": last_24h_errors,
+        "projected_monthly_invocations": projected_invocations,
+        "projected_monthly_gb_seconds": round(projected_gb_seconds, 4),
+        "gross_usd": round(request_cost + compute_cost, 6),
+        "details": details,
+    }
+
+
+def _logs_stored_bytes(region_name: str, log_group_name: str) -> int:
+    try:
+        response = _logs_client(region_name).describe_log_groups(logGroupNamePrefix=log_group_name, limit=5)
+        for group in response.get("logGroups", []):
+            if group.get("logGroupName") == log_group_name:
+                return int(group.get("storedBytes") or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+def _count_management_alert_logs(hours: int = 24) -> int:
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "uptime-management")
+    log_group_name = f"/aws/lambda/{function_name}"
+    start_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp() * 1000)
+    try:
+        response = _logs_client(HOME_REGION).filter_log_events(
+            logGroupName=log_group_name,
+            startTime=start_time_ms,
+            filterPattern='"[alerts] sent"',
+            limit=1000,
+        )
+        return len(response.get("events", []))
+    except Exception:
+        return 0
+
+
+def _cost_usage_snapshot(defaults: dict) -> dict:
+    db = _db()
+    settings = _load_settings_item()
+    hosts_desc = _ddb_client().describe_table(TableName=HOSTS_TABLE)["Table"]
+    checks_desc = _ddb_client().describe_table(TableName=CHECKS_TABLE)["Table"]
+    host_rows = _list_host_items()
+    enabled_hosts = [host for host in host_rows if host.get("enabled", True)]
+    regions = reg.list_regions(db)
+    management_lambda = _management_lambda_summary()
+    worker_lambdas = []
+    for region_info in regions:
+        try:
+            worker_lambdas.append(_worker_lambda_summary(region_info))
+        except Exception as exc:
+            worker_lambdas.append({
+                "function_name": region_info.get("function_name"),
+                "region": region_info.get("region"),
+                "memory_mb": int(region_info.get("memory_mb", 0) or 0),
+                "error": str(exc),
+                "last_24h": {"invocations": 0, "errors": 0, "avg_duration_ms": None},
+            })
+    lambda_projection = _lambda_monthly_projection([management_lambda, *worker_lambdas])
+    tables = {
+        "hosts": _table_summary(hosts_desc),
+        "checks": _table_summary(checks_desc),
+    }
+    ddb_storage_bytes = tables["hosts"]["size_bytes"] + tables["checks"]["size_bytes"]
+    ddb_storage_gb = ddb_storage_bytes / (1024 ** 3)
+    projected_checks = _estimate_monthly_checks(enabled_hosts, regions)
+    estimated_ddb_writes = projected_checks + (defaults["regions"] * int((30 * 24 * 3600) / _current_scheduler_interval_seconds()))
+    estimated_ddb_reads = projected_checks * 0.1
+    log_groups = [
+        {"region": HOME_REGION, "name": f"/aws/lambda/{management_lambda.get('function_name')}", "stored_bytes": _logs_stored_bytes(HOME_REGION, f"/aws/lambda/{management_lambda.get('function_name')}")},
+    ]
+    for worker in worker_lambdas:
+        if worker.get("function_name") and worker.get("region"):
+            group_name = f"/aws/lambda/{worker['function_name']}"
+            log_groups.append({"region": worker["region"], "name": group_name, "stored_bytes": _logs_stored_bytes(worker["region"], group_name)})
+    logs_stored_bytes = sum(item.get("stored_bytes", 0) for item in log_groups)
+    sns_24h = _count_management_alert_logs()
+    sns_projected = sns_24h * 30
+    custom_domain = _custom_domain_summary(settings)
+    gross_costs = {
+        "lambda_usd": lambda_projection["gross_usd"],
+        "dynamodb_writes_usd": round((estimated_ddb_writes / 1_000_000) * _DDB_WRITE_PRICE_PER_MILLION, 6),
+        "dynamodb_reads_usd": round((estimated_ddb_reads / 1_000_000) * _DDB_READ_PRICE_PER_MILLION, 6),
+        "dynamodb_storage_usd": round(ddb_storage_gb * _DDB_STORAGE_PRICE_PER_GB_MONTH, 6),
+        "cloudwatch_logs_storage_usd": round((logs_stored_bytes / (1024 ** 3)) * 0.03, 6),
+        "sns_publish_usd": round((sns_projected / 1_000_000) * _SNS_PUBLISH_PRICE_PER_MILLION, 6),
+        "cloudfront_custom_domain_usd": _CLOUDFRONT_PLAN_COSTS.get(defaults.get("cloudfront_plan", "payg"), 0.0) if custom_domain.get("configured") else 0.0,
+    }
+    return {
+        "assets": {
+            "hosts_total": len(host_rows),
+            "hosts_enabled": len(enabled_hosts),
+            "hosts_on_status_page": sum(1 for host in host_rows if host.get("show_on_status_page", True)),
+            "hosts_with_alerts": sum(1 for host in host_rows if host.get("alert_enabled")),
+            "probe_regions": len(regions),
+            "lambda_functions": 1 + len(regions),
+            "custom_domain_configured": bool(custom_domain.get("configured")),
+            "cognito_enabled": bool(defaults.get("cognito_enabled")),
+        },
+        "tables": tables,
+        "lambda": {
+            **lambda_projection,
+            "management": management_lambda,
+            "workers": worker_lambdas,
+        },
+        "dynamodb": {
+            "projected_monthly_writes": int(estimated_ddb_writes),
+            "projected_monthly_reads": int(estimated_ddb_reads),
+            "stored_bytes": ddb_storage_bytes,
+            "stored_gb": round(ddb_storage_gb, 6),
+        },
+        "checks": {
+            "projected_monthly": int(projected_checks),
+            "projected_daily": int(projected_checks / 30),
+        },
+        "logs": {
+            "stored_bytes": logs_stored_bytes,
+            "stored_human": _human_bytes(logs_stored_bytes),
+            "groups": log_groups,
+        },
+        "sns": {
+            "alert_publishes_last_24h": sns_24h,
+            "projected_monthly_publishes": sns_projected,
+        },
+        "gross_breakdown": gross_costs,
+        "gross_total_usd_per_month": round(sum(gross_costs.values()), 6),
+        "note": "Usage is a live estimate. Lambda invocations and duration come from CloudWatch last-24h metrics projected to 30 days. DynamoDB write/read usage is estimated from configured host/probe schedules plus current table row and storage counts. SNS publish count comes from management alert logs until all alert events have audit rows.",
+    }
+
+
+def _host_target_region_count(host: dict, regions: list[dict]) -> int:
+    targets = _normalize_target_regions(host.get("target_regions"))
+    if targets:
+        return len([region for region in regions if region.get("region") in targets])
+    return len(regions)
+
+
+def _estimate_monthly_checks(hosts: list[dict], regions: list[dict]) -> int:
+    total = 0
+    for host in hosts:
+        tier = int(host.get("monitor_tier_seconds", host.get("check_interval_seconds", 60)) or 60)
+        target_regions = _host_target_region_count(host, regions)
+        total += int((30 * 24 * 3600) / max(60, tier)) * target_regions
+    return total
+
+
 def _cost_estimate(qs: dict) -> dict:
     defaults = _default_cost_inputs()
+    usage = _cost_usage_snapshot(defaults)
     hosts    = int(qs.get("hosts",    [str(defaults["hosts"])])[0])
     rcount   = int(qs.get("regions",  [str(defaults["regions"])])[0])
     interval = int(qs.get("interval", [str(defaults["interval_sec"])])[0])
@@ -2552,6 +2889,8 @@ def _cost_estimate(qs: dict) -> dict:
         cognito_billable_mau = max(0, cognito_admin_mau - _COGNITO_ESSENTIALS_DIRECT_MAU_FREE_TIER)
         cognito_auth_cost = cognito_billable_mau * _COGNITO_ESSENTIALS_DIRECT_MAU_PRICE
     total        = lambda_cost + ddb_w_cost + ddb_r_cost + storage_cost + log_cost + cloudfront_custom_domain_cost + cognito_auth_cost
+    usage_gross_total = usage.get("gross_total_usd_per_month", 0.0)
+    near_zero = usage_gross_total < 0.01
 
     return _json(200, {
         "inputs": {
@@ -2587,6 +2926,9 @@ def _cost_estimate(qs: dict) -> dict:
             "cloudwatch_logs_usd":  round(log_cost,     4),
         },
         "total_usd_per_month": round(total, 4),
+        "usage": usage,
+        "usage_total_usd_per_month": round(usage_gross_total, 6),
+        "usage_near_zero": near_zero,
         "note": "AWS Free Tier applied (1M Lambda req/mo, 25GB DynamoDB, 5GB logs). The current scheduler runs once per minute, so Lambda invocations are driven by worker-region count, not by each host's requested interval. CloudFront uses the selected plan cost; pay-as-you-go request and bandwidth overages are not estimated here. Cognito is estimated as direct sign-in MAUs on the Essentials pricing path and excludes SMS, SES email, and advanced add-ons.",
     })
 
@@ -2618,6 +2960,14 @@ def _parse_iso_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _display_tz(settings: dict):
+    name = str(settings.get("display_timezone") or _SETTINGS_DEFAULTS.get("display_timezone") or "UTC").strip() or "UTC"
+    try:
+        return ZoneInfo(name), name
+    except ZoneInfoNotFoundError:
+        return timezone.utc, "UTC"
 
 
 def _maintenance_state(settings: dict) -> dict:
@@ -2876,17 +3226,28 @@ def _build_public_host_data(db, hosts: list[dict], history_limit: int = 300) -> 
     return host_data
 
 
-def _collect_public_history_rows(db, hosts: list[dict], checks_limit: int = 120) -> list[dict]:
+def _collect_public_history_rows(db, hosts: list[dict], retention_days: int = 90, max_rows_per_host: int = 20_000) -> list[dict]:
     from boto3.dynamodb.conditions import Key as DKey
 
     rows = []
     host_names = {host["host_id"]: host.get("name", host["host_id"]) for host in hosts}
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, retention_days))).isoformat()
     for host in hosts:
-        checks = db.Table(CHECKS_TABLE).query(
-            KeyConditionExpression=DKey("host_id").eq(host["host_id"]),
-            ScanIndexForward=False,
-            Limit=checks_limit,
-        ).get("Items", [])
+        checks = []
+        last_key = None
+        while len(checks) < max_rows_per_host:
+            kwargs = {
+                "KeyConditionExpression": DKey("host_id").eq(host["host_id"]) & DKey("checked_at").gte(cutoff),
+                "ScanIndexForward": False,
+                "Limit": min(1000, max_rows_per_host - len(checks)),
+            }
+            if last_key:
+                kwargs["ExclusiveStartKey"] = last_key
+            result = db.Table(CHECKS_TABLE).query(**kwargs)
+            checks.extend(result.get("Items", []))
+            last_key = result.get("LastEvaluatedKey")
+            if not last_key:
+                break
         for check in checks:
             rows.append({
                 "host_id": host["host_id"],
@@ -2896,10 +3257,152 @@ def _collect_public_history_rows(db, hosts: list[dict], checks_limit: int = 120)
                 "latency_ms": check.get("latency_ms"),
                 "status_code": check.get("status_code"),
                 "checked_at": check.get("checked_at", ""),
+                "run_id": check.get("run_id", ""),
                 "error": check.get("error", ""),
             })
     rows.sort(key=lambda row: row.get("checked_at", ""), reverse=True)
     return rows
+
+
+def _history_status_rank(status: str) -> int:
+    return {"up": 1, "unknown": 2, "degraded": 3, "down": 4}.get(str(status or "unknown"), 2)
+
+
+def _worst_history_status(status_counts: dict) -> str:
+    statuses = []
+    for status, count in _as_dict(status_counts).items():
+        if _coerce_int(count) > 0:
+            statuses.append(str(status or "unknown"))
+    if not statuses:
+        return "none"
+    return max(statuses, key=_history_status_rank)
+
+
+def _normalize_history_summary(item: dict) -> dict:
+    status_counts = {**_blank_status_counts(), **_as_dict(item.get("status_counts"))}
+    status_counts = {status: _coerce_int(count) for status, count in status_counts.items()}
+    hosts = {}
+    for host_id, raw_host in _as_dict(item.get("hosts")).items():
+        host_entry = _as_dict(raw_host)
+        host_counts = {**_blank_status_counts(), **_as_dict(host_entry.get("status_counts"))}
+        host_counts = {status: _coerce_int(count) for status, count in host_counts.items()}
+        latency_samples = _coerce_int(host_entry.get("latency_samples"))
+        latency_total = _coerce_int(host_entry.get("latency_total_ms"))
+        hosts[str(host_id)] = {
+            "host_id": str(host_id),
+            "name": str(host_entry.get("name") or host_id),
+            "total_checks": _coerce_int(host_entry.get("total_checks")),
+            "status_counts": host_counts,
+            "regions": {str(k): _coerce_int(v) for k, v in _as_dict(host_entry.get("regions")).items()},
+            "status_codes": {str(k): _coerce_int(v) for k, v in _as_dict(host_entry.get("status_codes")).items()},
+            "avg_latency_ms": round(latency_total / latency_samples) if latency_samples else None,
+            "latest_status": str(host_entry.get("latest_status") or _worst_history_status(host_counts)),
+            "latest_checked_at": str(host_entry.get("latest_checked_at") or ""),
+            "latest_error": str(host_entry.get("latest_error") or ""),
+        }
+    return {
+        "host_id": str(item.get("host_id") or ""),
+        "day": str(item.get("day") or "").strip(),
+        "display_timezone": str(item.get("display_timezone") or ""),
+        "total_checks": _coerce_int(item.get("total_checks")),
+        "run_count": _coerce_int(item.get("run_count")),
+        "status_counts": status_counts,
+        "regions": {str(k): _coerce_int(v) for k, v in _as_dict(item.get("regions")).items()},
+        "hosts": hosts,
+        "first_checked_at": str(item.get("first_checked_at") or ""),
+        "last_checked_at": str(item.get("last_checked_at") or ""),
+        "updated_at": str(item.get("updated_at") or ""),
+    }
+
+
+def _list_history_day_summaries(db, retention_days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=max(1, retention_days) + 2)).isoformat()
+    summaries = []
+    last_key = None
+    table = db.Table(HOSTS_TABLE)
+    while True:
+        kwargs = {
+            "FilterExpression": "begins_with(host_id, :p)",
+            "ExpressionAttributeValues": {":p": "__history_day__"},
+        }
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
+        result = table.scan(**kwargs)
+        summaries.extend(_normalize_history_summary(item) for item in result.get("Items", []) if str(item.get("day") or "") >= cutoff)
+        last_key = result.get("LastEvaluatedKey")
+        if not last_key:
+            break
+    summaries.sort(key=lambda row: row.get("day", ""), reverse=True)
+    return summaries
+
+
+def _summaries_from_history_rows(rows: list[dict], display_tz) -> list[dict]:
+    daily: dict[str, dict] = {}
+    for row in rows:
+        parsed = _parse_aws_timestamp(row.get("checked_at", ""))
+        if not parsed:
+            continue
+        day = parsed.astimezone(display_tz).date().isoformat()
+        summary = daily.setdefault(day, {
+            "host_id": _history_summary_key(day),
+            "day": day,
+            "total_checks": 0,
+            "run_count": 0,
+            "status_counts": _blank_status_counts(),
+            "regions": {},
+            "hosts": {},
+            "_runs": set(),
+            "first_checked_at": row.get("checked_at", ""),
+            "last_checked_at": row.get("checked_at", ""),
+        })
+        status = str(row.get("status") or "unknown")
+        region = str(row.get("region") or "unknown")
+        host_id = str(row.get("host_id") or "")
+        summary["total_checks"] += 1
+        if row.get("run_id"):
+            summary["_runs"].add(str(row.get("run_id")))
+        _increment_count(summary["status_counts"], status)
+        _increment_count(summary["regions"], region)
+        summary["first_checked_at"] = min(str(summary["first_checked_at"]), str(row.get("checked_at", "")))
+        summary["last_checked_at"] = max(str(summary["last_checked_at"]), str(row.get("checked_at", "")))
+        host_entry = summary["hosts"].setdefault(host_id, {
+            "host_id": host_id,
+            "name": row.get("host_name") or host_id,
+            "total_checks": 0,
+            "status_counts": _blank_status_counts(),
+            "regions": {},
+            "status_codes": {},
+            "latency_total_ms": 0,
+            "latency_samples": 0,
+            "latest_status": status,
+            "latest_checked_at": row.get("checked_at", ""),
+            "latest_error": row.get("error", ""),
+        })
+        host_entry["total_checks"] += 1
+        _increment_count(host_entry["status_counts"], status)
+        _increment_count(host_entry["regions"], region)
+        if row.get("status_code") is not None:
+            _increment_count(host_entry["status_codes"], str(row.get("status_code")))
+        if row.get("latency_ms") is not None:
+            host_entry["latency_total_ms"] += _coerce_int(row.get("latency_ms"))
+            host_entry["latency_samples"] += 1
+        if str(row.get("checked_at", "")) >= str(host_entry.get("latest_checked_at", "")):
+            host_entry["latest_status"] = status
+            host_entry["latest_checked_at"] = row.get("checked_at", "")
+            host_entry["latest_error"] = row.get("error", "")
+    for item in daily.values():
+        item["run_count"] = len(item.pop("_runs", set()))
+    return [_normalize_history_summary(item) for item in sorted(daily.values(), key=lambda item: item["day"], reverse=True)]
+
+
+def _history_summary_matches(summary: dict, selected_host: str, selected_region: str, selected_status: str) -> bool:
+    if selected_host != "all" and selected_host not in _as_dict(summary.get("hosts")):
+        return False
+    if selected_region != "all" and selected_region not in _as_dict(summary.get("regions")):
+        return False
+    if selected_status != "all" and _coerce_int(_as_dict(summary.get("status_counts")).get(selected_status)) <= 0:
+        return False
+    return True
 
 
 def _serve_history_page(event: dict) -> dict:
@@ -2909,24 +3412,27 @@ def _serve_history_page(event: dict) -> dict:
     brand_name = settings.get("status_page_brand_name", _SETTINGS_DEFAULTS["status_page_brand_name"])
     logo_url = settings.get("status_page_logo_url", _SETTINGS_DEFAULTS["status_page_logo_url"])
     theme = settings.get("status_page_theme", _SETTINGS_DEFAULTS["status_page_theme"])
+    retention_days = int(settings.get("retention_days", _SETTINGS_DEFAULTS["retention_days"]))
+    display_tz, display_timezone = _display_tz(settings)
     build = _build_info()
     hosts = _list_public_hosts()
     query = parse_qs(event.get("rawQueryString") or "")
     selected_host = (query.get("host", ["all"])[0] or "all").strip()
     selected_region = (query.get("region", ["all"])[0] or "all").strip()
     selected_status = (query.get("status", ["all"])[0] or "all").strip()
+    selected_day = (query.get("day", [""])[0] or "").strip()
 
-    history_rows = _collect_public_history_rows(db, hosts)
-    regions = sorted({row["region"] for row in history_rows if row.get("region")})
-    statuses = sorted({row["status"] for row in history_rows if row.get("status")})
-
-    filtered_rows = history_rows
-    if selected_host != "all":
-        filtered_rows = [row for row in filtered_rows if row["host_id"] == selected_host]
-    if selected_region != "all":
-        filtered_rows = [row for row in filtered_rows if row["region"] == selected_region]
-    if selected_status != "all":
-        filtered_rows = [row for row in filtered_rows if row["status"] == selected_status]
+    history_summaries = _list_history_day_summaries(db, retention_days=retention_days)
+    if not history_summaries:
+        history_rows = _collect_public_history_rows(db, hosts, retention_days=retention_days, max_rows_per_host=1000)
+        history_summaries = _summaries_from_history_rows(history_rows, display_tz)
+    regions = sorted({region for summary in history_summaries for region in _as_dict(summary.get("regions")).keys() if region})
+    statuses = sorted({status for summary in history_summaries for status, count in _as_dict(summary.get("status_counts")).items() if _coerce_int(count) > 0})
+    filtered_summaries = [
+        summary for summary in history_summaries
+        if _history_summary_matches(summary, selected_host, selected_region, selected_status)
+    ]
+    selected_summary = next((summary for summary in filtered_summaries if summary.get("day") == selected_day), None)
 
     return _html(
         200,
@@ -2941,8 +3447,13 @@ def _serve_history_page(event: dict) -> dict:
             selected_host=selected_host,
             selected_region=selected_region,
             selected_status=selected_status,
-            rows=filtered_rows[:250],
+            selected_day=selected_day,
+            summaries=filtered_summaries,
+            selected_summary=selected_summary,
             build=build,
+            retention_days=retention_days,
+            display_tz=display_tz,
+            display_timezone=display_timezone,
         ),
     )
 
@@ -3263,7 +3774,7 @@ footer{{text-align:center;margin-top:52px;font-size:.78rem;color:var(--soft);fon
 </div></body></html>"""
 
 
-def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], statuses: list[str], selected_host: str, selected_region: str, selected_status: str, rows: list[dict], build: dict) -> str:
+def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str, hosts: list[dict], regions: list[str], statuses: list[str], selected_host: str, selected_region: str, selected_status: str, selected_day: str, summaries: list[dict], selected_summary: dict | None, build: dict, retention_days: int = 90, display_tz=timezone.utc, display_timezone: str = "UTC") -> str:
     theme_class = theme if theme in {"clean", "midnight", "sunrise", "forest"} else "clean"
     brand = ""
     if brand_name or logo_url:
@@ -3278,17 +3789,131 @@ def _render_history_page(title: str, brand_name: str, logo_url: str, theme: str,
         f'<option value="{status}"{" selected" if selected_status == status else ""}>{status.title()}</option>'
         for status in statuses
     ]
-    row_markup = "".join(
-        f"""<tr>
-  <td>{row["host_name"]}</td>
-  <td><span class="pill {row["status"]}">{row["status"].title()}</span></td>
-  <td>{row["latency_ms"] if row["latency_ms"] is not None else "—"} ms</td>
-  <td>{row["status_code"] if row.get("status_code") is not None else "—"}</td>
-  <td>{row["checked_at"].replace("T", " ")[:19]}</td>
-  <td>{(row.get("error") or "—")[:120]}</td>
-</tr>"""
-        for row in rows
-    ) or '<tr><td colspan="6" class="empty-cell">No checks matched the selected filters.</td></tr>'
+    region_options = ['<option value="all">All regions</option>'] + [
+        f'<option value="{region}"{" selected" if selected_region == region else ""}>{region}</option>'
+        for region in regions
+    ]
+
+    def esc(value) -> str:
+        return html.escape(str(value or ""), quote=True)
+
+    end_day = datetime.now(timezone.utc).astimezone(display_tz).date()
+    start_window = end_day - timedelta(days=max(1, retention_days) - 1)
+    start_day = start_window - timedelta(days=start_window.weekday())
+    end_grid = end_day + timedelta(days=6 - end_day.weekday())
+    total_weeks = ((end_grid - start_day).days // 7) + 1
+    daily = {summary.get("day"): summary for summary in summaries if summary.get("day")}
+    total_events = sum(_coerce_int(summary.get("total_checks")) for summary in summaries)
+    total_hosts = len({
+        host_id
+        for summary in summaries
+        for host_id in _as_dict(summary.get("hosts")).keys()
+    })
+    total_runs = sum(_coerce_int(summary.get("run_count")) for summary in summaries)
+    hero_meta = f"{total_events:,} events · {total_hosts:,} hosts · {total_runs:,} Lambda runs · {esc(display_timezone)}"
+
+    month_labels = []
+    previous_month = None
+    for week in range(total_weeks):
+        label_day = start_day + timedelta(days=week * 7 + 3)
+        if label_day.month != previous_month:
+            month_labels.append(f'<span style="grid-column:{week + 1}">{label_day.strftime("%b")}</span>')
+            previous_month = label_day.month
+
+    cells = []
+    for week in range(total_weeks):
+        for day_offset in range(7):
+            cell_day = start_day + timedelta(days=week * 7 + day_offset)
+            day_key = cell_day.isoformat()
+            entry = daily.get(day_key)
+            status = _worst_history_status(entry.get("status_counts")) if entry else "none"
+            is_outside = cell_day < start_window or cell_day > end_day
+            cell_class = "empty" if is_outside else status
+            if selected_day == day_key:
+                cell_class += " selected"
+            count = _coerce_int(entry.get("total_checks")) if entry else 0
+            title_bits = [cell_day.strftime("%b %-d, %Y"), f"{count} events"]
+            if entry:
+                title_bits.append(status.title())
+                hosts_for_day = [host.get("name") or host_id for host_id, host in _as_dict(entry.get("hosts")).items()]
+                if hosts_for_day:
+                    title_bits.append(", ".join(sorted(str(name) for name in hosts_for_day)[:3]))
+                day_regions = _as_dict(entry.get("regions"))
+                if day_regions:
+                    title_bits.append("Regions: " + ", ".join(sorted(day_regions.keys())[:3]))
+            params = {"host": selected_host, "status": selected_status, "region": selected_region, "day": day_key}
+            href = "/history?" + urlencode({key: value for key, value in params.items() if value and not (key == "day" and is_outside)})
+            if is_outside:
+                cells.append(f'<span class="heat-cell {cell_class}" title="{esc(" · ".join(title_bits))}"></span>')
+            else:
+                cells.append(f'<a class="heat-cell {cell_class}" href="{href}" title="{esc(" · ".join(title_bits))}" aria-label="{esc(" · ".join(title_bits))}"></a>')
+
+    detail_markup = ""
+    if selected_day:
+        if selected_summary:
+            host_rows = []
+            for host_id, host_entry in sorted(_as_dict(selected_summary.get("hosts")).items(), key=lambda pair: str(_as_dict(pair[1]).get("name") or pair[0]).lower()):
+                host_data = _as_dict(host_entry)
+                if selected_host != "all" and host_id != selected_host:
+                    continue
+                if selected_region != "all" and selected_region not in _as_dict(host_data.get("regions")):
+                    continue
+                if selected_status != "all" and _coerce_int(_as_dict(host_data.get("status_counts")).get(selected_status)) <= 0:
+                    continue
+                host_status = _worst_history_status(host_data.get("status_counts"))
+                regions_text = ", ".join(sorted(_as_dict(host_data.get("regions")).keys())) or "No regions"
+                status_bits = " · ".join(
+                    f"{status} {_coerce_int(count)}"
+                    for status, count in _as_dict(host_data.get("status_counts")).items()
+                    if _coerce_int(count) > 0
+                ) or "No events"
+                codes = _as_dict(host_data.get("status_codes"))
+                code_text = ", ".join(f"{code} x{_coerce_int(count)}" for code, count in sorted(codes.items())) if codes else "No HTTP code"
+                latency = host_data.get("avg_latency_ms")
+                latency_text = f"{latency} ms avg" if latency is not None else "No latency"
+                latest_error = host_data.get("latest_error")
+                error_html = f'<div class="day-error">{esc(latest_error)}</div>' if latest_error else ""
+                host_rows.append(f"""<div class="day-host">
+  <div class="day-host-head">
+    <strong>{esc(host_data.get("name") or host_id)}</strong>
+    <span class="pill {host_status}">{esc(host_status.title())}</span>
+  </div>
+  <div class="day-host-meta">{_coerce_int(host_data.get("total_checks")):,} events · {latency_text} · {esc(regions_text)}</div>
+  <div class="day-host-meta">{esc(status_bits)} · {esc(code_text)}</div>
+  {error_html}
+</div>""")
+            detail_markup = f"""<section class="day-detail">
+  <div class="day-detail-head">
+    <div>
+      <h2>{esc(selected_day)}</h2>
+      <p>{_coerce_int(selected_summary.get("total_checks")):,} events · {_coerce_int(selected_summary.get("run_count")):,} Lambda runs · worst status {_worst_history_status(selected_summary.get("status_counts")).title()}</p>
+    </div>
+    <a class="ghost-link compact" href="/history?{urlencode({k: v for k, v in {'host': selected_host, 'status': selected_status, 'region': selected_region}.items() if v})}">Close day</a>
+  </div>
+  <div class="day-hosts">{''.join(host_rows) if host_rows else '<div class="day-empty">No host events match these filters for this day.</div>'}</div>
+</section>"""
+        else:
+            detail_markup = f"""<section class="day-detail">
+  <div class="day-detail-head">
+    <div><h2>{esc(selected_day)}</h2><p>No summarized events match the current filters.</p></div>
+    <a class="ghost-link compact" href="/history?{urlencode({k: v for k, v in {'host': selected_host, 'status': selected_status, 'region': selected_region}.items() if v})}">Close day</a>
+  </div>
+</section>"""
+
+    heatmap_markup = f"""<div class="heatmap-shell">
+  <div class="heatmap-head"><div class="heatmap-title">Daily status</div></div>
+  <div class="heatmap-scroll">
+    <div class="heatmap-months" style="grid-template-columns:repeat({total_weeks}, 12px)">{''.join(month_labels)}</div>
+    <div class="heatmap-body">
+      <div class="weekday-labels"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div>
+      <div class="heatmap-grid" style="grid-template-columns:repeat({total_weeks}, 12px)">{''.join(cells)}</div>
+    </div>
+  </div>
+  <div class="heatmap-footer">
+    <span>Worst daily status · {max(1, retention_days)} day retention · {esc(display_timezone)}</span>
+    <span class="legend"><span>None</span><span class="heat-cell none"></span><span class="heat-cell up"></span><span class="heat-cell unknown"></span><span class="heat-cell degraded"></span><span class="heat-cell down"></span><span>Down</span></span>
+  </div>
+</div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -3313,29 +3938,58 @@ linear-gradient(180deg, var(--bg) 0%, var(--bg-alt) 100%);color:var(--text);min-
 .hero{{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;margin-bottom:20px}}
 h1{{font-family:"Space Grotesk","IBM Plex Sans",sans-serif;font-size:clamp(2rem,4vw,3rem);line-height:1.02;font-weight:700;letter-spacing:-.04em;margin-bottom:8px}}
 .sub{{color:var(--muted);line-height:1.65;max-width:64ch}}
+.history-meta{{margin-top:10px;color:var(--soft);font-size:.82rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .hero-actions{{display:flex;gap:10px;flex-wrap:wrap}}
 .ghost-link{{display:inline-flex;align-items:center;justify-content:center;padding:11px 14px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.5);color:var(--text);text-decoration:none;font-weight:700}}
+.ghost-link.compact{{padding:8px 12px;font-size:.82rem}}
 .panel{{background:var(--hero);border:1px solid var(--hero-border);border-radius:14px;padding:18px 18px 16px;box-shadow:var(--shadow);margin-bottom:16px;backdrop-filter:blur(14px)}}
 .filters{{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end}}
 label{{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}}
 select{{width:100%;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;color:var(--text);font-size:.92rem}}
 .filter-btn{{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:12px;border:1px solid var(--border);background:var(--text);color:var(--card);text-decoration:none;font-weight:700}}
 .summary{{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:.92rem}}
-table{{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}}
-th{{background:rgba(148,163,184,.08);color:var(--soft);font-size:.75rem;text-transform:uppercase;letter-spacing:.14em;padding:12px 14px;text-align:left;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
-td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertical-align:top}}
 .pill{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:12px;font-size:.72rem;font-weight:600;border:1px solid var(--border);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .pill.up{{background:#f0fdf4;color:#166534;border-color:#bbf7d0}}
 .pill.down{{background:#fef2f2;color:#b91c1c;border-color:#fecaca}}
 .pill.degraded{{background:#fffbeb;color:#b45309;border-color:#fde68a}}
 .pill.unknown{{background:#f8fafc;color:#64748b}}
-.empty-cell{{text-align:center;color:var(--soft);padding:28px}}
+.heatmap-shell{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow);margin-top:18px}}
+.heatmap-head{{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}}
+.heatmap-title{{font-weight:700;color:var(--text)}}
+.heatmap-count{{color:var(--muted);font-size:.78rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.heatmap-scroll{{overflow-x:auto;padding-bottom:2px}}
+.heatmap-months{{display:grid;grid-auto-flow:column;grid-auto-columns:12px;gap:3px;margin-left:36px;margin-bottom:6px;color:var(--muted);font-size:.74rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace;min-width:max-content}}
+.heatmap-body{{display:flex;gap:8px;align-items:flex-start;min-width:max-content}}
+.weekday-labels{{display:grid;grid-template-rows:repeat(7,12px);gap:3px;width:28px;color:var(--muted);font-size:.7rem;line-height:12px;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.heatmap-grid{{display:grid;grid-template-rows:repeat(7,12px);grid-auto-flow:column;grid-auto-columns:12px;gap:3px}}
+.heat-cell{{width:12px;height:12px;border-radius:3px;border:1px solid rgba(148,163,184,.13);display:inline-block;text-decoration:none}}
+.heat-cell.none{{background:#e2e8f0}}.heat-cell.empty{{background:transparent;border-color:transparent}}
+.heat-cell.up{{background:#22c55e}}.heat-cell.unknown{{background:#94a3b8}}.heat-cell.degraded{{background:#f59e0b}}.heat-cell.down{{background:#ef4444}}
+.heat-cell.selected{{outline:2px solid var(--text);outline-offset:1px}}
+.theme-midnight .heat-cell.none{{background:#111827}}
+.heatmap-footer{{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:12px;color:var(--muted);font-size:.76rem;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.legend{{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}}
+.day-detail{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:var(--shadow);margin-top:16px}}
+.day-detail-head{{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:14px}}
+.day-detail h2{{font-size:1.1rem;margin-bottom:4px;font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
+.day-detail p,.day-host-meta{{color:var(--muted);font-size:.84rem;line-height:1.55}}
+.day-hosts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}}
+.day-host{{border:1px solid var(--border);border-radius:12px;padding:12px;background:color-mix(in srgb, var(--card) 92%, var(--bg))}}
+.day-host-head{{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px}}
+.day-error{{margin-top:8px;color:#b91c1c;font-size:.78rem;line-height:1.45;font-family:"IBM Plex Mono","SFMono-Regular",monospace;word-break:break-word}}
+.day-empty{{color:var(--muted);padding:10px}}
 @media (max-width: 900px) {{
   .filters{{grid-template-columns:1fr}}
   .hero{{flex-direction:column;align-items:flex-start}}
   .hero-actions{{width:100%}}
   .ghost-link,.filter-btn{{width:100%}}
-  .table-wrap{{overflow-x:auto}}
+}}
+@media (max-width: 520px) {{
+  .wrap{{padding:36px 14px 56px}}
+  .panel{{padding:14px}}
+  .heatmap-shell{{padding:14px}}
+  .heatmap-footer{{align-items:flex-start;flex-direction:column}}
+  .heatmap-head,.day-detail-head{{align-items:flex-start;flex-direction:column}}
 }}
 </style></head><body class="theme-{theme_class}">
 <div class="wrap">
@@ -3343,7 +3997,8 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
   <div class="hero">
     <div>
       <h1>Check History</h1>
-      <p class="sub">Browse recent public checks across services. Use filters to narrow the timeline without crowding the main status page.</p>
+      <p class="sub">Daily summaries across public services. Click a day to expand what happened per host.</p>
+      <div class="history-meta">{hero_meta}</div>
     </div>
     <div class="hero-actions"><a class="ghost-link" href="/status">Back to status</a></div>
   </div>
@@ -3356,17 +4011,14 @@ td{{padding:13px 14px;border-top:1px solid var(--border);font-size:.87rem;vertic
       <label for="status">Status</label>
       <select id="status" name="status">{''.join(status_options)}</select>
     </div>
+    <div>
+      <label for="region">Region</label>
+      <select id="region" name="region">{''.join(region_options)}</select>
+    </div>
     <button class="filter-btn" type="submit">Apply filters</button>
   </form>
-  <div class="panel summary">
-    <span>Showing <strong>{len(rows)}</strong> recent checks</span>
-  </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Host</th><th>Status</th><th>Latency</th><th>HTTP</th><th>Checked</th><th>Detail</th></tr></thead>
-      <tbody>{row_markup}</tbody>
-    </table>
-  </div>
+  {heatmap_markup}
+  {detail_markup}
 </div></body></html>"""
 
 
@@ -3533,6 +4185,18 @@ input:focus,select:focus,textarea:focus{{outline:none;border-color:var(--sky);bo
 .toast.hidden{{opacity:0;pointer-events:none}}
 .cost-row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line-soft);font-size:.875rem}}
 .cost-row:last-child{{border:none;font-weight:700;color:#67e8f9;font-size:1rem}}
+.usage-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px}}
+.usage-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
+.usage-card .label{{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.usage-card .value{{font-size:1.25rem;font-weight:800;color:#f8fafc;margin-top:8px}}
+.usage-card .meta{{font-size:.76rem;color:var(--soft);margin-top:5px;line-height:1.45}}
+.cost-breakdown-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
+.cost-meter{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
+.cost-meter-title{{font-weight:800;color:#f8fafc;margin-bottom:8px}}
+.section-summary{{display:flex;justify-content:space-between;align-items:center;gap:12px;list-style:none}}
+.section-summary::-webkit-details-marker{{display:none}}
+.section-summary-title{{font-size:.8rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#f8fafc;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.section-summary-meta{{font-size:.78rem;color:var(--soft)}}
 pre{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px;font-size:.78rem;overflow-x:auto;line-height:1.6;color:#b9d8ff;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
 .tip{{background:linear-gradient(135deg, rgba(15,118,110,.12), rgba(14,165,233,.1));border:1px solid rgba(14,165,233,.22);padding:12px 14px;border-radius:16px;font-size:.83rem;color:#c7efff;margin:12px 0;line-height:1.55}}
 p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;max-width:72ch}}
@@ -3569,6 +4233,16 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .probe-region-pill-name{{font-size:.86rem;font-weight:700;color:#e5eef8}}
 .probe-region-pill-meta{{font-size:.74rem;color:var(--soft);margin-top:2px}}
 .coverage-grid{{display:flex;flex-direction:column;gap:10px}}
+.coverage-toolbar{{display:grid;grid-template-columns:minmax(180px,1fr) 170px;gap:10px;margin-bottom:12px}}
+.coverage-table{{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:18px;overflow:hidden;background:#0e1828}}
+.coverage-row{{display:grid;grid-template-columns:minmax(140px,1.1fr) 140px minmax(160px,1.4fr) minmax(120px,.9fr);gap:12px;align-items:center;padding:11px 13px;border-top:1px solid var(--line-soft);cursor:pointer}}
+.coverage-row:first-child{{border-top:none}}
+.coverage-row:hover{{background:#111c2d}}
+.coverage-row.selected{{background:linear-gradient(90deg, rgba(14,165,233,.14), rgba(15,118,110,.08));box-shadow:inset 3px 0 0 var(--sky)}}
+.coverage-host{{font-weight:700;color:#f8fafc;font-size:.88rem}}
+.coverage-meta{{font-size:.74rem;color:var(--soft);margin-top:3px}}
+.coverage-routes{{display:flex;flex-wrap:wrap;gap:6px}}
+.coverage-empty{{padding:16px;color:var(--soft);font-size:.82rem}}
 .coverage-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:12px 14px}}
 .coverage-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}}
 .coverage-title{{font-size:.92rem;font-weight:700;color:#f8fafc}}
@@ -3582,6 +4256,25 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .coverage-pill.warn{{border-color:rgba(245,158,11,.3);background:rgba(120,53,15,.18);color:#fde68a}}
 .coverage-pill.off{{opacity:.68}}
 .coverage-pill.meta{{border-style:dashed;color:var(--soft)}}
+.host-row{{cursor:pointer}}
+.host-row:hover{{background:#111c2d}}
+.host-row.selected{{background:linear-gradient(90deg, rgba(14,165,233,.14), rgba(15,118,110,.08));box-shadow:inset 3px 0 0 var(--sky)}}
+.host-detail-panel{{display:none;margin-top:16px}}
+.host-detail-panel.open{{display:block}}
+.host-detail-head{{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:14px}}
+.host-detail-title{{font-size:1rem;font-weight:800;color:#f8fafc;font-family:"Space Grotesk","IBM Plex Sans",sans-serif}}
+.host-detail-meta{{font-size:.78rem;color:var(--soft);margin-top:4px;word-break:break-word}}
+.host-detail-grid{{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}}
+.activity-list{{display:flex;flex-direction:column;gap:8px}}
+.activity-item{{display:grid;grid-template-columns:84px minmax(0,1fr) auto;gap:10px;align-items:start;background:#0e1828;border:1px solid var(--line-soft);border-radius:16px;padding:10px 12px}}
+.activity-time{{font-size:.72rem;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.activity-title{{font-weight:700;color:#f8fafc;font-size:.86rem}}
+.activity-meta{{font-size:.76rem;color:var(--soft);margin-top:3px;line-height:1.45}}
+.activity-empty{{background:#0e1828;border:1px solid var(--line-soft);border-radius:16px;padding:16px;color:var(--soft);font-size:.82rem}}
+.route-mini{{display:flex;flex-direction:column;gap:8px}}
+.route-mini-row{{display:flex;justify-content:space-between;gap:10px;align-items:center;background:#0e1828;border:1px solid var(--line-soft);border-radius:16px;padding:10px 12px}}
+.route-mini-name{{font-weight:700;color:#f8fafc;font-size:.84rem}}
+.route-mini-reason{{font-size:.74rem;color:var(--soft);margin-top:2px}}
 .diag-kv{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
 .diag-kv-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
 .diag-kv-card .label{{font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
@@ -3595,6 +4288,9 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .badge.warn{{background:#713f12;color:#fde68a}}
 .badge.info{{background:#16314b;color:#93c5fd}}
 .spinner{{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}}
+.loading-state{{display:flex;align-items:center;gap:10px;min-height:120px;padding:18px;border:1px dashed var(--line);border-radius:18px;background:#0e1828;color:var(--soft);font-size:.86rem}}
+.loading-state.large{{min-height:260px;align-items:flex-start;padding-top:22px}}
+.loading-state.table{{min-height:180px;justify-content:center}}
 .auth-gate{{position:fixed;inset:0;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;z-index:250;padding:20px}}
 .auth-card{{width:100%;max-width:440px;background:linear-gradient(180deg, rgba(23,34,53,.98), rgba(11,18,32,.98));border:1px solid var(--line);border-radius:28px;padding:30px;box-shadow:0 28px 70px rgba(0,0,0,.42)}}
 .auth-card h1{{font-size:1.45rem;margin-bottom:10px;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.03em}}
@@ -3608,6 +4304,12 @@ strong{{color:#f8fafc}}
   nav{{overflow-x:auto}}
   .main{{padding-top:24px}}
   .doc-hero,.doc-grid,.doc-columns{{grid-template-columns:1fr}}
+  .coverage-toolbar{{grid-template-columns:1fr}}
+  .coverage-row{{grid-template-columns:1fr;gap:8px;align-items:start}}
+  .host-detail-head{{flex-direction:column}}
+  .host-detail-grid{{grid-template-columns:1fr}}
+  .activity-item{{grid-template-columns:1fr;gap:7px}}
+  .cost-breakdown-grid{{grid-template-columns:1fr}}
 }}
 @media (max-width: 760px) {{
   .grid2{{grid-template-columns:1fr}}
@@ -3669,12 +4371,25 @@ strong{{color:#f8fafc}}
       <tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">Loading…</td></tr>
     </tbody>
   </table>
+  <div class="panel host-detail-panel" id="host-detail-panel">
+    <div id="host-detail-content"><span class="spinner"></span> Loading host activity…</div>
+  </div>
   <div class="panel" style="margin-top:18px">
     <div class="section-header" style="margin-bottom:10px">
       <div>
         <h3 style="margin:0">Probe Routing</h3>
-        <div class="hint">See where each host can run right now, and why a probe would skip it.</div>
+        <div class="hint">Grouped by host route health. Use filters when the fleet gets larger.</div>
       </div>
+    </div>
+    <div class="coverage-toolbar">
+      <input id="route-filter-text" placeholder="Filter hosts or probes" oninput="renderHostCoverage()">
+      <select id="route-filter-mode" onchange="renderHostCoverage()">
+        <option value="all">All routes</option>
+        <option value="issues">Needs attention</option>
+        <option value="active">Has active route</option>
+        <option value="selected">Selected probes only</option>
+        <option value="disabled">Disabled hosts</option>
+      </select>
     </div>
     <div id="host-coverage" style="color:#94a3b8">Loading host coverage…</div>
   </div>
@@ -4163,41 +4878,62 @@ strong{{color:#f8fafc}}
       <label>Default Timeout (seconds)</label>
       <input id="s-timeout" type="number" min="1" max="60">
     </div>
+    <div class="form-group">
+      <label>Display Timezone</label>
+      <input id="s-timezone" placeholder="UTC, Asia/Jerusalem, America/New_York">
+      <div class="hint">Used for public history day grouping and operator-facing timestamps that are not browser-local.</div>
+    </div>
     <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
   </div>
 </div>
 
 <div id="pane-cost" style="display:none">
-  <h2>Cost Estimator</h2>
+  <h2>Usage & Cost</h2>
   <p class="desc">
-    Defaults are filled from your live deployment: enabled hosts, active probes, default interval, and retention.
+    Current assets, Lambda calls, DynamoDB rows, log storage, and SNS alert publishes, with monthly usage and cost projections.
   </p>
-  <div class="panel grid2" style="margin-bottom:16px">
-    <div class="form-group"><label>Hosts</label><input id="c-hosts" type="number" value="0" min="0"></div>
-    <div class="form-group"><label>Monitor Regions</label><input id="c-regions" type="number" value="0" min="0"></div>
-    <div class="form-group"><label>Check Interval (sec)</label><input id="c-interval" type="number" value="60" min="60"></div>
-    <div class="form-group"><label>Retention (days)</label><input id="c-days" type="number" value="90"></div>
-    <div class="form-group">
-      <label>CloudFront Plan</label>
-      <select id="c-cloudfront-plan">
-        <option value="payg">Pay as you go (not estimated)</option>
-        <option value="free">Free plan ($0/mo)</option>
-        <option value="pro">Pro plan ($15/mo)</option>
-        <option value="business">Business plan ($200/mo)</option>
-        <option value="premium">Premium plan ($1000/mo)</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label>Cognito Admin MAUs / Month</label>
-      <input id="c-cognito-mau" type="number" value="0" min="0">
-      <div class="hint">Only used when Cognito is deployed. This estimates monthly active admin users, not total user accounts.</div>
-    </div>
-  </div>
-  <button class="btn btn-primary" onclick="calcCost()" style="margin-bottom:20px">Calculate</button>
   <div class="panel" id="cost-result" style="display:none">
     <div id="cost-summary" class="hint" style="margin-bottom:14px"></div>
-    <div id="cost-rows"></div>
+    <div id="usage-cards"></div>
+    <div class="cost-breakdown-grid">
+      <div class="cost-meter">
+        <div class="cost-meter-title">Monthly Cost Estimate</div>
+        <div id="usage-cost-rows"></div>
+      </div>
+      <div class="cost-meter">
+        <div class="cost-meter-title">Planning Estimate</div>
+        <div id="cost-rows"></div>
+      </div>
+    </div>
   </div>
+  <details class="panel" style="margin-top:16px">
+    <summary class="section-summary" style="cursor:pointer">
+      <span class="section-summary-title">Planning inputs</span>
+      <span class="section-summary-meta">Override counts for edge cases</span>
+    </summary>
+    <div class="grid2" style="margin-top:16px">
+      <div class="form-group"><label>Hosts</label><input id="c-hosts" type="number" value="0" min="0"></div>
+      <div class="form-group"><label>Monitor Regions</label><input id="c-regions" type="number" value="0" min="0"></div>
+      <div class="form-group"><label>Check Interval (sec)</label><input id="c-interval" type="number" value="60" min="60"></div>
+      <div class="form-group"><label>Retention (days)</label><input id="c-days" type="number" value="90"></div>
+      <div class="form-group">
+        <label>CloudFront Plan</label>
+        <select id="c-cloudfront-plan">
+          <option value="payg">Pay as you go (not estimated)</option>
+          <option value="free">Free plan ($0/mo)</option>
+          <option value="pro">Pro plan ($15/mo)</option>
+          <option value="business">Business plan ($200/mo)</option>
+          <option value="premium">Premium plan ($1000/mo)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Cognito Admin MAUs / Month</label>
+        <input id="c-cognito-mau" type="number" value="0" min="0">
+        <div class="hint">Only used when Cognito is deployed. This estimates monthly active admin users, not total user accounts.</div>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="calcCost()">Recalculate Planning Estimate</button>
+  </details>
 </div>
 
 <div id="pane-guides" style="display:none">
@@ -4473,6 +5209,7 @@ let ACCOUNT_CACHE = null;
 const queryKey = new URLSearchParams(location.search).get('key') || '';
 let REGIONS_CACHE = [];
 let HOSTS_CACHE = [];
+let SELECTED_HOST_ID = '';
 const RECOMMENDED_MONITOR_TIERS = {json.dumps(RECOMMENDED_MONITOR_TIERS)};
 const CLOUDFRONT_PLAN_COSTS = {json.dumps(_CLOUDFRONT_PLAN_COSTS)};
 if (queryKey) {{
@@ -4516,6 +5253,11 @@ document.addEventListener('click', event => {{
     const hostId = deleteBtn.dataset.hostId || '';
     const host = HOSTS_CACHE.find(item => item.host_id === hostId);
     deleteHost(hostId, hostDisplayName(host || {{host_id: hostId}}));
+    return;
+  }}
+  const hostRow = event.target.closest('.host-row');
+  if (hostRow) {{
+    selectHost(hostRow.dataset.hostId || '');
   }}
 }});
 
@@ -4524,6 +5266,10 @@ function toast(msg, err=false) {{
   t.textContent = msg;
   t.className = 'toast' + (err ? ' error' : '');
   setTimeout(() => t.className = 'toast hidden', 3500);
+}}
+
+function loadingMarkup(message='Fetching data…', size='') {{
+  return `<div class="loading-state ${{size}}"><span class="spinner"></span><span>${{escapeHtml(message)}}</span></div>`;
 }}
 
 function showAuthGate(message='') {{
@@ -5013,47 +5759,60 @@ function renderHostCoverage() {{
     wrap.innerHTML = '<div class="hint">Deploy at least one probe region to see coverage.</div>';
     return;
   }}
-  wrap.innerHTML = `<div class="coverage-grid">${{HOSTS_CACHE.map(host => {{
+  const textFilter = (document.getElementById('route-filter-text')?.value || '').trim().toLowerCase();
+  const modeFilter = document.getElementById('route-filter-mode')?.value || 'all';
+  const rows = HOSTS_CACHE.map(host => {{
     const coverage = computeHostProbeCoverage(host);
-    const eligibleHtml = coverage.eligible.length
-      ? coverage.eligible.map(region => `<span class="coverage-pill ok">${{region.region}}</span>`).join('')
-      : '<span class="coverage-pill warn">No active route</span>';
-    const blockedHtml = coverage.blocked.length
-      ? coverage.blocked.map(region => `<span class="coverage-pill off" title="${{region.reason}}">${{region.region}} · ${{region.reason}}</span>`).join('')
-      : '';
-    const scopeBits = [];
-    if (host.enabled === false) scopeBits.push('Disabled');
-    scopeBits.push(formatTierLabel(coverage.tier));
-    if (host.target_regions && host.target_regions.length) {{
-      scopeBits.push(`${{host.target_regions.length}} selected probe${{host.target_regions.length === 1 ? '' : 's'}}`);
-    }} else {{
-      scopeBits.push('All probes');
-    }}
-    const routeBadge = host.enabled === false
+    const routeLabel = host.enabled === false
       ? 'disabled'
       : coverage.eligible.length
         ? `${{coverage.eligible.length}} route${{coverage.eligible.length === 1 ? '' : 's'}}`
         : 'blocked';
-    const badgeTone = host.enabled === false ? 'inactive' : coverage.eligible.length ? 'active' : 'warn';
-    const blockedSection = blockedHtml
-      ? `<div class="coverage-line"><div class="coverage-label">Skipped</div><div class="coverage-pills">${{blockedHtml}}</div></div>`
-      : '';
+    const tone = host.enabled === false ? 'inactive' : coverage.eligible.length ? 'active' : 'warn';
+    const searchHaystack = [
+      hostDisplayName(host),
+      host.url,
+      host.target_regions?.join(' '),
+      coverage.regions.map(region => `${{region.region}} ${{region.reason}}`).join(' ')
+    ].join(' ').toLowerCase();
+    return {{host, coverage, routeLabel, tone, searchHaystack}};
+  }}).filter(item => {{
+    if (textFilter && !item.searchHaystack.includes(textFilter)) return false;
+    if (modeFilter === 'issues') return item.host.enabled === false || !item.coverage.eligible.length || item.coverage.blocked.length;
+    if (modeFilter === 'active') return item.host.enabled !== false && item.coverage.eligible.length;
+    if (modeFilter === 'selected') return item.host.target_regions && item.host.target_regions.length;
+    if (modeFilter === 'disabled') return item.host.enabled === false;
+    return true;
+  }});
+  if (!rows.length) {{
+    wrap.innerHTML = '<div class="coverage-empty">No routes matched the current filters.</div>';
+    return;
+  }}
+  wrap.innerHTML = `<div class="coverage-table">${{rows.map(item => {{
+    const host = item.host;
+    const coverage = item.coverage;
+    const hostId = escapeHtml(host.host_id || '');
+    const scopeLabel = host.enabled === false
+      ? 'Disabled'
+      : host.target_regions?.length
+        ? `${{host.target_regions.length}} selected`
+        : 'All probes';
+    const activeHtml = coverage.eligible.length
+      ? coverage.eligible.map(region => `<span class="coverage-pill ok">${{escapeHtml(region.region)}}</span>`).join('')
+      : '<span class="coverage-pill warn">No active route</span>';
+    const skippedHtml = coverage.blocked.length
+      ? coverage.blocked.slice(0, 3).map(region => `<span class="coverage-pill off" title="${{escapeHtml(region.reason)}}">${{escapeHtml(region.region)}}</span>`).join('')
+      : '<span class="coverage-pill meta">None</span>';
+    const moreSkipped = coverage.blocked.length > 3 ? `<span class="coverage-pill meta">+${{coverage.blocked.length - 3}}</span>` : '';
     return `
-      <div class="coverage-card">
-        <div class="coverage-head">
-          <div>
-            <div class="coverage-title">${{escapeHtml(hostDisplayName(host))}}</div>
-            <div class="coverage-subtitle">${{scopeBits.join(' · ')}}</div>
-          </div>
-          <span class="badge ${{badgeTone}}">${{routeBadge}}</span>
+      <div class="coverage-row ${{host.host_id === SELECTED_HOST_ID ? 'selected' : ''}}" data-host-id="${{hostId}}" onclick="selectHost('${{hostId}}')">
+        <div>
+          <div class="coverage-host">${{escapeHtml(hostDisplayName(host))}}</div>
+          <div class="coverage-meta">${{formatTierLabel(coverage.tier)}}</div>
         </div>
-        <div class="coverage-lines">
-          <div class="coverage-line">
-            <div class="coverage-label">Runs From</div>
-            <div class="coverage-pills">${{eligibleHtml}}</div>
-          </div>
-          ${{blockedSection}}
-        </div>
+        <span class="badge ${{item.tone}}">${{item.routeLabel}}</span>
+        <div class="coverage-routes">${{activeHtml}}</div>
+        <div class="coverage-routes" title="Skipped probes">${{skippedHtml}}${{moreSkipped}}</div>
       </div>
     `;
   }}).join('')}}</div>`;
@@ -5067,9 +5826,11 @@ async function loadHosts() {{
     return;
   }}
   HOSTS_CACHE = Array.isArray(hosts) ? hosts.map(normalizeHostForUi) : [];
+  if (SELECTED_HOST_ID && !HOSTS_CACHE.some(host => host.host_id === SELECTED_HOST_ID)) SELECTED_HOST_ID = '';
   const tbody = document.getElementById('hosts-body');
   if (!HOSTS_CACHE.length) {{
     tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#64748b;padding:32px">No hosts yet.</td></tr>';
+    renderHostDetail();
     renderHostCoverage();
     return;
   }}
@@ -5078,7 +5839,7 @@ async function loadHosts() {{
     const safeName = escapeHtml(displayName);
     const hostId = escapeHtml(h.host_id || '');
     return `
-    <tr>
+    <tr class="host-row ${{h.host_id === SELECTED_HOST_ID ? 'selected' : ''}}" data-host-id="${{hostId}}">
       <td style="font-weight:600">${{safeName}}</td>
       <td style="color:#64748b;font-size:.8rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{escapeHtml(h.url)}}">${{escapeHtml(h.url || '—')}}</td>
       <td><span class="badge ${{escapeHtml(h.check_type||'http')}}">${{escapeHtml(h.check_type||'http')}}</span></td>
@@ -5095,7 +5856,120 @@ async function loadHosts() {{
       </div></td>
     </tr>`;
   }}).join('');
+  renderHostDetail();
   renderHostCoverage();
+}}
+
+function selectHost(hostId) {{
+  if (!hostId) return;
+  SELECTED_HOST_ID = SELECTED_HOST_ID === hostId ? '' : hostId;
+  document.querySelectorAll('.host-row').forEach(row => row.classList.toggle('selected', row.dataset.hostId === SELECTED_HOST_ID));
+  renderHostCoverage();
+  renderHostDetail();
+}}
+
+function closeHostDetail() {{
+  SELECTED_HOST_ID = '';
+  document.querySelectorAll('.host-row').forEach(row => row.classList.remove('selected'));
+  renderHostCoverage();
+  renderHostDetail();
+}}
+
+function renderHostDetail() {{
+  const panel = document.getElementById('host-detail-panel');
+  const content = document.getElementById('host-detail-content');
+  if (!panel || !content) return;
+  if (!SELECTED_HOST_ID) {{
+    panel.classList.remove('open');
+    content.innerHTML = '';
+    return;
+  }}
+  const host = HOSTS_CACHE.find(item => item.host_id === SELECTED_HOST_ID);
+  if (!host) {{
+    panel.classList.remove('open');
+    content.innerHTML = '';
+    return;
+  }}
+  panel.classList.add('open');
+  content.innerHTML = '<span class="spinner"></span> Loading host activity…';
+  loadHostActivity(SELECTED_HOST_ID);
+}}
+
+function renderRouteMini(host) {{
+  const coverage = computeHostProbeCoverage(host);
+  if (!REGIONS_CACHE.length) return '<div class="activity-empty">No probes are deployed yet.</div>';
+  return `<div class="route-mini">${{coverage.regions.map(region => `
+    <div class="route-mini-row">
+      <div>
+        <div class="route-mini-name">${{escapeHtml(region.region)}}</div>
+        <div class="route-mini-reason">${{escapeHtml(region.reason)}}</div>
+      </div>
+      <span class="badge ${{region.eligible ? 'active' : 'inactive'}}">${{region.eligible ? 'runs' : 'skips'}}</span>
+    </div>
+  `).join('')}}</div>`;
+}}
+
+function renderHostActivity(data, requestedHostId) {{
+  if (requestedHostId !== SELECTED_HOST_ID) return;
+  const content = document.getElementById('host-detail-content');
+  if (!content) return;
+  if (data.error) {{
+    content.innerHTML = `<div class="activity-empty">${{escapeHtml(data.error)}}</div>`;
+    return;
+  }}
+  const host = normalizeHostForUi(data.host || HOSTS_CACHE.find(item => item.host_id === requestedHostId) || {{host_id: requestedHostId}});
+  const checks = Array.isArray(data.checks) ? data.checks : [];
+  const audits = Array.isArray(data.audit) ? data.audit : [];
+  const checksHtml = checks.length ? checks.slice(0, 8).map(row => `
+    <div class="activity-item">
+      <div class="activity-time">${{escapeHtml(formatLogTime(row.checked_at))}}</div>
+      <div>
+        <div class="activity-title">${{escapeHtml(row.region || 'unknown region')}}</div>
+        <div class="activity-meta">Latency ${{row.latency_ms != null ? row.latency_ms + ' ms' : '—'}} · HTTP ${{row.status_code != null ? row.status_code : '—'}}${{row.error ? ' · ' + escapeHtml(String(row.error).slice(0, 90)) : ''}}</div>
+      </div>
+      <span class="badge ${{escapeHtml(row.status || 'unknown')}}">${{escapeHtml(row.status || 'unknown')}}</span>
+    </div>
+  `).join('') : '<div class="activity-empty">No checks recorded for this host yet.</div>';
+  const auditHtml = audits.length ? audits.slice(0, 8).map(row => `
+    <div class="activity-item">
+      <div class="activity-time">${{escapeHtml(formatLogTime(row.created_at))}}</div>
+      <div>
+        <div class="activity-title">${{escapeHtml(row.event_type || row.action || 'audit')}}</div>
+        <div class="activity-meta">${{escapeHtml([row.host_name, row.action, row.updated_fields && row.updated_fields.length ? 'Updated ' + row.updated_fields.join(', ') : '', row.error].filter(Boolean).join(' · ') || 'Host audit event')}}</div>
+      </div>
+      <span class="badge ${{row.status === 'error' ? 'error' : 'active'}}">${{escapeHtml(row.status || 'ok')}}</span>
+    </div>
+  `).join('') : '<div class="activity-empty">No host-specific audit events yet.</div>';
+  content.innerHTML = `
+    <div class="host-detail-head">
+      <div>
+        <div class="host-detail-title">${{escapeHtml(hostDisplayName(host))}}</div>
+        <div class="host-detail-meta">${{escapeHtml(host.url || 'No URL')}} · ${{escapeHtml(formatTierLabel(hostTierSeconds(host)))}} · ${{escapeHtml(describeHostScope(host))}}</div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-ghost btn-sm host-edit-btn" type="button" data-host-id="${{escapeHtml(host.host_id)}}">Edit</button>
+        <button class="btn btn-ghost btn-sm host-check-btn" type="button" data-host-id="${{escapeHtml(host.host_id)}}">Check</button>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="closeHostDetail()">Close</button>
+      </div>
+    </div>
+    <div class="host-detail-grid">
+      <div>
+        <h3 style="margin-top:0">Recent Checks</h3>
+        <div class="activity-list">${{checksHtml}}</div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Routing</h3>
+        ${{renderRouteMini(host)}}
+        <h3>Recent Audits</h3>
+        <div class="activity-list">${{auditHtml}}</div>
+      </div>
+    </div>
+  `;
+}}
+
+async function loadHostActivity(hostId) {{
+  const data = await api('/api/hosts/'+encodeURIComponent(hostId)+'/activity?limit=30');
+  renderHostActivity(data, hostId);
 }}
 
 function renderSslCell(host) {{
@@ -5273,13 +6147,14 @@ async function deleteHost(id, name) {{
 }}
 
 async function loadRegions() {{
+  const el = document.getElementById('regions-list');
+  if (el) el.innerHTML = loadingMarkup('Fetching probe regions…');
   const list = await api('/api/regions');
   if (list.unauthorized) {{
     showAuthGate('Enter the admin token to load probes.');
     return;
   }}
   REGIONS_CACHE = Array.isArray(list) ? list : [];
-  const el = document.getElementById('regions-list');
   if (!REGIONS_CACHE.length) {{
     el.innerHTML = '<div style="color:#64748b;padding:20px 0">No probes deployed yet.</div>';
     return;
@@ -5413,6 +6288,8 @@ function refreshMaintenanceEditorState() {{
 }}
 
 async function loadStatusPage() {{
+  const tbody = document.getElementById('status-page-hosts');
+  if (tbody) tbody.innerHTML = `<tr><td colspan="4">${{loadingMarkup('Fetching status page settings and hosts…', 'table')}}</td></tr>`;
   const [settings, hosts] = await Promise.all([api('/api/settings'), api('/api/hosts')]);
   if (settings.unauthorized || hosts.unauthorized) {{
     showAuthGate('Enter the admin token to load status-page settings.');
@@ -5436,7 +6313,6 @@ async function loadStatusPage() {{
   document.getElementById('cd-domain').value = settings.custom_domain_name || '';
   refreshMaintenanceEditorState();
   refreshCustomDomain();
-  const tbody = document.getElementById('status-page-hosts');
   if (!Array.isArray(hosts) || !hosts.length) {{
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b;padding:24px">No hosts yet.</td></tr>';
     return;
@@ -5577,6 +6453,10 @@ async function destroyCustomDomain() {{
 }}
 
 async function loadNotificationSettings() {{
+  ['n-topic-arn','n-sender-label','n-delay','n-reminder','n-ttl','n-quiet-timezone','n-quiet-start','n-quiet-end','n-sleep-until'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (el) el.disabled = true;
+  }});
   const s = await api('/api/settings');
   if (s.unauthorized) {{
     showAuthGate('Enter the admin token to load notification settings.');
@@ -5593,6 +6473,10 @@ async function loadNotificationSettings() {{
   document.getElementById('n-quiet-end').value = s.notifications_quiet_hours_end || '';
   document.getElementById('n-sleep-until').value = s.notifications_sleep_until || '';
   document.getElementById('n-maintenance-mute').checked = s.notifications_mute_during_maintenance !== false;
+  ['n-topic-arn','n-sender-label','n-delay','n-reminder','n-ttl','n-quiet-timezone','n-quiet-start','n-quiet-end','n-sleep-until'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (el) el.disabled = false;
+  }});
 }}
 
 async function saveNotificationSettings() {{
@@ -5709,6 +6593,8 @@ function renderManagementSummary(data) {{
 }}
 
 async function loadManagement() {{
+  const el = document.getElementById('mgmt-summary');
+  if (el) el.innerHTML = loadingMarkup('Fetching management summary, Lambda metrics, and table counts…', 'large');
   const data = await api('/api/management');
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to load management data.');
@@ -5995,9 +6881,9 @@ async function loadDynamoData() {{
   const summaryEl = document.getElementById('ddb-summary');
   const hostsEl = document.getElementById('ddb-hosts');
   const checksEl = document.getElementById('ddb-checks');
-  summaryEl.innerHTML = '<span class="spinner"></span> Loading DynamoDB summary…';
-  hostsEl.innerHTML = '<span class="spinner"></span> Loading hosts table…';
-  checksEl.innerHTML = '<span class="spinner"></span> Loading checks table…';
+  summaryEl.innerHTML = loadingMarkup('Fetching DynamoDB summary…', 'large');
+  hostsEl.innerHTML = loadingMarkup('Fetching hosts table snapshot…');
+  checksEl.innerHTML = loadingMarkup('Fetching checks/audit rows…');
   const qs = new URLSearchParams({{checks_limit: checksLimit, view, region}});
   if (hostId) qs.set('host_id', hostId);
   const data = await api('/api/dynamodb?'+qs.toString());
@@ -6042,9 +6928,9 @@ async function loadLogs() {{
   const summaryEl = document.getElementById('logs-summary');
   const issuesEl = document.getElementById('logs-issues');
   const entriesEl = document.getElementById('logs-entries');
-  summaryEl.innerHTML = '<span class="spinner"></span> Loading log summary…';
-  issuesEl.innerHTML = '<span class="spinner"></span> Looking for likely issues…';
-  entriesEl.innerHTML = '<span class="spinner"></span> Loading entries…';
+  summaryEl.innerHTML = loadingMarkup('Fetching CloudWatch log summary…', 'large');
+  issuesEl.innerHTML = loadingMarkup('Scanning logs for likely issues…');
+  entriesEl.innerHTML = loadingMarkup('Fetching recent log entries…');
   const qs = new URLSearchParams({{scope, limit, hours}});
   if (scope === 'worker' && region) qs.set('region', region);
   const data = await api('/api/logs?'+qs.toString());
@@ -6135,6 +7021,7 @@ async function loadSettings() {{
   document.getElementById('s-retention').value = s.retention_days || 90;
   document.getElementById('s-interval').value = s.default_check_interval || 60;
   document.getElementById('s-timeout').value = s.default_timeout || 10;
+  document.getElementById('s-timezone').value = s.display_timezone || 'UTC';
 }}
 
 async function saveSettings() {{
@@ -6142,6 +7029,7 @@ async function saveSettings() {{
     retention_days: +document.getElementById('s-retention').value,
     default_check_interval: +document.getElementById('s-interval').value,
     default_timeout: +document.getElementById('s-timeout').value,
+    display_timezone: document.getElementById('s-timezone').value.trim() || 'UTC',
   }};
   const res = await api('/api/settings', {{method:'PUT', body:JSON.stringify(body)}});
   if (res.error) {{ toast(res.error, true); return; }}
@@ -6149,6 +7037,14 @@ async function saveSettings() {{
 }}
 
 async function loadCostDefaults() {{
+  const el = document.getElementById('cost-result');
+  if (el) {{
+    el.style.display = '';
+    document.getElementById('cost-summary').innerHTML = loadingMarkup('Fetching usage and cost data from AWS metrics…', 'large');
+    document.getElementById('usage-cards').innerHTML = '';
+    document.getElementById('usage-cost-rows').innerHTML = '';
+    document.getElementById('cost-rows').innerHTML = '';
+  }}
   const data = await api('/api/cost');
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to load cost estimates.');
@@ -6170,7 +7066,7 @@ async function loadCostDefaults() {{
   }}
   const defaults = data.defaults || data.inputs || {{}};
   fillCostInputs(defaults);
-  await calcCost();
+  renderCostEstimate(data);
 }}
 
 function costNumber(value) {{
@@ -6271,27 +7167,54 @@ function estimateCostLocal(inputs) {{
 
 function renderCostEstimate(data, prefixNote='') {{
   const b = data.breakdown || {{}};
+  const usage = data.usage || {{}};
+  const assets = usage.assets || {{}};
+  const lambda = usage.lambda || {{}};
+  const ddb = usage.dynamodb || {{}};
+  const checks = usage.checks || {{}};
+  const logs = usage.logs || {{}};
+  const sns = usage.sns || {{}};
+  const usageBreakdown = usage.gross_breakdown || {{}};
   const el = document.getElementById('cost-result');
   el.style.display = '';
   const month = costNumber(data.total_usd_per_month);
   const day = month / 30;
+  const usageMonth = costNumber(data.usage_total_usd_per_month ?? usage.gross_total_usd_per_month);
+  const usageDay = usageMonth / 30;
+  const nearZero = data.usage_near_zero || usageMonth < 0.01;
   document.getElementById('cost-summary').innerHTML =
-    `Current scheduler: every <strong>${{costNumber(data.scheduler?.effective_interval_sec || 60).toLocaleString()}}s</strong>. ` +
-    `Requested interval: every <strong>${{costNumber(data.scheduler?.requested_interval_sec || 60).toLocaleString()}}s</strong>. ` +
-    `Checks/day per region at current scheduler: <strong>${{costNumber(data.checks_per_day_per_region).toLocaleString()}}</strong>. ` +
-    `If hosts actually run every ${{costNumber(data.scheduler?.requested_interval_sec || 60).toLocaleString()}}s, that is about <strong>${{costNumber(data.requested_checks_per_day_per_region).toLocaleString()}}</strong> checks/day per host-region. ` +
-    `Estimated total: <strong>$${{day.toFixed(4)}}/day</strong> · <strong>$${{month.toFixed(4)}}/month</strong>. ` +
-    `Monthly Lambda invocations: <strong>${{costNumber(data.monthly_invocations?.total).toLocaleString()}}</strong> ` +
-    `(management ${{costNumber(data.monthly_invocations?.management).toLocaleString()}}, workers ${{costNumber(data.monthly_invocations?.workers).toLocaleString()}}). ` +
-    `Cognito admin MAUs: <strong>${{costNumber(data.inputs?.cognito_admin_mau).toLocaleString()}}</strong>.`;
+    `${{nearZero ? 'Current usage is near zero, but not invisible:' : 'Current usage estimate:'}} ` +
+    `<strong>$${{usageDay.toFixed(4)}}/day</strong> · <strong>$${{usageMonth.toFixed(4)}}/month</strong>.`;
+  document.getElementById('usage-cards').innerHTML = `
+    <div class="usage-grid">
+      <div class="usage-card"><div class="label">Assets</div><div class="value">${{costNumber(assets.hosts_enabled).toLocaleString()}} hosts</div><div class="meta">${{costNumber(assets.probe_regions)}} probes · ${{costNumber(assets.lambda_functions)}} Lambdas · ${{costNumber(assets.hosts_with_alerts)}} alert hosts</div></div>
+      <div class="usage-card"><div class="label">Lambda</div><div class="value">${{costNumber(lambda.last_24h_invocations).toLocaleString()}}</div><div class="meta">invocations in 24h · projected ${{costNumber(lambda.projected_monthly_invocations).toLocaleString()}}/mo · errors ${{costNumber(lambda.last_24h_errors)}}</div></div>
+      <div class="usage-card"><div class="label">DynamoDB</div><div class="value">${{costNumber((usage.tables?.hosts?.item_count || 0) + (usage.tables?.checks?.item_count || 0)).toLocaleString()}} rows</div><div class="meta">checks table ${{costNumber(usage.tables?.checks?.item_count).toLocaleString()}} · stored ${{escapeHtml(usage.tables?.checks?.size_human || '0 B')}}</div></div>
+      <div class="usage-card"><div class="label">Checks</div><div class="value">${{costNumber(checks.projected_daily).toLocaleString()}}/day</div><div class="meta">projected ${{costNumber(checks.projected_monthly).toLocaleString()}}/mo from current tiers and probe routes</div></div>
+      <div class="usage-card"><div class="label">Logs</div><div class="value">${{escapeHtml(logs.stored_human || '0 B')}}</div><div class="meta">stored across ${{(logs.groups || []).length}} Lambda log groups</div></div>
+      <div class="usage-card"><div class="label">SNS</div><div class="value">${{costNumber(sns.alert_publishes_last_24h).toLocaleString()}}</div><div class="meta">alert publishes in 24h · projected ${{costNumber(sns.projected_monthly_publishes).toLocaleString()}}/mo</div></div>
+    </div>
+  `;
+  document.getElementById('usage-cost-rows').innerHTML =
+    [['Lambda invocations + runtime', usageBreakdown.lambda_usd], ['DynamoDB estimated writes', usageBreakdown.dynamodb_writes_usd], ['DynamoDB estimated reads', usageBreakdown.dynamodb_reads_usd], ['DynamoDB current storage', usageBreakdown.dynamodb_storage_usd], ['CloudWatch Logs storage', usageBreakdown.cloudwatch_logs_storage_usd], ['SNS publishes', usageBreakdown.sns_publish_usd], ['CloudFront / custom domain', usageBreakdown.cloudfront_custom_domain_usd], ['Usage total / month', usage.gross_total_usd_per_month ?? data.usage_total_usd_per_month]]
+    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{costNumber(v).toFixed(6)}}</span></div>`)
+    .join('');
   document.getElementById('cost-rows').innerHTML =
-    [['Lambda (workers + orchestrator)', b.lambda_usd], ['DynamoDB writes', b.dynamodb_writes_usd], ['DynamoDB reads', b.dynamodb_reads_usd], ['DynamoDB storage', b.dynamodb_storage_usd], ['CloudFront / custom domain', b.cloudfront_custom_domain_usd], ['Cognito auth', b.cognito_auth_usd], ['CloudWatch Logs', b.cloudwatch_logs_usd], ['Total / month', data.total_usd_per_month]]
-    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{costNumber(v).toFixed(4)}}</span></div>`)
-    .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{prefixNote ? prefixNote + ' ' : ''}}${{data.note||''}}</div>`;
+    [['Projected checks / month', data.monthly_checks], ['Lambda invocations / month', data.monthly_invocations?.total], ['Management invocations / month', data.monthly_invocations?.management], ['Worker invocations / month', data.monthly_invocations?.workers], ['Effective scheduler', (data.scheduler?.effective_interval_sec || 60) + 's'], ['Planned interval', (data.scheduler?.requested_interval_sec || 60) + 's'], ['Planning cost / month', data.total_usd_per_month]]
+    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>${{typeof v === 'string' ? escapeHtml(v) : costNumber(v).toLocaleString(undefined, {{maximumFractionDigits: 4}})}}</span></div>`)
+    .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{prefixNote ? prefixNote + ' ' : ''}}${{usage.note || data.note || ''}}</div>`;
 }}
 
 async function calcCost() {{
   const inputs = getCostInputs();
+  const el = document.getElementById('cost-result');
+  if (el) {{
+    el.style.display = '';
+    document.getElementById('cost-summary').innerHTML = loadingMarkup('Recalculating usage and planning estimate…', 'large');
+    document.getElementById('usage-cards').innerHTML = '';
+    document.getElementById('usage-cost-rows').innerHTML = '';
+    document.getElementById('cost-rows').innerHTML = '';
+  }}
   const data = await api('/api/cost?hosts='+inputs.hosts+'&regions='+inputs.regions+'&interval='+inputs.interval_sec+'&days='+inputs.retention_days+'&custom_domain='+(inputs.custom_domain ? '1' : '0')+'&cloudfront_plan='+encodeURIComponent(inputs.cloudfront_plan)+'&cognito_enabled='+(inputs.cognito_enabled ? '1' : '0')+'&cognito_admin_mau='+inputs.cognito_admin_mau);
   if (data.unauthorized) {{
     showAuthGate('Enter the admin token to calculate costs.');
@@ -6309,12 +7232,6 @@ async function boot() {{
   ['c-hosts','c-regions','c-interval','c-days','c-cloudfront-plan','c-cognito-mau'].forEach(id => {{
     const el = document.getElementById(id);
     if (!el || el.dataset.costBound === '1') return;
-    el.addEventListener('input', () => {{
-      if (document.getElementById('pane-cost').style.display !== 'none') calcCost();
-    }});
-    el.addEventListener('change', () => {{
-      if (document.getElementById('pane-cost').style.display !== 'none') calcCost();
-    }});
     el.dataset.costBound = '1';
   }});
   ['sp-maintenance-enabled','sp-maintenance-message','sp-maintenance-window','sp-maintenance-scope','sp-maintenance-start','sp-maintenance-end'].forEach(id => {{
