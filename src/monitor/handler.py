@@ -183,6 +183,10 @@ def _host_due_now(host: dict, region: str, now: datetime) -> bool:
 def _check_and_record(host: dict, run_id: str) -> dict:
     host_id = host["host_id"]
     check_type = host.get("check_type", "http")
+    if not host.get("url", "").strip():
+        return {"host_id": host_id, "name": host.get("name"), "region": MONITOR_REGION, "run_id": run_id,
+                "checked_at": datetime.now(timezone.utc).isoformat(), "status": "down", "latency_ms": 0,
+                "error": "missing url"}
     result = _check_tcp(host) if check_type == "tcp" else _check_http(host)
 
     now = datetime.now(timezone.utc)

@@ -1014,6 +1014,10 @@ def _route_api(method: str, path: str, event: dict) -> dict:
         if method == "GET":
             return _get_dynamodb_data(qs)
 
+    if resource == "export":
+        if method == "GET":
+            return _export_tables()
+
     # ── /api/cost ─────────────────────────────────────────────────────────────
     if resource == "cost":
         return _cost_estimate(qs)
@@ -2467,6 +2471,39 @@ def _get_logs(qs: dict) -> dict:
         "summary": summary,
         "issues": issues,
         "entries": entries,
+    })
+
+
+def _export_tables() -> dict:
+    items = []
+    resp = _db().Table(HOSTS_TABLE).scan()
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = _db().Table(HOSTS_TABLE).scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+        items.extend(resp.get("Items", []))
+
+    hosts, settings, regions, other = [], None, [], []
+    for item in items:
+        hid = str(item.get("host_id", ""))
+        if hid == "__settings__":
+            settings = item
+        elif hid.startswith("__region__"):
+            regions.append(item)
+        elif hid.startswith("__"):
+            other.append(item)
+        else:
+            hosts.append(item)
+
+    hosts.sort(key=lambda h: str(h.get("name") or h.get("host_id") or ""))
+    regions.sort(key=lambda r: str(r.get("region") or ""))
+
+    return _json(200, {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "table": HOSTS_TABLE,
+        "hosts": hosts,
+        "settings": settings,
+        "regions": regions,
+        "other": other,
     })
 
 
