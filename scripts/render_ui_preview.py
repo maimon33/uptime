@@ -21,13 +21,38 @@ def _load_handler():
     os.environ.setdefault("AWS_REGION", "eu-central-1")
     if "boto3" not in sys.modules:
         boto3_stub = types.ModuleType("boto3")
+        dynamodb_stub = types.ModuleType("boto3.dynamodb")
+        conditions_stub = types.ModuleType("boto3.dynamodb.conditions")
 
         def _unavailable(*args, **kwargs):
             raise RuntimeError("boto3 is unavailable in preview mode")
 
+        class _Key:
+            def __init__(self, name):
+                self.name = name
+
+            def eq(self, value):
+                return ("eq", self.name, value)
+
+            def begins_with(self, value):
+                return ("begins_with", self.name, value)
+
         boto3_stub.client = _unavailable
         boto3_stub.resource = _unavailable
+        conditions_stub.Key = _Key
         sys.modules["boto3"] = boto3_stub
+        sys.modules["boto3.dynamodb"] = dynamodb_stub
+        sys.modules["boto3.dynamodb.conditions"] = conditions_stub
+    if "botocore.exceptions" not in sys.modules:
+        botocore_stub = types.ModuleType("botocore")
+        exceptions_stub = types.ModuleType("botocore.exceptions")
+
+        class _ClientError(Exception):
+            pass
+
+        exceptions_stub.ClientError = _ClientError
+        sys.modules["botocore"] = botocore_stub
+        sys.modules["botocore.exceptions"] = exceptions_stub
     if "regions" not in sys.modules:
         sys.modules["regions"] = types.ModuleType("regions")
     sys.path.insert(0, str(MANAGEMENT_DIR))
@@ -121,27 +146,30 @@ def main() -> int:
     )
     (OUTPUT_DIR / "status-preview.html").write_text(status_html, encoding="utf-8")
 
-    history_html = handler._render_history_page(
-        title="Uptime Command Center",
-        brand_name="Uptime",
-        logo_url="",
-        theme="clean",
-        hosts=[
-            {"host_id": "marketing-site", "name": "Marketing Site"},
-            {"host_id": "payments-api", "name": "Payments API"},
-            {"host_id": "auth-cluster", "name": "Auth Cluster"},
-        ],
-        regions=["ap-southeast-1", "eu-west-1", "us-east-1"],
-        selected_host="all",
-        selected_region="all",
-        rows=[
-            {"host_id": "auth-cluster", "host_name": "Auth Cluster", "region": "us-east-1", "status": "down", "latency_ms": 0, "status_code": 503, "checked_at": "2026-05-03T08:15:00+00:00", "error": "upstream timeout"},
-            {"host_id": "payments-api", "host_name": "Payments API", "region": "ap-southeast-1", "status": "degraded", "latency_ms": 312, "status_code": 200, "checked_at": "2026-05-03T08:10:00+00:00", "error": ""},
-            {"host_id": "marketing-site", "host_name": "Marketing Site", "region": "eu-west-1", "status": "up", "latency_ms": 154, "status_code": 200, "checked_at": "2026-05-03T08:09:00+00:00", "error": ""},
-            {"host_id": "payments-api", "host_name": "Payments API", "region": "us-east-1", "status": "degraded", "latency_ms": 294, "status_code": 200, "checked_at": "2026-05-03T08:08:00+00:00", "error": "high latency"},
-        ],
-    )
-    (OUTPUT_DIR / "history-preview.html").write_text(history_html, encoding="utf-8")
+    try:
+        history_html = handler._render_history_page(
+            title="Uptime Command Center",
+            brand_name="Uptime",
+            logo_url="",
+            theme="clean",
+            hosts=[
+                {"host_id": "marketing-site", "name": "Marketing Site"},
+                {"host_id": "payments-api", "name": "Payments API"},
+                {"host_id": "auth-cluster", "name": "Auth Cluster"},
+            ],
+            regions=["ap-southeast-1", "eu-west-1", "us-east-1"],
+            statuses=["up", "degraded", "down"],
+            selected_host="all",
+            selected_region="all",
+            selected_status="all",
+            selected_day="",
+            summaries=[],
+            selected_summary=None,
+            build={"version": "preview"},
+        )
+        (OUTPUT_DIR / "history-preview.html").write_text(history_html, encoding="utf-8")
+    except TypeError as exc:
+        print(f"Skipped history preview: {exc}")
 
     admin_html = handler._admin_page()
     (OUTPUT_DIR / "admin-preview.html").write_text(admin_html, encoding="utf-8")

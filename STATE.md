@@ -65,7 +65,7 @@ Shared context for Claude Code + Codex collaboration.
 
 | host_id value | Type | Description |
 |---|---|---|
-| `<uuid>` | Host config | name, url, check_type, enabled, alert_enabled, alert_sns_arn, show_on_status_page, expected_status_code, target_regions, current_status, last_checked_at, last_down_at, last_latency_ms, region_statuses |
+| `<uuid>` | Host config | name, url, check_type, enabled, alert_enabled, alert_sns_arn, show_on_status_page, expected_status_code, target_regions, current_status, last_checked_at, last_down_at, last_latency_ms, region_statuses, consecutive_down_count, last_soft_fail_at, alert_after_consecutive_failures |
 | `__settings__` | Settings | status_page_title, status_page_description, status_page_brand_name, status_page_logo_url, status_page_theme, status_page_subscribe_intro, status_page_subscribe_email_url, status_page_subscribe_sms_url, status_page_subscribe_webhook_url, maintenance_enabled, maintenance_message, maintenance_window, maintenance_scope, notifications_default_topic_arn, notifications_sender_label, notifications_initial_delay_seconds, notifications_reminder_interval_minutes, notifications_ttl_seconds, notifications_quiet_hours_enabled, notifications_quiet_hours_timezone, notifications_quiet_hours_start, notifications_quiet_hours_end, notifications_sleep_until, notifications_mute_during_maintenance, custom_domain_name, custom_domain_origin_url, custom_domain_certificate_arn, custom_domain_distribution_id, custom_domain_distribution_domain_name, custom_domain_distribution_status, custom_domain_status, custom_domain_last_error, custom_domain_validation_records, retention_days, default_check_interval, default_timeout |
 | `__region__<name>` | Region record | region, function_arn, function_name, memory_mb, status, deployed_at |
 
@@ -200,6 +200,15 @@ terraform output -raw admin_key
 - Fork path documented: users override both params with their own bucket/key
 - `publish-artifacts.sh` now defaults to `www.maimons.dev / uptime` prefix; accepts optional args to publish a fork
 - README rewritten: one-click URL + CLI for standard path; separate fork section
+
+### 2026-05-26 — Soft-fail / consecutive-failures threshold
+
+- Added soft-fail protection to `_apply_aggregate_updates` in `src/management/handler.py`
+- New per-host field `alert_after_consecutive_failures` (default 2): alert and status flip only after N consecutive failures
+- `consecutive_down_count` (int) is auto-managed on the host record — increments each down run, resets on recovery
+- `last_soft_fail_at` (timestamp) written to host record when a failure is below threshold — visible via admin API without CloudWatch
+- Soft-fail events also logged via `_log("warn", "soft_fail", ...)` to CloudWatch for admin observability
+- Single-blip failures (e.g. Lambda timeout, DNS hiccup) no longer flip status page or trigger alerts
 
 ### 2026-05-03 — Design system + preview pipeline
 

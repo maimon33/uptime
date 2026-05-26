@@ -1025,7 +1025,7 @@ def _route_api(method: str, path: str, event: dict) -> dict:
             if method == "POST": return _add_region(body)
         else:
             if method == "DELETE":               return _remove_region(rid)
-            if method == "POST" and sub == "update": return _update_region(rid)
+            if method == "POST" and sub == "update": return _update_region(rid, body)
 
     return _json(404, {"error": "API endpoint not found"})
 
@@ -1423,21 +1423,37 @@ def _apply_aggregate_updates(db, hosts: list[dict], result_rows: list[dict], run
     table = db.Table(HOSTS_TABLE)
     for host in hosts:
         host_results = by_host.get(host["host_id"], [])
+        if not host_results:
+            _log("info", "orchestration_aggregate_skipped_no_results", host_id=host["host_id"], host_name=host.get("name"), previous_status=host.get("current_status", "unknown"), run_id=run_id)
+            continue
         region_statuses = _build_region_statuses(host_results)
         aggregate_status = _aggregate_status(host_results)
         avg_latency = round(sum(r.get("latency_ms", 0) for r in host_results) / len(host_results)) if host_results else None
         prev_status = host.get("current_status", "unknown")
 
+        alert_threshold = max(1, int(host.get("alert_after_consecutive_failures") or 2))
+        prev_consecutive_down = int(host.get("consecutive_down_count") or 0)
+        consecutive_down = (prev_consecutive_down + 1) if aggregate_status == "down" else 0
+
+        # Hold current_status at prev until consecutive failures reach threshold,
+        # so single-blip noise doesn't surface on the status page or trigger alerts.
+        is_soft_fail = aggregate_status == "down" and consecutive_down < alert_threshold
+        confirmed_status = prev_status if is_soft_fail else aggregate_status
+
         update_item = {
-            "current_status": aggregate_status,
+            "current_status": confirmed_status,
             "last_checked_at": run_id,
             "region_statuses": region_statuses,
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "consecutive_down_count": consecutive_down,
         }
         if avg_latency is not None:
             update_item["last_latency_ms"] = avg_latency
-        if aggregate_status == "down" and prev_status != "down":
+        if confirmed_status == "down" and prev_status != "down":
             update_item["last_down_at"] = run_id
+        if is_soft_fail:
+            update_item["last_soft_fail_at"] = run_id
+            _log("warn", "soft_fail", host_id=host["host_id"], host_name=host.get("name"), consecutive_down_count=consecutive_down, threshold=alert_threshold, run_id=run_id)
 
         expr_names = {f"#k{i}": key for i, key in enumerate(update_item)}
         expr_values = {f":v{i}": value for i, value in enumerate(update_item.values())}
@@ -1452,7 +1468,7 @@ def _apply_aggregate_updates(db, hosts: list[dict], result_rows: list[dict], run
         )
 
         if host.get("alert_enabled") and host.get("alert_sns_arn"):
-            if aggregate_status == "down" and prev_status not in ("down", "unknown"):
+            if aggregate_status == "down" and consecutive_down >= alert_threshold and prev_status not in ("down", "unknown"):
                 _send_alert(host, host_results, "DOWN")
             elif aggregate_status == "up" and prev_status == "down":
                 _send_alert(host, host_results, "RECOVERED")
@@ -1750,13 +1766,17 @@ def _add_region(body: dict) -> dict:
         _audit_event("worker_add", status="error", actor="admin", region=region, error=str(e))
         return _json(500, {"error": str(e)})
 
-def _update_region(region: str) -> dict:
-    """Re-deploy the current worker code to an existing region."""
+def _update_region(region: str, body: dict | None = None) -> dict:
+    """Re-deploy the current worker code and settings to an existing region."""
+    body = body or {}
     existing = _db().Table(HOSTS_TABLE).get_item(Key={"host_id": f"__region__{region}"}).get("Item")
     if not existing:
         return _json(404, {"error": f"Region {region} not found. Deploy it first."})
-    memory_mb = int(existing.get("memory_mb", 256))
-    supported_tiers = _normalize_monitor_tiers(existing.get("supported_tiers"), fallback=DEFAULT_MONITOR_TIERS)
+    memory_mb = int(body.get("memory_mb") or existing.get("memory_mb", 256))
+    supported_tiers = _normalize_monitor_tiers(
+        body.get("supported_tiers") if "supported_tiers" in body else existing.get("supported_tiers"),
+        fallback=DEFAULT_MONITOR_TIERS,
+    )
     try:
         info = reg.deploy_region(region, memory_mb, supported_tiers)
         reg.save_region_record(_db(), info)
@@ -4379,6 +4399,12 @@ input:focus,select:focus,textarea:focus{{outline:none;border-color:var(--sky);bo
 .cost-breakdown-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
 .cost-meter{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:14px}}
 .cost-meter-title{{font-weight:800;color:#f8fafc;margin-bottom:8px}}
+.usage-cost-table{{width:100%;border-collapse:collapse;font-size:.84rem}}
+.usage-cost-table th,.usage-cost-table td{{padding:10px 8px;border-bottom:1px solid var(--line-soft);text-align:left;vertical-align:top}}
+.usage-cost-table th{{font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.usage-cost-table td:last-child,.usage-cost-table th:last-child{{text-align:right}}
+.usage-cost-table tr:last-child td{{border-bottom:none;font-weight:800;color:#67e8f9}}
+.usage-cost-table .muted{{color:var(--soft);font-size:.76rem;line-height:1.4}}
 .section-summary{{display:flex;justify-content:space-between;align-items:center;gap:12px;list-style:none}}
 .section-summary::-webkit-details-marker{{display:none}}
 .section-summary-title{{font-size:.8rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#f8fafc;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
@@ -4408,28 +4434,65 @@ p.desc{{color:var(--muted);font-size:.92rem;line-height:1.65;margin-bottom:12px;
 .choice-card.active{{border-color:rgba(14,165,233,.55);background:linear-gradient(180deg, rgba(14,165,233,.12), rgba(15,118,110,.08));box-shadow:0 18px 36px rgba(2,6,23,.18)}}
 .choice-card-title{{font-size:.88rem;font-weight:700;color:#f8fafc;font-family:"Space Grotesk","IBM Plex Sans",sans-serif;letter-spacing:-.01em}}
 .choice-card-copy{{font-size:.8rem;color:var(--soft);line-height:1.55;margin-top:4px}}
+.scope-toggle{{display:grid;grid-template-columns:1fr 1fr;gap:8px;background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:6px}}
+.scope-option{{display:flex;align-items:center;justify-content:center;gap:8px;min-height:42px;border-radius:13px;color:var(--soft);font-weight:800;font-size:.82rem;cursor:pointer;transition:background .16s ease,color .16s ease,box-shadow .16s ease}}
+.scope-option input{{width:auto;accent-color:var(--sky)}}
+.scope-option.active{{background:linear-gradient(180deg, rgba(14,165,233,.2), rgba(15,118,110,.12));color:#f8fafc;box-shadow:inset 0 0 0 1px rgba(14,165,233,.45)}}
 .probe-scope-panel{{margin-top:12px;padding:14px 16px;border-radius:18px;border:1px solid var(--line);background:#0e1828;transition:border-color .16s ease,background .16s ease,opacity .16s ease}}
 .probe-scope-panel.inactive{{opacity:.72}}
-.probe-scope-header{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}}
+.probe-scope-header{{display:grid;grid-template-columns:minmax(150px,auto) minmax(220px,1fr);gap:12px;align-items:start;margin-bottom:10px}}
 .probe-scope-title{{font-size:.82rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#cbd5e1;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
-.probe-region-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}}
+.probe-scope-tools{{display:grid;grid-template-columns:1fr;gap:8px}}
+.probe-region-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;max-height:320px;overflow:auto;padding-right:2px}}
 .probe-region-pill{{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:16px;border:1px solid var(--line);background:#111c2d;transition:border-color .16s ease,background .16s ease,transform .16s ease}}
 .probe-region-pill:hover{{border-color:#44617f;transform:translateY(-1px)}}
 .probe-region-pill input{{width:auto;accent-color:var(--sky)}}
+.probe-region-pill.readonly{{cursor:default}}
+.probe-region-pill.readonly:hover{{transform:none;border-color:var(--line)}}
+.probe-region-pill.unsupported{{border-color:rgba(245,158,11,.32);background:rgba(120,53,15,.14)}}
+.probe-region-pill.selected{{border-color:rgba(14,165,233,.5);background:rgba(14,165,233,.12)}}
 .probe-region-pill-name{{font-size:.86rem;font-weight:700;color:#e5eef8}}
 .probe-region-pill-meta{{font-size:.74rem;color:var(--soft);margin-top:2px}}
+.probe-region-pill-status{{margin-left:auto;font-size:.7rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace;color:#86efac}}
+.probe-region-pill-status.warn{{color:#fcd34d}}
+.probe-dropdown{{position:relative}}
+.probe-dropdown-button{{width:100%;display:flex;justify-content:space-between;align-items:center;gap:10px;border:1px solid var(--line);border-radius:16px;background:#0e1828;color:#f8fafc;padding:13px 15px;text-align:left;font-weight:800;cursor:pointer}}
+.probe-dropdown-button:hover{{border-color:#44617f}}
+.probe-dropdown-caret{{color:var(--soft);font-size:.78rem}}
+.probe-dropdown-menu{{display:none;position:absolute;left:0;right:0;top:calc(100% + 8px);z-index:90;background:#0b1322;border:1px solid var(--line);border-radius:18px;box-shadow:0 24px 60px rgba(2,6,23,.44);padding:10px}}
+.probe-dropdown.open .probe-dropdown-menu{{display:block}}
+.probe-dropdown-search{{margin-bottom:8px}}
+.probe-option-list{{max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:6px;padding-right:2px}}
+.probe-option{{display:flex;align-items:center;gap:10px;width:100%;border:1px solid transparent;border-radius:14px;background:transparent;color:#dbe7f3;padding:10px 11px;text-align:left;cursor:pointer}}
+.probe-option:hover{{background:#111c2d;border-color:var(--line-soft)}}
+.probe-option.active{{background:rgba(14,165,233,.12);border-color:rgba(14,165,233,.45);color:#f8fafc}}
+.probe-option.unsupported{{color:#fde68a}}
+.probe-option input{{width:auto;accent-color:var(--sky)}}
+.probe-option-main{{font-size:.84rem;font-weight:800}}
+.probe-option-sub{{font-size:.72rem;color:var(--soft);margin-top:2px}}
+.probe-option-status{{margin-left:auto;font-size:.68rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace;color:#86efac;white-space:nowrap}}
+.probe-option-status.warn{{color:#fcd34d}}
 .coverage-grid{{display:flex;flex-direction:column;gap:10px}}
-.coverage-toolbar{{display:grid;grid-template-columns:minmax(180px,1fr) 170px;gap:10px;margin-bottom:12px}}
-.coverage-table{{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:18px;overflow:hidden;background:#0e1828}}
-.coverage-row{{display:grid;grid-template-columns:minmax(140px,1.1fr) 140px minmax(160px,1.4fr) minmax(120px,.9fr);gap:12px;align-items:center;padding:11px 13px;border-top:1px solid var(--line-soft);cursor:pointer}}
-.coverage-row:first-child{{border-top:none}}
-.coverage-row:hover{{background:#111c2d}}
-.coverage-row.selected{{background:linear-gradient(90deg, rgba(14,165,233,.14), rgba(15,118,110,.08));box-shadow:inset 3px 0 0 var(--sky)}}
+.coverage-toolbar{{display:grid;grid-template-columns:minmax(180px,1fr) 170px 150px;gap:10px;margin-bottom:12px}}
+.coverage-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}}
+.coverage-matrix{{border:1px solid var(--line);border-radius:18px;overflow:auto;background:#0e1828}}
+.coverage-matrix-row{{display:grid;grid-template-columns:220px repeat(var(--probe-count), minmax(116px,1fr));min-width:max-content;border-top:1px solid var(--line-soft)}}
+.coverage-matrix-row:first-child{{border-top:none}}
+.coverage-matrix-head{{background:#111c2d;position:sticky;top:0;z-index:1}}
+.coverage-matrix-cell{{padding:10px 12px;border-left:1px solid var(--line-soft);min-height:58px;display:flex;flex-direction:column;justify-content:center;gap:4px}}
+.coverage-matrix-cell:first-child{{border-left:none;position:sticky;left:0;background:#0e1828;z-index:2}}
+.coverage-matrix-head .coverage-matrix-cell:first-child{{background:#111c2d;z-index:3}}
+.coverage-matrix-row:not(.coverage-matrix-head):hover .coverage-matrix-cell{{background:#111c2d}}
+.coverage-matrix-row.selected .coverage-matrix-cell:first-child{{box-shadow:inset 3px 0 0 var(--sky)}}
+.coverage-cell-status{{font-size:.72rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;font-family:"IBM Plex Mono","SFMono-Regular",monospace}}
+.coverage-cell-status.ok{{color:#86efac}}.coverage-cell-status.off{{color:#94a3b8}}.coverage-cell-status.warn{{color:#fcd34d}}.coverage-cell-status.inactive{{color:#64748b}}
+.coverage-cell-meta{{font-size:.72rem;color:var(--soft);line-height:1.35}}
 .coverage-host{{font-weight:700;color:#f8fafc;font-size:.88rem}}
 .coverage-meta{{font-size:.74rem;color:var(--soft);margin-top:3px}}
 .coverage-routes{{display:flex;flex-wrap:wrap;gap:6px}}
 .coverage-empty{{padding:16px;color:var(--soft);font-size:.82rem}}
 .coverage-card{{background:#0e1828;border:1px solid var(--line);border-radius:18px;padding:12px 14px}}
+.coverage-card.selected{{border-color:rgba(14,165,233,.55);box-shadow:inset 3px 0 0 var(--sky)}}
 .coverage-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}}
 .coverage-title{{font-size:.92rem;font-weight:700;color:#f8fafc}}
 .coverage-subtitle{{font-size:.77rem;color:var(--soft);margin-top:4px}}
@@ -4500,6 +4563,7 @@ strong{{color:#f8fafc}}
 @media (max-width: 760px) {{
   .grid2{{grid-template-columns:1fr}}
   .choice-grid{{grid-template-columns:1fr}}
+  .probe-scope-header{{grid-template-columns:1fr}}
   .section-header,.region-card{{flex-direction:column;align-items:flex-start}}
 }}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
@@ -4513,7 +4577,7 @@ strong{{color:#f8fafc}}
   <span class="tab" data-tab="notifications" onclick="show('notifications')">Notifications</span>
   <span class="tab" data-tab="management" onclick="show('management')">Management</span>
   <span class="tab" data-tab="diagnostics" onclick="show('diagnostics')">Diagnostics</span>
-  <span class="tab" data-tab="cost" onclick="show('cost')">Cost</span>
+  <span class="tab" data-tab="cost" onclick="show('cost')">Usage & Cost</span>
   <span class="nav-spacer"></span>
   <div class="menu-wrap">
     <button class="menu-btn" id="more-menu-btn" type="button" onclick="toggleMoreMenu()">General ▾</button>
@@ -4575,6 +4639,11 @@ strong{{color:#f8fafc}}
         <option value="active">Has active route</option>
         <option value="selected">Selected probes only</option>
         <option value="disabled">Disabled hosts</option>
+      </select>
+      <select id="route-view-mode" onchange="renderHostCoverage()">
+        <option value="auto">Auto view</option>
+        <option value="compact">Compact</option>
+        <option value="matrix">Matrix</option>
       </select>
     </div>
     <div id="host-coverage" style="color:#94a3b8">Loading host coverage…</div>
@@ -5098,20 +5167,15 @@ strong{{color:#f8fafc}}
   <div class="panel" id="cost-result" style="display:none">
     <div id="cost-summary" class="hint" style="margin-bottom:14px"></div>
     <div id="usage-cards"></div>
-    <div class="cost-breakdown-grid">
-      <div class="cost-meter">
-        <div class="cost-meter-title">Monthly Cost Estimate</div>
-        <div id="usage-cost-rows"></div>
-      </div>
-      <div class="cost-meter">
-        <div class="cost-meter-title">Planning Estimate</div>
-        <div id="cost-rows"></div>
-      </div>
+    <div class="cost-meter">
+      <div class="cost-meter-title">Usage Estimate</div>
+      <div id="usage-cost-rows"></div>
+      <div id="cost-rows" class="hint" style="margin-top:10px"></div>
     </div>
   </div>
   <details class="panel" style="margin-top:16px">
     <summary class="section-summary" style="cursor:pointer">
-      <span class="section-summary-title">Planning inputs</span>
+      <span class="section-summary-title">Scenario inputs</span>
       <span class="section-summary-meta">Override counts for edge cases</span>
     </summary>
     <div class="grid2" style="margin-top:16px">
@@ -5135,7 +5199,7 @@ strong{{color:#f8fafc}}
         <div class="hint">Only used when Cognito is deployed. This estimates monthly active admin users, not total user accounts.</div>
       </div>
     </div>
-    <button class="btn btn-primary" onclick="calcCost()">Recalculate Planning Estimate</button>
+    <button class="btn btn-primary" onclick="calcCost()">Recalculate Usage Estimate</button>
   </details>
 </div>
 
@@ -5300,7 +5364,7 @@ aws secretsmanager put-secret-value \\
     <div class="grid2">
       <div class="form-group">
         <label>Monitor Tier</label>
-        <select id="m-tier"></select>
+        <select id="m-tier" onchange="renderTargetRegions(selectedTargetRegions()); updateHostImpact()"></select>
         <div class="hint">Choose one of the schedules currently supported by your worker fleet.</div>
       </div>
       <div class="form-group"><label>Timeout (sec)</label><input id="m-timeout" type="number" value="10" min="1" max="60"></div>
@@ -5323,29 +5387,17 @@ aws secretsmanager put-secret-value \\
     </div>
     <div class="form-group">
       <label>Probes</label>
-      <div class="choice-grid">
-        <label class="choice-card" id="m-region-card-all">
-          <input type="radio" name="m-region-mode" id="m-region-mode-all" value="all" checked onchange="toggleTargetRegionMode()">
-          <span>
-            <div class="choice-card-title">Run on all deployed probes</div>
-            <div class="choice-card-copy">Best when you want broad coverage by default. New probes will pick this host up automatically.</div>
-          </span>
-        </label>
-        <label class="choice-card" id="m-region-card-selected">
-          <input type="radio" name="m-region-mode" id="m-region-mode-selected" value="selected" onchange="toggleTargetRegionMode()">
-          <span>
-            <div class="choice-card-title">Run only on selected probes</div>
-            <div class="choice-card-copy">Use this when a host should stay scoped to specific regions, networks, or customer edges.</div>
-          </span>
-        </label>
-      </div>
-      <div class="probe-scope-panel inactive" id="m-target-regions-panel">
-        <div class="probe-scope-header">
-          <div class="probe-scope-title">Probe selection</div>
-          <div class="hint" id="m-target-regions-hint">All deployed probes will run this host unless you switch to selected probes.</div>
+      <div class="probe-dropdown" id="m-probe-dropdown">
+        <button type="button" class="probe-dropdown-button" onclick="toggleProbeDropdown()">
+          <span id="m-probe-summary">All probes</span>
+          <span class="probe-dropdown-caret">▾</span>
+        </button>
+        <div class="probe-dropdown-menu" id="m-probe-menu">
+          <input class="probe-dropdown-search" id="m-region-filter" placeholder="Filter probes" oninput="renderTargetRegions(selectedTargetRegions())">
+          <div id="m-target-regions" class="probe-option-list"></div>
         </div>
-        <div id="m-target-regions" class="probe-region-grid"></div>
       </div>
+      <div class="hint" id="m-target-regions-hint" style="margin-top:8px">All deployed probes that support the selected interval will run this host.</div>
     </div>
     <div class="form-group">
       <label class="toggle"><input type="checkbox" id="m-page" checked> Show on public status page</label>
@@ -5371,8 +5423,8 @@ aws secretsmanager put-secret-value \\
 
 <div class="modal-overlay" id="region-modal">
   <div class="modal">
-    <h3>Add Worker Region</h3>
-    <p class="desc" style="margin-bottom:16px">This deploys a new probe Lambda in the selected AWS region.</p>
+    <h3 id="region-modal-title">Add Worker Region</h3>
+    <p class="desc" id="region-modal-desc" style="margin-bottom:16px">This deploys a new probe Lambda in the selected AWS region.</p>
     <div class="form-group">
       <label>AWS Region</label>
       <select id="r-region">{region_options}</select>
@@ -5413,6 +5465,8 @@ const queryKey = new URLSearchParams(location.search).get('key') || '';
 let REGIONS_CACHE = [];
 let HOSTS_CACHE = [];
 let SELECTED_HOST_ID = '';
+let MODAL_TARGET_REGIONS = [];
+let MODAL_REGION_SCOPE = 'all';
 const RECOMMENDED_MONITOR_TIERS = {json.dumps(RECOMMENDED_MONITOR_TIERS)};
 const CLOUDFRONT_PLAN_COSTS = {json.dumps(_CLOUDFRONT_PLAN_COSTS)};
 if (queryKey) {{
@@ -5813,6 +5867,13 @@ function formatTierLabel(seconds) {{
   return `Every ${{sec}} seconds`;
 }}
 
+function formatTierShort(seconds) {{
+  const sec = +seconds;
+  if (sec % 3600 === 0) return `${{sec / 3600}}h`;
+  if (sec % 60 === 0) return `${{sec / 60}}m`;
+  return `${{sec}}s`;
+}}
+
 function availableMonitorTiers(extra=[]) {{
   const tiers = new Set(RECOMMENDED_MONITOR_TIERS);
   REGIONS_CACHE.forEach(region => (region.supported_tiers || []).forEach(tier => tiers.add(+tier)));
@@ -5851,51 +5912,116 @@ function renderRegionTierCostNote() {{
   note.innerHTML = `Cost note: each deployed worker is still invoked every <strong>1 minute</strong> today, which is about <strong>1,440 runs/day</strong> or <strong>43,200 runs/month</strong> per worker. That is roughly <strong>$0.01/month in Lambda request charges after the free tier</strong>, and usually still $0 while free-tier headroom remains. Slower host tiers reduce checks, DynamoDB rows, and logs for hosts assigned to them, but they do not change the worker's base wake-up cadence.<br><span style="display:block;margin-top:6px">${{tierBits}}</span>`;
 }}
 
-function renderTargetRegions(selected=[]) {{
-  const wrap = document.getElementById('m-target-regions');
-  if (!REGIONS_CACHE.length) {{
-    wrap.innerHTML = '<div class="hint">No worker regions deployed yet.</div>';
+function setModalTargetRegion(region, checked) {{
+  MODAL_REGION_SCOPE = 'selected';
+  const current = new Set(MODAL_TARGET_REGIONS);
+  if (checked) current.add(region);
+  else current.delete(region);
+  MODAL_TARGET_REGIONS = Array.from(current);
+  renderTargetRegions(MODAL_TARGET_REGIONS);
+  updateHostImpact();
+}}
+
+function probeShortName(regionName) {{
+  const first = String(regionName || '').split('-')[0] || regionName || '';
+  return first.toUpperCase();
+}}
+
+function probeOptionLabel(region) {{
+  const tiers = (region.supported_tiers || [60,300]).map(formatTierShort).join(', ');
+  return `${{probeShortName(region.region)}} - ${{tiers}}`;
+}}
+
+function renderProbeSummary() {{
+  const el = document.getElementById('m-probe-summary');
+  if (!el) return;
+  if (MODAL_REGION_SCOPE === 'all') {{
+    el.textContent = '🌐 All - every deployed probe';
     return;
   }}
-  wrap.innerHTML = REGIONS_CACHE.map(r => `
-    <label class="probe-region-pill">
-      <input type="checkbox" value="${{r.region}}" ${{selected.includes(r.region) ? 'checked' : ''}} onchange="updateHostImpact()">
-      <span>
-        <div class="probe-region-pill-name">${{r.region}}</div>
-        <div class="probe-region-pill-meta">${{(r.supported_tiers || [60,300]).map(t => formatTierLabel(t)).join(' · ')}}</div>
-      </span>
-    </label>
-  `).join('');
-  toggleTargetRegionMode();
+  if (!MODAL_TARGET_REGIONS.length) {{
+    el.textContent = 'Selected probes - none chosen';
+    return;
+  }}
+  const selected = REGIONS_CACHE.filter(region => MODAL_TARGET_REGIONS.includes(region.region));
+  const labels = selected.slice(0, 2).map(probeOptionLabel);
+  el.textContent = labels.join(' · ') + (selected.length > 2 ? ` · +${{selected.length - 2}}` : '');
+}}
+
+function setProbeScopeAll() {{
+  MODAL_REGION_SCOPE = 'all';
+  MODAL_TARGET_REGIONS = [];
+  renderTargetRegions([]);
+  updateHostImpact();
+}}
+
+function toggleProbeDropdown() {{
+  const dd = document.getElementById('m-probe-dropdown');
+  if (dd) dd.classList.toggle('open');
+}}
+
+function renderTargetRegions(selected=[]) {{
+  const wrap = document.getElementById('m-target-regions');
+  if (MODAL_REGION_SCOPE === 'selected') MODAL_TARGET_REGIONS = Array.from(new Set(selected || []));
+  if (!REGIONS_CACHE.length) {{
+    wrap.innerHTML = '<div class="hint">No worker regions deployed yet.</div>';
+    renderProbeSummary();
+    return;
+  }}
+  const filter = (document.getElementById('m-region-filter')?.value || '').trim().toLowerCase();
+  const visibleRegions = REGIONS_CACHE.filter(r => {{
+    const haystack = [r.region, probeOptionLabel(r), (r.supported_tiers || [60,300]).map(t => formatTierLabel(t)).join(' ')].join(' ').toLowerCase();
+    return !filter || haystack.includes(filter);
+  }});
+  if (!visibleRegions.length) {{
+    wrap.innerHTML = '<div class="hint">No probes match this filter.</div>';
+    renderProbeSummary();
+    return;
+  }}
+  const requestedTier = Math.max(60, +(document.getElementById('m-tier')?.value || 60));
+  const allActive = MODAL_REGION_SCOPE === 'all';
+  const allOption = `
+    <button type="button" class="probe-option ${{allActive ? 'active' : ''}}" onclick="setProbeScopeAll()">
+      <span class="probe-option-main">🌐 All</span>
+      <span class="probe-option-sub">Every deployed probe that supports this interval</span>
+    </button>`;
+  const regionOptions = visibleRegions.map(r => {{
+    const supportsTier = (r.supported_tiers || [60,300]).includes(requestedTier);
+    const checked = MODAL_REGION_SCOPE === 'selected' && MODAL_TARGET_REGIONS.includes(r.region);
+    return `
+      <label class="probe-option ${{checked ? 'active' : ''}} ${{supportsTier ? '' : 'unsupported'}}">
+        <input type="checkbox" value="${{r.region}}" ${{checked ? 'checked' : ''}} onchange="setModalTargetRegion('${{r.region}}', this.checked)">
+        <span>
+          <div class="probe-option-main">📍 ${{escapeHtml(probeOptionLabel(r))}}</div>
+          <div class="probe-option-sub">${{escapeHtml(r.region)}}</div>
+        </span>
+        <span class="probe-option-status ${{supportsTier ? '' : 'warn'}}">${{supportsTier ? 'ready' : 'missing'}}</span>
+      </label>`;
+  }}).join('');
+  wrap.innerHTML = allOption + regionOptions;
+  renderProbeSummary();
+  renderProbeHint();
 }}
 
 function selectedTargetRegions() {{
-  return Array.from(document.querySelectorAll('#m-target-regions input[type=checkbox]:checked')).map(el => el.value);
+  return MODAL_REGION_SCOPE === 'selected' ? MODAL_TARGET_REGIONS.slice() : [];
 }}
 
 function targetRegionMode() {{
-  return document.getElementById('m-region-mode-selected').checked ? 'selected' : 'all';
+  return MODAL_REGION_SCOPE;
+}}
+
+function renderProbeHint() {{
+  const hint = document.getElementById('m-target-regions-hint');
+  if (hint) {{
+    hint.textContent = MODAL_REGION_SCOPE === 'selected'
+      ? 'Only checked probes will run this host. Options marked missing need their probe intervals edited first.'
+      : 'All deployed probes that support the selected interval will run this host. Missing probes are skipped until edited.';
+  }}
 }}
 
 function toggleTargetRegionMode() {{
-  const selectedMode = targetRegionMode() === 'selected';
-  const hint = document.getElementById('m-target-regions-hint');
-  const panel = document.getElementById('m-target-regions-panel');
-  const allCard = document.getElementById('m-region-card-all');
-  const selectedCard = document.getElementById('m-region-card-selected');
-  const checkboxes = Array.from(document.querySelectorAll('#m-target-regions input[type=checkbox]'));
-  if (allCard) allCard.classList.toggle('active', !selectedMode);
-  if (selectedCard) selectedCard.classList.toggle('active', selectedMode);
-  if (panel) panel.classList.toggle('inactive', !selectedMode);
-  checkboxes.forEach(el => {{
-    el.disabled = !selectedMode;
-    if (!selectedMode) el.checked = false;
-  }});
-  if (hint) {{
-    hint.textContent = selectedMode
-      ? 'Only the checked probes will run this host. Choose the exact regions below.'
-      : 'This host will run on every deployed probe. The list below is shown for reference.';
-  }}
+  renderTargetRegions(selectedTargetRegions());
   updateHostImpact();
 }}
 
@@ -5923,6 +6049,9 @@ function computeHostProbeCoverage(host) {{
       region: region.region,
       eligible,
       reason,
+      scopedOut,
+      supportsTier,
+      supportedTiers: region.supported_tiers || [60,300],
     }};
   }});
   return {{
@@ -5949,6 +6078,105 @@ function normalizeHostForUi(host) {{
   normalized.target_regions = Array.isArray(normalized.target_regions) ? normalized.target_regions : [];
   normalized.region_statuses = normalized.region_statuses && typeof normalized.region_statuses === 'object' ? normalized.region_statuses : {{}};
   return normalized;
+}}
+
+function coveragePills(regions, cls='meta', empty='None') {{
+  if (!regions.length) return `<span class="coverage-pill meta">${{escapeHtml(empty)}}</span>`;
+  const shown = regions.slice(0, 6).map(region => `<span class="coverage-pill ${{cls}}" title="${{escapeHtml(region.reason || '')}}">${{escapeHtml(region.region)}}</span>`);
+  if (regions.length > shown.length) shown.push(`<span class="coverage-pill meta">+${{regions.length - shown.length}} more</span>`);
+  return shown.join('');
+}}
+
+function renderCoverageCards(rows) {{
+  return `<div class="coverage-cards">
+    ${{rows.map(item => {{
+      const host = item.host;
+      const coverage = item.coverage;
+      const unsupported = coverage.regions.filter(region => !region.scopedOut && !region.supportsTier);
+      const scopedOut = coverage.regions.filter(region => region.scopedOut);
+      const status = host.enabled === false ? 'Disabled' : host.current_status || 'unknown';
+      const hostId = escapeHtml(host.host_id || '');
+      const scopeLabel = host.enabled === false
+        ? 'Disabled'
+        : host.target_regions?.length
+          ? `${{host.target_regions.length}} selected`
+          : 'All probes';
+      return `
+        <div class="coverage-card ${{host.host_id === SELECTED_HOST_ID ? 'selected' : ''}}" data-host-id="${{hostId}}" onclick="selectHost('${{hostId}}')">
+          <div class="coverage-head">
+            <div>
+              <div class="coverage-title">${{escapeHtml(hostDisplayName(host))}}</div>
+              <div class="coverage-subtitle">${{formatTierLabel(coverage.tier)}} · ${{scopeLabel}} · ${{escapeHtml(status)}}</div>
+            </div>
+            <span class="badge ${{item.tone}}">${{item.routeLabel}}</span>
+          </div>
+          <div class="coverage-lines">
+            <div class="coverage-line">
+              <div class="coverage-label">Runs</div>
+              <div class="coverage-pills">${{host.enabled === false ? '<span class="coverage-pill off">Host disabled</span>' : coveragePills(coverage.eligible, 'ok', 'No active route')}}</div>
+            </div>
+            <div class="coverage-line">
+              <div class="coverage-label">Skipped</div>
+              <div class="coverage-pills">${{coveragePills(scopedOut, 'off', host.target_regions?.length ? 'None' : 'All selected')}}</div>
+            </div>
+            <div class="coverage-line">
+              <div class="coverage-label">Tier</div>
+              <div class="coverage-pills">${{coveragePills(unsupported, 'warn', 'Supported everywhere')}}</div>
+            </div>
+          </div>
+        </div>`;
+    }}).join('')}}
+  </div>`;
+}}
+
+function renderCoverageMatrix(rows) {{
+  const probeHeaders = REGIONS_CACHE.map(region => `
+    <div class="coverage-matrix-cell">
+      <div class="coverage-host">${{escapeHtml(region.region)}}</div>
+      <div class="coverage-meta">${{(region.supported_tiers || [60,300]).map(formatTierLabel).join(' · ')}}</div>
+    </div>
+  `).join('');
+  return `<div class="coverage-matrix" style="--probe-count:${{REGIONS_CACHE.length}}">
+    <div class="coverage-matrix-row coverage-matrix-head">
+      <div class="coverage-matrix-cell">
+        <div class="coverage-host">Host</div>
+        <div class="coverage-meta">Tier and scope</div>
+      </div>
+      ${{probeHeaders}}
+    </div>
+    ${{rows.map(item => {{
+      const host = item.host;
+      const coverage = item.coverage;
+      const hostId = escapeHtml(host.host_id || '');
+      const scopeLabel = host.enabled === false
+        ? 'Disabled'
+        : host.target_regions?.length
+          ? `${{host.target_regions.length}} selected`
+          : 'All probes';
+      const cells = coverage.regions.map(region => {{
+        const statusClass = host.enabled === false ? 'inactive' : region.eligible ? 'ok' : region.supportsTier ? 'off' : 'warn';
+        const label = host.enabled === false ? 'Disabled' : region.eligible ? 'Runs' : region.scopedOut ? 'Skipped' : 'Unsupported';
+        const meta = region.eligible
+          ? formatTierLabel(coverage.tier)
+          : region.scopedOut
+            ? 'Not selected'
+            : `Needs ${{formatTierLabel(coverage.tier)}}`;
+        return `<div class="coverage-matrix-cell" title="${{escapeHtml(region.reason)}}">
+          <div class="coverage-cell-status ${{statusClass}}">${{label}}</div>
+          <div class="coverage-cell-meta">${{escapeHtml(meta)}}</div>
+        </div>`;
+      }}).join('');
+      return `
+        <div class="coverage-matrix-row ${{host.host_id === SELECTED_HOST_ID ? 'selected' : ''}}" data-host-id="${{hostId}}" onclick="selectHost('${{hostId}}')">
+          <div class="coverage-matrix-cell">
+            <div class="coverage-host">${{escapeHtml(hostDisplayName(host))}}</div>
+            <div class="coverage-meta">${{formatTierLabel(coverage.tier)}} · ${{scopeLabel}}</div>
+          </div>
+          ${{cells}}
+        </div>
+      `;
+    }}).join('')}}
+  </div>`;
 }}
 
 function renderHostCoverage() {{
@@ -5991,34 +6219,11 @@ function renderHostCoverage() {{
     wrap.innerHTML = '<div class="coverage-empty">No routes matched the current filters.</div>';
     return;
   }}
-  wrap.innerHTML = `<div class="coverage-table">${{rows.map(item => {{
-    const host = item.host;
-    const coverage = item.coverage;
-    const hostId = escapeHtml(host.host_id || '');
-    const scopeLabel = host.enabled === false
-      ? 'Disabled'
-      : host.target_regions?.length
-        ? `${{host.target_regions.length}} selected`
-        : 'All probes';
-    const activeHtml = coverage.eligible.length
-      ? coverage.eligible.map(region => `<span class="coverage-pill ok">${{escapeHtml(region.region)}}</span>`).join('')
-      : '<span class="coverage-pill warn">No active route</span>';
-    const skippedHtml = coverage.blocked.length
-      ? coverage.blocked.slice(0, 3).map(region => `<span class="coverage-pill off" title="${{escapeHtml(region.reason)}}">${{escapeHtml(region.region)}}</span>`).join('')
-      : '<span class="coverage-pill meta">None</span>';
-    const moreSkipped = coverage.blocked.length > 3 ? `<span class="coverage-pill meta">+${{coverage.blocked.length - 3}}</span>` : '';
-    return `
-      <div class="coverage-row ${{host.host_id === SELECTED_HOST_ID ? 'selected' : ''}}" data-host-id="${{hostId}}" onclick="selectHost('${{hostId}}')">
-        <div>
-          <div class="coverage-host">${{escapeHtml(hostDisplayName(host))}}</div>
-          <div class="coverage-meta">${{formatTierLabel(coverage.tier)}}</div>
-        </div>
-        <span class="badge ${{item.tone}}">${{item.routeLabel}}</span>
-        <div class="coverage-routes">${{activeHtml}}</div>
-        <div class="coverage-routes" title="Skipped probes">${{skippedHtml}}${{moreSkipped}}</div>
-      </div>
-    `;
-  }}).join('')}}</div>`;
+  const viewMode = document.getElementById('route-view-mode')?.value || 'auto';
+  const effectiveView = viewMode === 'auto'
+    ? (REGIONS_CACHE.length <= 6 ? 'matrix' : 'compact')
+    : viewMode;
+  wrap.innerHTML = effectiveView === 'matrix' ? renderCoverageMatrix(rows) : renderCoverageCards(rows);
 }}
 
 async function loadHosts() {{
@@ -6216,8 +6421,9 @@ async function openAddHost() {{
   document.getElementById('m-public-link-enabled').checked = false;
   document.getElementById('m-alert').checked = false;
   document.getElementById('m-enabled').checked = true;
-  document.getElementById('m-region-mode-all').checked = true;
-  document.getElementById('m-region-mode-selected').checked = false;
+  MODAL_REGION_SCOPE = 'all';
+  MODAL_TARGET_REGIONS = [];
+  document.getElementById('m-region-filter').value = '';
   document.getElementById('m-sns-group').style.display = 'none';
   document.getElementById('m-public-link-group').style.display = 'none';
   renderTargetRegions([]);
@@ -6241,8 +6447,9 @@ async function openEditHost(h) {{
   document.getElementById('m-sns').value = h.alert_sns_arn || '';
   document.getElementById('m-enabled').checked = h.enabled !== false;
   const hasScopedRegions = Array.isArray(h.target_regions) && h.target_regions.length > 0;
-  document.getElementById('m-region-mode-all').checked = !hasScopedRegions;
-  document.getElementById('m-region-mode-selected').checked = hasScopedRegions;
+  MODAL_REGION_SCOPE = hasScopedRegions ? 'selected' : 'all';
+  MODAL_TARGET_REGIONS = hasScopedRegions ? h.target_regions.slice() : [];
+  document.getElementById('m-region-filter').value = '';
   document.getElementById('m-sns-group').style.display = h.alert_enabled ? '' : 'none';
   document.getElementById('m-public-link-group').style.display = h.public_link_enabled ? '' : 'none';
   renderTargetRegions(h.target_regions || []);
@@ -6373,17 +6580,42 @@ async function loadRegions() {{
         <div class="meta">Expected now: <strong>${{expectedProbeVersion}}</strong>${{expectedProbeSha ? ' · ' + expectedProbeSha.slice(0, 8) : ''}} · ${{r.monitor_build_version === expectedProbeVersion && r.monitor_source_sha === expectedProbeSha ? 'matches current bundle' : 'update recommended'}}</div>
       </div>
       <div class="actions">
-        <button class="btn btn-warn btn-sm" onclick="updateRegion('${{r.region}}')">Update Code</button>
+        <button class="btn btn-ghost btn-sm" onclick="openEditRegion('${{r.region}}')">Edit</button>
+        <button class="btn btn-warn btn-sm" onclick="updateRegionCode('${{r.region}}')">Update Code</button>
         <button class="btn btn-danger btn-sm" onclick="removeRegion('${{r.region}}')">Remove</button>
       </div>
     </div>`).join('');
 }}
 
 function openAddRegion() {{
+  document.getElementById('region-modal').dataset.mode = 'add';
+  document.getElementById('region-modal-title').textContent = 'Add Worker Region';
+  document.getElementById('region-modal-desc').textContent = 'This deploys a new probe Lambda in the selected AWS region.';
+  document.getElementById('r-region').disabled = false;
   document.getElementById('r-status').style.display = 'none';
   document.getElementById('r-deploy-btn').disabled = false;
   document.getElementById('r-deploy-btn').innerHTML = 'Deploy';
+  document.getElementById('r-memory').value = '256';
   renderRegionTierOptions([60, 300]);
+  document.getElementById('region-modal').classList.add('open');
+}}
+
+function openEditRegion(region) {{
+  const existing = REGIONS_CACHE.find(item => item.region === region);
+  if (!existing) {{
+    toast('Probe not found: ' + region, true);
+    return;
+  }}
+  document.getElementById('region-modal').dataset.mode = 'edit';
+  document.getElementById('region-modal-title').textContent = 'Edit Probe';
+  document.getElementById('region-modal-desc').textContent = "Update this probe's supported intervals and redeploy the worker in place.";
+  document.getElementById('r-region').value = region;
+  document.getElementById('r-region').disabled = true;
+  document.getElementById('r-memory').value = String(existing.memory_mb || 256);
+  document.getElementById('r-status').style.display = 'none';
+  document.getElementById('r-deploy-btn').disabled = false;
+  document.getElementById('r-deploy-btn').innerHTML = 'Update Probe';
+  renderRegionTierOptions(existing.supported_tiers || [60, 300]);
   document.getElementById('region-modal').classList.add('open');
 }}
 
@@ -6392,6 +6624,7 @@ function closeRegionModal() {{ document.getElementById('region-modal').classList
 async function deployRegion() {{
   const btn = document.getElementById('r-deploy-btn');
   const stat = document.getElementById('r-status');
+  const isEdit = document.getElementById('region-modal').dataset.mode === 'edit';
   const body = {{
     region: document.getElementById('r-region').value,
     memory_mb: +document.getElementById('r-memory').value,
@@ -6402,23 +6635,23 @@ async function deployRegion() {{
     return;
   }}
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Deploying…';
+  btn.innerHTML = isEdit ? '<span class="spinner"></span> Updating…' : '<span class="spinner"></span> Deploying…';
   stat.style.display = '';
-  stat.innerHTML = '<span style="color:#94a3b8">Deploying worker Lambda in '+body.region+'…</span>';
-  const res = await api('/api/regions', {{method:'POST', body:JSON.stringify(body)}});
+  stat.innerHTML = '<span style="color:#94a3b8">'+(isEdit ? 'Updating' : 'Deploying')+' worker Lambda in '+body.region+'…</span>';
+  const res = await api(isEdit ? '/api/regions/'+encodeURIComponent(body.region)+'/update' : '/api/regions', {{method:'POST', body:JSON.stringify(body)}});
   btn.disabled = false;
-  btn.innerHTML = 'Deploy';
+  btn.innerHTML = isEdit ? 'Update Probe' : 'Deploy';
   if (res.error) {{
     stat.innerHTML = '<span style="color:#ef4444">Error: '+res.error+'</span>';
     return;
   }}
-  stat.innerHTML = '<span style="color:#22c55e">Deployed successfully</span>';
+  stat.innerHTML = '<span style="color:#22c55e">'+(isEdit ? 'Updated' : 'Deployed')+' successfully</span>';
   await loadRegions();
   closeRegionModal();
-  toast('Worker deployed in '+body.region);
+  toast(isEdit ? 'Probe updated in '+body.region : 'Worker deployed in '+body.region);
 }}
 
-async function updateRegion(region) {{
+async function updateRegionCode(region) {{
   if (!confirm('Push the latest monitor code to '+region+'?')) return;
   const res = await api('/api/regions/'+region+'/update', {{method:'POST'}});
   if (res.error) {{ toast(res.error, true); return; }}
@@ -7386,13 +7619,12 @@ function renderCostEstimate(data, prefixNote='') {{
   const el = document.getElementById('cost-result');
   el.style.display = '';
   const month = costNumber(data.total_usd_per_month);
-  const day = month / 30;
   const usageMonth = costNumber(data.usage_total_usd_per_month ?? usage.gross_total_usd_per_month);
   const usageDay = usageMonth / 30;
   const nearZero = data.usage_near_zero || usageMonth < 0.01;
   document.getElementById('cost-summary').innerHTML =
-    `${{nearZero ? 'Current usage is near zero, but not invisible:' : 'Current usage estimate:'}} ` +
-    `<strong>$${{usageDay.toFixed(4)}}/day</strong> · <strong>$${{usageMonth.toFixed(4)}}/month</strong>.`;
+    `${{nearZero ? 'Current usage is near zero, but visible:' : 'Current usage from CloudWatch:'}} ` +
+    `<strong>$${{usageDay.toFixed(4)}}/day run-rate</strong> · <strong>$${{usageMonth.toFixed(4)}}/month projected</strong>.`;
   document.getElementById('usage-cards').innerHTML = `
     <div class="usage-grid">
       <div class="usage-card"><div class="label">Assets</div><div class="value">${{costNumber(assets.hosts_enabled).toLocaleString()}} hosts</div><div class="meta">${{costNumber(assets.probe_regions)}} probes · ${{costNumber(assets.lambda_functions)}} Lambdas · ${{costNumber(assets.hosts_with_alerts)}} alert hosts</div></div>
@@ -7403,14 +7635,34 @@ function renderCostEstimate(data, prefixNote='') {{
       <div class="usage-card"><div class="label">SNS</div><div class="value">${{costNumber(sns.alert_publishes_last_24h).toLocaleString()}}</div><div class="meta">alert publishes in 24h · projected ${{costNumber(sns.projected_monthly_publishes).toLocaleString()}}/mo</div></div>
     </div>
   `;
-  document.getElementById('usage-cost-rows').innerHTML =
-    [['Lambda invocations + runtime', usageBreakdown.lambda_usd], ['DynamoDB estimated writes', usageBreakdown.dynamodb_writes_usd], ['DynamoDB estimated reads', usageBreakdown.dynamodb_reads_usd], ['DynamoDB current storage', usageBreakdown.dynamodb_storage_usd], ['CloudWatch Logs storage', usageBreakdown.cloudwatch_logs_storage_usd], ['SNS publishes', usageBreakdown.sns_publish_usd], ['CloudFront / custom domain', usageBreakdown.cloudfront_custom_domain_usd], ['Usage total / month', usage.gross_total_usd_per_month ?? data.usage_total_usd_per_month]]
-    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>$${{costNumber(v).toFixed(6)}}</span></div>`)
-    .join('');
+  const money = value => '$' + costNumber(value).toFixed(6);
+  const currentCost = value => money(costNumber(value) / 30);
+  const rows = [
+    ['Lambda', `${{costNumber(lambda.last_24h_invocations).toLocaleString()}} invocations in 24h`, `${{costNumber(lambda.projected_monthly_invocations).toLocaleString()}} invocations · ${{costNumber(lambda.projected_monthly_gb_seconds).toLocaleString()}} GB-s`, usageBreakdown.lambda_usd],
+    ['DynamoDB writes', 'Estimated from current host tiers', `${{costNumber(ddb.projected_monthly_writes).toLocaleString()}} writes`, usageBreakdown.dynamodb_writes_usd],
+    ['DynamoDB reads', 'Estimated from history/status reads', `${{costNumber(ddb.projected_monthly_reads).toLocaleString()}} reads`, usageBreakdown.dynamodb_reads_usd],
+    ['DynamoDB storage', `${{escapeHtml(usage.tables?.checks?.size_human || '0 B')}} checks table now`, `${{costNumber(ddb.stored_gb).toLocaleString(undefined, {{maximumFractionDigits: 4}})}} GB stored`, usageBreakdown.dynamodb_storage_usd],
+    ['CloudWatch Logs', `${{escapeHtml(logs.stored_human || '0 B')}} stored now`, `${{(logs.groups || []).length}} log groups`, usageBreakdown.cloudwatch_logs_storage_usd],
+    ['SNS alerts', `${{costNumber(sns.alert_publishes_last_24h).toLocaleString()}} publishes in 24h`, `${{costNumber(sns.projected_monthly_publishes).toLocaleString()}} publishes`, usageBreakdown.sns_publish_usd],
+    ['CloudFront/custom domain', assets.custom_domain_configured ? 'Configured' : 'Not configured', assets.custom_domain_configured ? 'Distribution active/configured' : 'No custom domain cost', usageBreakdown.cloudfront_custom_domain_usd],
+    ['Total', 'Current daily run-rate', `${{costNumber(checks.projected_monthly).toLocaleString()}} checks · ${{costNumber(lambda.projected_monthly_invocations).toLocaleString()}} Lambda invokes`, usage.gross_total_usd_per_month ?? data.usage_total_usd_per_month],
+  ];
+  document.getElementById('usage-cost-rows').innerHTML = `
+    <table class="usage-cost-table">
+      <thead><tr><th>Area</th><th>Current cost estimate</th><th>Projected usage this month</th><th>Projected cost</th></tr></thead>
+      <tbody>
+        ${{rows.map(([area,current,projected,cost]) => `
+          <tr>
+            <td>${{escapeHtml(area)}}</td>
+            <td><div>${{currentCost(cost)}}</div><div class="muted">${{escapeHtml(current)}}</div></td>
+            <td>${{escapeHtml(projected)}}</td>
+            <td>${{money(cost)}}</td>
+          </tr>
+        `).join('')}}
+      </tbody>
+    </table>`;
   document.getElementById('cost-rows').innerHTML =
-    [['Projected checks / month', data.monthly_checks], ['Lambda invocations / month', data.monthly_invocations?.total], ['Management invocations / month', data.monthly_invocations?.management], ['Worker invocations / month', data.monthly_invocations?.workers], ['Effective scheduler', (data.scheduler?.effective_interval_sec || 60) + 's'], ['Planned interval', (data.scheduler?.requested_interval_sec || 60) + 's'], ['Planning cost / month', data.total_usd_per_month]]
-    .map(([l,v]) => `<div class="cost-row"><span>${{l}}</span><span>${{typeof v === 'string' ? escapeHtml(v) : costNumber(v).toLocaleString(undefined, {{maximumFractionDigits: 4}})}}</span></div>`)
-    .join('') + `<div style="color:#64748b;font-size:.75rem;margin-top:10px">${{prefixNote ? prefixNote + ' ' : ''}}${{usage.note || data.note || ''}}</div>`;
+    `${{prefixNote ? escapeHtml(prefixNote) + ' ' : ''}}${{escapeHtml(usage.note || data.note || '')}}`;
 }}
 
 async function calcCost() {{
@@ -7418,7 +7670,7 @@ async function calcCost() {{
   const el = document.getElementById('cost-result');
   if (el) {{
     el.style.display = '';
-    document.getElementById('cost-summary').innerHTML = loadingMarkup('Recalculating usage and planning estimate…', 'large');
+    document.getElementById('cost-summary').innerHTML = loadingMarkup('Recalculating usage estimate…', 'large');
     document.getElementById('usage-cards').innerHTML = '';
     document.getElementById('usage-cost-rows').innerHTML = '';
     document.getElementById('cost-rows').innerHTML = '';
@@ -7451,6 +7703,10 @@ async function boot() {{
   }});
   if (!await ensureAuthed()) return;
   document.getElementById('m-tier').addEventListener('change', updateHostImpact);
+  document.addEventListener('click', event => {{
+    const dd = document.getElementById('m-probe-dropdown');
+    if (dd && !dd.contains(event.target)) dd.classList.remove('open');
+  }});
   await Promise.all([ensureRegionsLoaded(), loadHosts()]);
 }}
 
