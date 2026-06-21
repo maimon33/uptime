@@ -42,6 +42,13 @@ Parameters:
       - OPTIONAL
       - ON
     Description: MFA mode for the Cognito user pool when AdminAuthMode is cognito. TOTP is enabled in the pool.
+  PublicDemoPageEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable the optional public /demo product explanation page. Leave false for normal deployments.
 
 Conditions:
   HasProvidedAdminApiKey: !Not
@@ -387,6 +394,7 @@ Resources:
           RETENTION_DAYS: '90'
           STATUS_PAGE_TITLE: System Status
           STATUS_PAGE_DESC: Real-time status of our services
+          PUBLIC_DEMO_PAGE_ENABLED: !Ref PublicDemoPageEnabled
       Tags:
         - Key: Project
           Value: uptime

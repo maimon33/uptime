@@ -174,6 +174,14 @@ def main() -> int:
     admin_html = handler._admin_page()
     (OUTPUT_DIR / "admin-preview.html").write_text(admin_html, encoding="utf-8")
 
+    demo_html = handler._render_demo_page(
+        title="Uptime Command Center",
+        brand_name="Uptime",
+        logo_url="",
+        theme="clean",
+    )
+    (OUTPUT_DIR / "demo-preview.html").write_text(demo_html, encoding="utf-8")
+
     print(f"Wrote previews to {OUTPUT_DIR}")
     return 0
 

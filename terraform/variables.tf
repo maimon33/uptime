@@ -55,6 +55,12 @@ variable "status_page_description" {
   default     = "Real-time status of our services"
 }
 
+variable "public_demo_page_enabled" {
+  description = "Enable the optional public /demo product explanation page. Keep false for normal deployments."
+  type        = bool
+  default     = false
+}
+
 variable "custom_domain" {
   description = <<-EOF
     Optional custom domain (e.g. 'status.yourdomain.com').

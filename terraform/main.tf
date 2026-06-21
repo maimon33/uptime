@@ -290,6 +290,7 @@ resource "aws_lambda_function" "management" {
       RETENTION_DAYS    = tostring(var.retention_days)
       STATUS_PAGE_TITLE = var.status_page_title
       STATUS_PAGE_DESC  = var.status_page_description
+      PUBLIC_DEMO_PAGE_ENABLED = tostring(var.public_demo_page_enabled)
     }
   }
 
